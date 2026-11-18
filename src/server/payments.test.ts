@@ -12,6 +12,11 @@ import {
   ADS_REFERRAL_RATES,
   getPersistentPremiumTxNumber,
   resetPersistentPremiumState,
+  createServerPaymentOrder,
+  executeRazorpayRefund,
+  parseStrictBooleanFlag,
+  isProductionRuntimeEnv,
+  isFailClosedProductionEnv,
 } from "./payments";
 import {
   handleApiRequest,
@@ -3225,5 +3230,376 @@ describe("Payout Metadata and Sensitive Beneficiary Masking Audit Tests", () => 
       assert.equal(bStr.includes("987654321098"), false);
       assert.equal(bStr.includes("XXXXXXXX1098"), true);
     }
+  });
+});
+
+describe("Phase 1 Production Safety: Environment Detection, Strict Parsing & Gateway Verification", () => {
+  const testKeyId = "rzp_test_phase1_key";
+  const testSecret = "phase1_razorpay_secret_123456";
+
+  it("1. parseStrictBooleanFlag treats ONLY trimmed case-insensitive 'true' and '1' as true", () => {
+    assert.equal(parseStrictBooleanFlag("true"), true);
+    assert.equal(parseStrictBooleanFlag("TRUE"), true);
+    assert.equal(parseStrictBooleanFlag("  TrUe  "), true);
+    assert.equal(parseStrictBooleanFlag("1"), true);
+    assert.equal(parseStrictBooleanFlag(" 1 "), true);
+
+    assert.equal(parseStrictBooleanFlag("false"), false);
+    assert.equal(parseStrictBooleanFlag("FALSE"), false);
+    assert.equal(parseStrictBooleanFlag(" false "), false);
+    assert.equal(parseStrictBooleanFlag("0"), false);
+    assert.equal(parseStrictBooleanFlag(" 0 "), false);
+    assert.equal(parseStrictBooleanFlag(""), false);
+    assert.equal(parseStrictBooleanFlag("   "), false);
+    assert.equal(parseStrictBooleanFlag("yes"), false);
+    assert.equal(parseStrictBooleanFlag("no"), false);
+    assert.equal(parseStrictBooleanFlag(undefined), false);
+    assert.equal(parseStrictBooleanFlag(null), false);
+  });
+
+  it("2. Environment helper treats APP_ENV/NODE_ENV=production, staging, and unknown/unset as fail-closed production while preserving development and test", () => {
+    assert.equal(isFailClosedProductionEnv("production", "development"), true);
+    assert.equal(isFailClosedProductionEnv("development", "production"), true);
+    assert.equal(isFailClosedProductionEnv("production", "test"), true);
+    assert.equal(isFailClosedProductionEnv("test", "production"), true);
+    assert.equal(isFailClosedProductionEnv("staging", "development"), true);
+    assert.equal(isFailClosedProductionEnv("unknown", "test"), true);
+    assert.equal(isFailClosedProductionEnv(undefined, undefined), true);
+    assert.equal(isFailClosedProductionEnv("", ""), true);
+
+    assert.equal(isFailClosedProductionEnv("development", "development"), false);
+    assert.equal(isFailClosedProductionEnv("test", "test"), false);
+    assert.equal(isFailClosedProductionEnv("local", "development"), false);
+    assert.equal(isFailClosedProductionEnv(undefined, "development"), false);
+    assert.equal(isFailClosedProductionEnv("development", undefined), false);
+
+    assert.equal(isProductionRuntimeEnv({ APP_ENV: "production", NODE_ENV: "development" }), true);
+    assert.equal(isProductionRuntimeEnv({ APP_ENV: "development", NODE_ENV: "production" }), true);
+    assert.equal(
+      isProductionRuntimeEnv({ APP_ENV: "development", NODE_ENV: "development" }),
+      false,
+    );
+    assert.equal(isProductionRuntimeEnv({ APP_ENV: "test", NODE_ENV: "test" }), false);
+  });
+
+  it("3. 'false' and '0' MUST NOT skip remote Razorpay checks in createServerPaymentOrder, verifyServerPayment, executeRazorpayRefund, or /api/payments/verify", async () => {
+    const origFetch = globalThis.fetch;
+    try {
+      for (const flagValue of ["false", "0", " FALSE ", " 0 "]) {
+        const calledUrls: string[] = [];
+        globalThis.fetch = (async (input: string | URL | Request) => {
+          const u = typeof input === "string" ? input : input.toString();
+          calledUrls.push(u);
+          if (u.endsWith("/v1/orders")) {
+            return new Response(JSON.stringify({ id: "order_remote_verified_123" }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (u.includes("/v1/payments/") && u.endsWith("/refund")) {
+            return new Response(JSON.stringify({ id: "rfnd_remote_123" }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (u.includes("/v1/payments/")) {
+            const pid = u.split("/v1/payments/")[1] || "";
+            const ordMatch = pid.includes("verify_route") ? "ord_phase1_route" : "ord_phase1_fn";
+            return new Response(
+              JSON.stringify({
+                id: pid,
+                order_id: ordMatch,
+                status: "captured",
+                amount: 600,
+                currency: "INR",
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          throw new Error(`Unexpected fetch URL: ${u}`);
+        }) as typeof fetch;
+
+        const baseEnv = {
+          APP_ENV: "development",
+          NODE_ENV: "development",
+          RAZORPAY_KEY_ID: testKeyId,
+          RAZORPAY_KEY_SECRET: testSecret,
+          RAZORPAY_SKIP_REMOTE_CHECK: flagValue,
+        };
+
+        const order = await createServerPaymentOrder(
+          { purpose: "premium_video_upload", userId: "FT483921" },
+          baseEnv,
+        );
+        assert.equal(order.orderId, "order_remote_verified_123");
+
+        const refundRes = await executeRazorpayRefund("pay_rfnd_check", 600, "test", baseEnv);
+        assert.equal(refundRes.success, true);
+        assert.equal(refundRes.refundId, "rfnd_remote_123");
+
+        const payId = `pay_fn_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const sig = crypto
+          .createHmac("sha256", testSecret)
+          .update(`ord_phase1_fn|${payId}`)
+          .digest("hex");
+        const verifyRes = await verifyServerPayment(
+          {
+            orderId: "ord_phase1_fn",
+            paymentId: payId,
+            signature: sig,
+            userId: "FT483921",
+            purpose: "premium_video_upload",
+          },
+          ["FT483921"],
+          "FT102857",
+          baseEnv,
+        );
+        assert.equal(verifyRes.verified, true);
+
+        const routePayId = `pay_verify_route_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const routeSig = crypto
+          .createHmac("sha256", testSecret)
+          .update(`ord_phase1_route|${routePayId}`)
+          .digest("hex");
+        // Return a clean 400 from remote lookup on /api/payments/verify to prove remote call occurred before store write
+        globalThis.fetch = (async (input: string | URL | Request) => {
+          const u = typeof input === "string" ? input : input.toString();
+          calledUrls.push(u);
+          return new Response("Remote check rejected test payment", { status: 400 });
+        }) as typeof fetch;
+        const routeRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/payments/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              orderId: "ord_phase1_route",
+              paymentId: routePayId,
+              signature: routeSig,
+              userId: "FT483921",
+              purpose: "premium_video_upload",
+            }),
+          }),
+          baseEnv,
+        );
+        assert.ok(routeRes);
+        assert.equal(routeRes.status, 400);
+        assert.equal(
+          calledUrls.filter((u) => u.includes("api.razorpay.com")).length,
+          4,
+          `Flag '${flagValue}' must trigger all 4 remote Razorpay calls`,
+        );
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("4. 'true' and '1' may skip remote checks ONLY in explicit development and test environments", async () => {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      throw new Error(
+        "Remote fetch should be skipped in explicit development/test when skip='true'/'1'",
+      );
+    }) as typeof fetch;
+
+    try {
+      for (const envPair of [
+        { APP_ENV: "development", NODE_ENV: "development" },
+        { APP_ENV: "test", NODE_ENV: "test" },
+      ]) {
+        for (const flagValue of ["true", " TRUE ", "1", " 1 "]) {
+          const runtimeEnv = {
+            ...envPair,
+            RAZORPAY_KEY_ID: testKeyId,
+            RAZORPAY_KEY_SECRET: testSecret,
+            RAZORPAY_SKIP_REMOTE_CHECK: flagValue,
+          };
+
+          const order = await createServerPaymentOrder(
+            { purpose: "premium_video_upload", userId: "FT483921" },
+            runtimeEnv,
+          );
+          assert.ok(order.orderId.startsWith("order_"));
+
+          const refundRes = await executeRazorpayRefund("pay_skip_1", 600, "test", runtimeEnv);
+          assert.equal(refundRes.gatewayStatus, "gateway_unavailable");
+
+          const payId = `pay_skip_ok_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          const sig = crypto
+            .createHmac("sha256", testSecret)
+            .update(`ord_skip_ok|${payId}`)
+            .digest("hex");
+          const verifyRes = await verifyServerPayment(
+            {
+              orderId: "ord_skip_ok",
+              paymentId: payId,
+              signature: sig,
+              userId: "FT483921",
+              purpose: "premium_video_upload",
+            },
+            ["FT483921"],
+            "FT102857",
+            runtimeEnv,
+          );
+          assert.equal(verifyRes.verified, true);
+        }
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("5. Production (APP_ENV=production or NODE_ENV=production, regardless of the other) MUST NEVER skip remote Razorpay verification, order creation, or refunds", async () => {
+    const origFetch = globalThis.fetch;
+    try {
+      const prodCombinations = [
+        { APP_ENV: "production", NODE_ENV: "development", RAZORPAY_SKIP_REMOTE_CHECK: "true" },
+        { APP_ENV: "development", NODE_ENV: "production", RAZORPAY_SKIP_REMOTE_CHECK: "true" },
+        { APP_ENV: "production", NODE_ENV: "production", RAZORPAY_SKIP_REMOTE_CHECK: "1" },
+        { APP_ENV: "staging", NODE_ENV: "development", RAZORPAY_SKIP_REMOTE_CHECK: "true" },
+      ];
+
+      for (const combo of prodCombinations) {
+        const calledUrls: string[] = [];
+        globalThis.fetch = (async (input: string | URL | Request) => {
+          const u = typeof input === "string" ? input : input.toString();
+          calledUrls.push(u);
+          if (u.endsWith("/v1/orders")) {
+            return new Response(JSON.stringify({ id: "order_prod_live_1" }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (u.endsWith("/refund")) {
+            return new Response(JSON.stringify({ id: "rfnd_prod_live_1" }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          return new Response("Simulated Razorpay failure", { status: 400 });
+        }) as typeof fetch;
+
+        const prodEnv = {
+          ...combo,
+          RAZORPAY_KEY_ID: testKeyId,
+          RAZORPAY_KEY_SECRET: testSecret,
+        };
+
+        const order = await createServerPaymentOrder(
+          { purpose: "premium_video_upload", userId: "FT483921" },
+          prodEnv,
+        );
+        assert.equal(order.orderId, "order_prod_live_1");
+
+        const refund = await executeRazorpayRefund("pay_prod_1", 600, "prod", prodEnv);
+        assert.equal(refund.success, true);
+        assert.equal(refund.refundId, "rfnd_prod_live_1");
+
+        const payId = `pay_prod_${Date.now()}`;
+        const sig = crypto
+          .createHmac("sha256", testSecret)
+          .update(`ord_prod|${payId}`)
+          .digest("hex");
+
+        const verifyFnRes = await verifyServerPayment(
+          {
+            orderId: "ord_prod",
+            paymentId: payId,
+            signature: sig,
+            userId: "FT483921",
+            purpose: "premium_video_upload",
+          },
+          ["FT483921"],
+          "FT102857",
+          prodEnv,
+        );
+        assert.equal(verifyFnRes.verified, false);
+        assert.match(verifyFnRes.error || "", /Razorpay payment confirmation failed/);
+
+        const dummyPool = { query: async () => [[]], getConnection: async () => ({}) } as any;
+        const apiVerifyRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/payments/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              orderId: "ord_prod",
+              paymentId: payId,
+              signature: sig,
+              userId: "FT483921",
+              purpose: "premium_video_upload",
+            }),
+          }),
+          prodEnv,
+          { pool: dummyPool },
+        );
+        assert.ok(apiVerifyRes);
+        assert.equal(apiVerifyRes.status, 400);
+        const apiVerifyJson = await apiVerifyRes.json();
+        assert.match(apiVerifyJson.error || "", /Razorpay API lookup returned status 400/);
+
+        assert.equal(
+          calledUrls.length,
+          4,
+          `Production combo ${JSON.stringify(combo)} must execute all 4 remote Razorpay calls`,
+        );
+
+        // Missing RAZORPAY_KEY_ID in production must fail closed rather than skipping remote check
+        const missingKeyIdRes = await verifyServerPayment(
+          {
+            orderId: "ord_prod",
+            paymentId: payId,
+            signature: sig,
+            userId: "FT483921",
+            purpose: "premium_video_upload",
+          },
+          ["FT483921"],
+          "FT102857",
+          {
+            ...combo,
+            RAZORPAY_KEY_ID: "",
+            RAZORPAY_KEY_SECRET: testSecret,
+          },
+        );
+        assert.equal(missingKeyIdRes.verified, false);
+        assert.match(missingKeyIdRes.error || "", /failed closed/i);
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("6. APP_ENV=production enforces fail-closed MySQL guard in handleApiRequest even when NODE_ENV=development", async () => {
+    const res = await handleApiRequest(
+      new Request("http://localhost:3000/api/admin/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Test" }),
+      }),
+      { APP_ENV: "production", NODE_ENV: "development" },
+    );
+    // Unauthenticated returns 401 before pool check; check /api/auth/login which checks pool directly
+    assert.ok(res);
+
+    const loginRes = await handleApiRequest(
+      new Request("http://localhost:3000/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifier: "alex@facetube.com", password: "password123" }),
+      }),
+      { APP_ENV: "production", NODE_ENV: "development" },
+    );
+    assert.ok(loginRes);
+    assert.equal(loginRes.status, 503);
+
+    const devLoginRes = await handleApiRequest(
+      new Request("http://localhost:3000/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifier: "alex@facetube.com", password: "password123" }),
+      }),
+      { APP_ENV: "development", NODE_ENV: "development" },
+    );
+    assert.ok(devLoginRes);
+    assert.equal(devLoginRes.status, 200);
   });
 });

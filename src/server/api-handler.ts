@@ -14,7 +14,6 @@ import {
   ADS_REFERRAL_RATES,
   evaluateAdsDistribution,
   resolveUplineSponsors,
-  
   type AdsUplineSponsor,
   calculateWeightedPoolPayouts,
   executeRazorpayRefund,
@@ -22,7 +21,12 @@ import {
   savePersistentRefundRequest,
   updatePersistentRefundRequest,
   type RefundRequestRecord,
+  isFailClosedProductionEnv,
+  isProductionRuntimeEnv,
+  parseStrictBooleanFlag,
 } from "./payments.ts";
+
+export { isFailClosedProductionEnv };
 import {
   sendWelcomeEmailServer,
   sendCertificateEmailServer,
@@ -55,21 +59,6 @@ export function isAdPromotionActive(video: {
   const expiryTime = new Date(expiryRaw).getTime();
   if (Number.isNaN(expiryTime)) return false;
   return expiryTime > Date.now();
-}
-
-export function isFailClosedProductionEnv(appEnvRaw?: string, nodeEnvRaw?: string): boolean {
-  const appEnv = String(appEnvRaw ?? "")
-    .trim()
-    .toLowerCase();
-  const nodeEnv = String(nodeEnvRaw ?? "")
-    .trim()
-    .toLowerCase();
-  if (appEnv === "production" || nodeEnv === "production") {
-    return true;
-  }
-  const nonProdEnvs = new Set(["development", "dev", "local", "test"]);
-  const presentEnvs = [appEnv, nodeEnv].filter((v) => v !== "");
-  return presentEnvs.length === 0 || presentEnvs.some((v) => !nonProdEnvs.has(v));
 }
 
 export function isMysqlDuplicateKeyError(err: unknown): boolean {
@@ -1015,7 +1004,42 @@ export function resetInMemoryStore(): void {
   lastLoadedMtime = 0;
 }
 
-function loadStore(): ServerStore {
+function createEmptyStoreForProduction(): ServerStore {
+  return {
+    users: [],
+    sessions: {},
+    videos: [],
+    comments: [],
+    images: [],
+    wallets: {},
+    personalKyc: {},
+    bankKyc: {},
+    certificates: {},
+    walletTransactions: [],
+    passwordResetTokens: [],
+    liveStreams: [],
+    liveChatMessages: [],
+    liveStreamViewers: {},
+    livekitWebhookEvents: {},
+    payoutBatches: [],
+    categories: [],
+    subscriberPlans: [],
+    userSubscriptions: [],
+    paymentOrders: [],
+    subscriptionRefundRequests: [],
+    kycAuditLog: [],
+    affiliateNetworks: {},
+    affiliateClicks: [],
+    affiliateConversions: {},
+    affiliateAuditLog: [],
+    channelSubscriptions: [],
+  };
+}
+
+function loadStore(env?: Record<string, string | undefined>): ServerStore {
+  if (isProductionRuntimeEnv(env)) {
+    return createEmptyStoreForProduction();
+  }
   try {
     if (fs.existsSync(STORE_FILE)) {
       const stats = fs.statSync(STORE_FILE);
@@ -1079,11 +1103,14 @@ function loadStore(): ServerStore {
   if (!inMemoryStore.subscriptionRefundRequests) inMemoryStore.subscriptionRefundRequests = [];
   if (!inMemoryStore.kycAuditLog) inMemoryStore.kycAuditLog = [];
   if (!inMemoryStore.channelSubscriptions) inMemoryStore.channelSubscriptions = [];
-  saveStore(inMemoryStore);
+  saveStore(inMemoryStore, env);
   return inMemoryStore;
 }
 
-function saveStore(store: ServerStore): void {
+function saveStore(store: ServerStore, env?: Record<string, string | undefined>): void {
+  if (isProductionRuntimeEnv(env)) {
+    throw new Error("JSON store persistence (data/facetube_store.json) is disabled in production.");
+  }
   inMemoryStore = store;
   try {
     if (!fs.existsSync(DATA_DIR)) {
@@ -1234,6 +1261,7 @@ export async function getAuthUserFromRequest(
   request: Request,
   store: ServerStore,
   pool?: Pool | null,
+  env?: Record<string, string | undefined>,
 ): Promise<AuthUser | null> {
   const authHeader = request.headers.get("Authorization") || request.headers.get("X-Authorization");
   if (!authHeader) return null;
@@ -1241,6 +1269,8 @@ export async function getAuthUserFromRequest(
   if (!token) return null;
 
   const activePool = pool !== undefined ? pool : getMysqlPool();
+  const isProd = isProductionRuntimeEnv(env);
+
   if (activePool) {
     try {
       const [rows]: any = await activePool.query(
@@ -1254,9 +1284,19 @@ export async function getAuthUserFromRequest(
       if (rows && rows.length > 0) {
         return rows[0] as AuthUser;
       }
+      if (isProd) {
+        return null;
+      }
     } catch (_e) {
-      // Fall through to store check
+      if (isProd) {
+        return null;
+      }
+      // Fall through to store check in non-production
     }
+  }
+
+  if (isProd) {
+    return null;
   }
 
   if (store.sessions && store.sessions[token]) {
@@ -1280,6 +1320,64 @@ export async function getAuthUserFromRequest(
   }
 
   return null;
+}
+
+async function resolveAuthWithProdDbGuard(
+  request: Request,
+  store: ServerStore,
+  pool: Pool | null,
+  env?: Record<string, string | undefined>,
+): Promise<{ authUser: AuthUser | null; earlyResponse: Response | null }> {
+  const authHeader = request.headers.get("Authorization") || request.headers.get("X-Authorization");
+  const token = authHeader ? authHeader.replace(/^Bearer\s+/i, "").trim() : "";
+
+  if (!token) {
+    return { authUser: null, earlyResponse: null };
+  }
+
+  if (isProductionRuntimeEnv(env)) {
+    if (!pool) {
+      return {
+        authUser: null,
+        earlyResponse: jsonResponse(
+          {
+            success: false,
+            error:
+              "Database connection unavailable in production environment. Persistent database storage is required.",
+          },
+          503,
+        ),
+      };
+    }
+    try {
+      const [rows]: any = await pool.query(
+        `SELECT u.id, u.user_id, u.name, u.mobile, u.email, u.role, u.referral_code, u.avatar_url, u.created_at
+         FROM sessions s
+         INNER JOIN users u ON (s.user_id = u.id OR s.user_id = u.user_id)
+         WHERE s.token = ? AND s.expires_at > NOW()
+         LIMIT 1`,
+        [token],
+      );
+      return {
+        authUser: rows && rows.length > 0 ? (rows[0] as AuthUser) : null,
+        earlyResponse: null,
+      };
+    } catch {
+      return {
+        authUser: null,
+        earlyResponse: jsonResponse(
+          {
+            success: false,
+            error: "Database connection unavailable while verifying session in production.",
+          },
+          503,
+        ),
+      };
+    }
+  }
+
+  const authUser = await getAuthUserFromRequest(request, store, pool, env);
+  return { authUser, earlyResponse: null };
 }
 
 export type AuthResult =
@@ -1618,7 +1716,10 @@ export async function handleApiRequest(
   // Normalize path: strip /api/ and .php extension
   const route = pathname.replace(/^\/api\/?/, "").replace(/\.php$/, "");
   const method = request.method;
-  const store = loadStore();
+  const isProd = isProductionRuntimeEnv(env);
+  const resolvePool = (): Pool | null =>
+    deps && "pool" in deps ? (deps.pool ?? null) : getMysqlPool();
+  const store = loadStore(env);
 
   // 1. Email Endpoints
   if (route === "send-welcome-email") {
@@ -1665,8 +1766,25 @@ export async function handleApiRequest(
     if (method === "POST") {
       try {
         const payload = await request.json();
-        const pool = getMysqlPool();
-        const authUser = await getAuthUserFromRequest(request, store, pool);
+        const pool = resolvePool();
+        const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+          request,
+          store,
+          pool,
+          env,
+        );
+        if (earlyResponse) return earlyResponse;
+        if (isProd && !pool) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database connection unavailable in production. Persistent payment order storage is required.",
+            },
+            503,
+          );
+        }
+
         const reqUserId = String(payload.userId || payload.user_id || "")
           .trim()
           .toUpperCase();
@@ -1688,9 +1806,34 @@ export async function handleApiRequest(
         const videoId = String(payload.videoId || payload.video_id || "").trim();
         const purpose = String(payload.purpose || "premium_video_upload").trim();
         if (purpose === "ads_promotion" && videoId) {
-          const v = store.videos.find((vid) => vid.id === videoId);
-          if (v) {
-            const isOwner = v.user_id.toUpperCase() === effectiveUserId.toUpperCase();
+          let foundVideoUserId: string | null = null;
+          if (pool) {
+            try {
+              const [vRows]: any = await pool.query(
+                "SELECT user_id FROM uploaded_videos WHERE id = ? LIMIT 1",
+                [videoId],
+              );
+              if (vRows && vRows.length > 0) {
+                foundVideoUserId = String(vRows[0].user_id || "");
+              }
+            } catch (dbErr: any) {
+              if (isProd) {
+                return jsonResponse(
+                  {
+                    success: false,
+                    error: "Database error while verifying video ownership: " + dbErr.message,
+                  },
+                  503,
+                );
+              }
+            }
+          } else if (!isProd) {
+            const v = store.videos.find((vid) => vid.id === videoId);
+            if (v) foundVideoUserId = v.user_id;
+          }
+
+          if (foundVideoUserId) {
+            const isOwner = foundVideoUserId.toUpperCase() === effectiveUserId.toUpperCase();
             const isAdmin = authUser?.role === "admin";
             if (!isOwner && !isAdmin) {
               return jsonResponse(
@@ -1732,25 +1875,35 @@ export async function handleApiRequest(
                 result.amount,
               ],
             );
-          } catch (_ePo) {
-            // optional
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                {
+                  success: false,
+                  error: "Database error persisting payment order: " + dbErr.message,
+                },
+                503,
+              );
+            }
           }
         }
-        if (!store.paymentOrders) store.paymentOrders = [];
-        store.paymentOrders.push({
-          order_id: result.orderId,
-          user_id: effectiveUserId,
-          user_name: payload.userName || authUser?.name || "Creator",
-          video_id: videoId || null,
-          purpose,
-          plan_id: payload.planId || null,
-          content_type: payload.contentType || null,
-          amount: result.amount,
-          currency: "INR",
-          status: "created",
-          created_at: new Date().toISOString(),
-        });
-        saveStore(store);
+        if (!isProd) {
+          if (!store.paymentOrders) store.paymentOrders = [];
+          store.paymentOrders.push({
+            order_id: result.orderId,
+            user_id: effectiveUserId,
+            user_name: payload.userName || authUser?.name || "Creator",
+            video_id: videoId || null,
+            purpose,
+            plan_id: payload.planId || null,
+            content_type: payload.contentType || null,
+            amount: result.amount,
+            currency: "INR",
+            status: "created",
+            created_at: new Date().toISOString(),
+          });
+          saveStore(store, env);
+        }
 
         return jsonResponse(result);
       } catch (err: any) {
@@ -1790,7 +1943,7 @@ export async function handleApiRequest(
           );
         }
 
-        if (process.env["NODE_ENV"] === "production" && !pool) {
+        if (isProductionRuntimeEnv(env) && !pool) {
           return jsonResponse(
             {
               verified: false,
@@ -1804,16 +1957,21 @@ export async function handleApiRequest(
         }
 
         // 1. PAYMENT VERIFICATION: Cryptographic Signature & Fail-Closed Credential Check
-        const keyId = env?.["RAZORPAY_KEY_ID"] || process.env["RAZORPAY_KEY_ID"];
-        const secretKey = env?.["RAZORPAY_KEY_SECRET"] || process.env["RAZORPAY_KEY_SECRET"];
-        if (!secretKey) {
+        const isProdRuntime = isProductionRuntimeEnv(env);
+        const keyId = String(
+          env?.["RAZORPAY_KEY_ID"] ?? process.env["RAZORPAY_KEY_ID"] ?? "",
+        ).trim();
+        const secretKey = String(
+          env?.["RAZORPAY_KEY_SECRET"] ?? process.env["RAZORPAY_KEY_SECRET"] ?? "",
+        ).trim();
+        if (!secretKey || (isProdRuntime && !keyId)) {
           return jsonResponse(
             {
               verified: false,
               paymentId,
               orderId,
               error:
-                "Payment verification configuration unavailable on server (RAZORPAY_KEY_SECRET missing). Failed closed.",
+                "Payment verification configuration unavailable on server (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET missing). Failed closed.",
             },
             500,
           );
@@ -1900,12 +2058,12 @@ export async function handleApiRequest(
 
         const expectedPaise = Math.round(expectedAmount * 100);
 
-        // Remote Razorpay API confirmation (status, order_id, amount in paise)
-        const skipRemote = Boolean(
-          env?.["RAZORPAY_SKIP_REMOTE_CHECK"] || process.env["RAZORPAY_SKIP_REMOTE_CHECK"],
-        );
+        // Remote Razorpay API confirmation (mandatory in production; never skipped in production)
+        const rawSkipRemote =
+          env?.["RAZORPAY_SKIP_REMOTE_CHECK"] ?? process.env["RAZORPAY_SKIP_REMOTE_CHECK"];
+        const skipRemote = !isProdRuntime && parseStrictBooleanFlag(rawSkipRemote);
 
-        if (keyId && !skipRemote) {
+        if ((isProdRuntime || keyId) && !skipRemote) {
           try {
             const authHeader = `Basic ${Buffer.from(`${keyId}:${secretKey}`).toString("base64")}`;
             const rzpRes = await fetch(`https://api.razorpay.com/v1/payments/${paymentId}`, {
@@ -2021,7 +2179,13 @@ export async function handleApiRequest(
         }
 
         // 2. AUTHORIZATION & OWNERSHIP VERIFICATION
-        const authUser = await getAuthUserFromRequest(request, store, pool);
+        const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+          request,
+          store,
+          pool,
+          env,
+        );
+        if (earlyResponse) return earlyResponse;
         let uploaderId = requestedUserId;
         if (authUser) {
           if (requestedUserId && requestedUserId.toUpperCase() !== authUser.user_id.toUpperCase()) {
@@ -2065,7 +2229,7 @@ export async function handleApiRequest(
             // Ignore if payment_orders table is not yet migrated
           }
         }
-        if (!orderOwnerId && store.paymentOrders) {
+        if (!isProdRuntime && !orderOwnerId && store.paymentOrders) {
           const po = store.paymentOrders.find((o) => o.order_id === orderId);
           if (po) orderOwnerId = po.user_id;
         }
@@ -2137,7 +2301,7 @@ export async function handleApiRequest(
             } catch (_e) {
               // Ignore video lookup check if table optional
             }
-          } else {
+          } else if (!isProdRuntime) {
             const vid = store.videos.find((v) => v.id === videoId);
             if (vid) {
               if (vid.user_id.toUpperCase() !== uploaderId.toUpperCase()) {
@@ -2820,7 +2984,7 @@ export async function handleApiRequest(
             conn.release();
           }
         } else {
-          if (process.env["NODE_ENV"] === "production") {
+          if (isProductionRuntimeEnv(env)) {
             return jsonResponse(
               {
                 verified: false,
@@ -3254,9 +3418,54 @@ export async function handleApiRequest(
   if (route === "payments/transactions" || route === "payment/transactions") {
     if (method === "GET") {
       try {
+        const pool = resolvePool();
+        if (pool) {
+          try {
+            const [cntRows]: any = await pool.query(
+              "SELECT COALESCE(MAX(tx_number), 0) AS last_tx FROM payment_transactions WHERE purpose = 'premium_video_upload'",
+            );
+            const [txRows]: any = await pool.query(
+              "SELECT * FROM payment_transactions ORDER BY created_at DESC LIMIT 100",
+            );
+            const transactions = Array.isArray(txRows) ? txRows : [];
+            const lastTxNumber = Number(cntRows?.[0]?.last_tx || 0);
+            return jsonResponse({
+              status: "ok",
+              lastTxNumber,
+              totalTransactions: transactions.length,
+              transactions,
+            });
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                {
+                  status: "error",
+                  success: false,
+                  error:
+                    "Database error loading payment transactions: " +
+                    (dbErr?.message || "Query failed"),
+                },
+                503,
+              );
+            }
+          }
+        }
+
+        if (isProd) {
+          return jsonResponse(
+            {
+              status: "error",
+              success: false,
+              error:
+                "Database connection unavailable in production. JSON transaction storage is disabled.",
+            },
+            503,
+          );
+        }
+
         const [lastTxNumber, transactions] = await Promise.all([
-          getPersistentPremiumTxNumber(),
-          getPersistentTransactions(),
+          getPersistentPremiumTxNumber(env),
+          getPersistentTransactions(env),
         ]);
         return jsonResponse({
           status: "ok",
@@ -3265,7 +3474,10 @@ export async function handleApiRequest(
           transactions,
         });
       } catch {
-        return jsonResponse({ status: "error", error: "Failed to load transactions" }, 500);
+        return jsonResponse(
+          { status: "error", success: false, error: "Failed to load transactions" },
+          isProd ? 503 : 500,
+        );
       }
     }
   }
@@ -3292,7 +3504,7 @@ export async function handleApiRequest(
         }
 
         const normalizedEmail = email.trim().toLowerCase();
-        const pool = getMysqlPool();
+        const pool = resolvePool();
 
         if (pool) {
           // Direct Hostinger MySQL execution
@@ -3425,13 +3637,84 @@ export async function handleApiRequest(
             201,
           );
         } else {
+          if (isProductionRuntimeEnv(env)) {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Hostinger MySQL database credentials are not configured in .env. Please define DB_HOST, DB_NAME, DB_USER, and DB_PASSWORD so user records can be inserted into the Hostinger MySQL users table.",
+              },
+              500,
+            );
+          }
+
+          const existing = store.users.find((u) => u.email.toLowerCase() === normalizedEmail);
+          if (existing) {
+            return jsonResponse(
+              {
+                success: false,
+                error: `The email "${normalizedEmail}" is already registered. Please sign in.`,
+              },
+              409,
+            );
+          }
+
+          const userId = generateUserId(store);
+          const uuid = crypto.randomUUID();
+          const passwordHash = await bcrypt.hash(password, 10);
+          const role: "admin" | "user" =
+            normalizedEmail === "admin@facetube.com" ? "admin" : "user";
+          const refCode = referralCode ? referralCode.trim() : null;
+          const now = new Date().toISOString();
+
+          const storedUser = {
+            id: uuid,
+            user_id: userId,
+            name: name.trim(),
+            mobile: (mobile || "").trim(),
+            email: normalizedEmail,
+            password_hash: passwordHash,
+            role,
+            referral_code: refCode,
+            created_at: now,
+          };
+
+          store.users.push(storedUser);
+          if (!store.wallets[userId]) {
+            store.wallets[userId] = {
+              balance: 0,
+              total_earned: 0,
+              total_withdrawn: 0,
+              referral_income: 0,
+              global_income: 0,
+              adsense_income: 0,
+              affiliate_income: 0,
+              updated_at: now,
+            };
+          }
+
+          const token = crypto.randomBytes(24).toString("hex");
+          if (!store.sessions) {
+            store.sessions = {};
+          }
+          store.sessions[token] = userId;
+          saveStore(store);
+
+          const { password_hash: _ph, ...newUser } = storedUser;
           return jsonResponse(
             {
-              success: false,
-              error:
-                "Hostinger MySQL database credentials are not configured in .env. Please define DB_HOST, DB_NAME, DB_USER, and DB_PASSWORD so user records can be inserted into the Hostinger MySQL users table.",
+              success: true,
+              token,
+              user: newUser,
+              userId,
+              emailDelivery: {
+                success: false,
+                provider: "none",
+                error: "SMTP not configured in preview mode",
+              },
+              message: "Registration successful.",
             },
-            500,
+            201,
           );
         }
       } catch (err: unknown) {
@@ -3460,7 +3743,7 @@ export async function handleApiRequest(
           );
         }
 
-        const pool = getMysqlPool();
+        const pool = resolvePool();
 
         if (pool) {
           const [rows]: any = await pool.query(
@@ -3536,7 +3819,7 @@ export async function handleApiRequest(
             message: "Login successful.",
           });
         } else {
-          if (process.env["NODE_ENV"] === "production") {
+          if (isProductionRuntimeEnv(env)) {
             return jsonResponse(
               {
                 success: false,
@@ -3610,7 +3893,7 @@ export async function handleApiRequest(
         const msg = err instanceof Error ? err.message : String(err);
         return jsonResponse(
           { success: false, error: "Database error during authentication: " + msg },
-          500,
+          isProd ? 503 : 500,
         );
       }
     }
@@ -3622,13 +3905,35 @@ export async function handleApiRequest(
         .get("Authorization")
         ?.replace(/^Bearer\s+/i, "")
         ?.trim();
-      const pool = getMysqlPool();
+      const pool = resolvePool();
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Database connection unavailable in production environment.",
+            },
+            503,
+          );
+        }
+        if (auth) {
+          try {
+            await pool.query("DELETE FROM sessions WHERE token = ?", [auth]);
+          } catch {
+            return jsonResponse(
+              { success: false, error: "Database error during logout." },
+              503,
+            );
+          }
+        }
+        return jsonResponse({ success: true, message: "Logged out successfully" });
+      }
       if (auth && pool) {
         pool.query("DELETE FROM sessions WHERE token = ?", [auth]).catch(() => {});
       }
       if (auth && store.sessions && store.sessions[auth]) {
         delete store.sessions[auth];
-        saveStore(store);
+        saveStore(store, env);
       }
       return jsonResponse({ success: true, message: "Logged out successfully" });
     }
@@ -3636,8 +3941,14 @@ export async function handleApiRequest(
 
   if (route === "auth/me") {
     if (method === "GET") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+        request,
+        store,
+        pool,
+        env,
+      );
+      if (earlyResponse) return earlyResponse;
       if (authUser) {
         return jsonResponse({ authenticated: true, user: authUser });
       }
@@ -3649,8 +3960,14 @@ export async function handleApiRequest(
   if (route === "auth/change-password") {
     if (method === "POST") {
       try {
-        const pool = getMysqlPool();
-        const authUser = await getAuthUserFromRequest(request, store, pool);
+        const pool = resolvePool();
+        const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+          request,
+          store,
+          pool,
+          env,
+        );
+        if (earlyResponse) return earlyResponse;
         if (!authUser) {
           return jsonResponse(
             {
@@ -3747,6 +4064,17 @@ export async function handleApiRequest(
             message: "Password changed successfully.",
           });
         } else {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Database connection unavailable in production. Persistent storage is required.",
+              },
+              503,
+            );
+          }
+
           // In-memory / JSON store fallback
           const user = store.users.find(
             (u) =>
@@ -3785,7 +4113,7 @@ export async function handleApiRequest(
 
           const newHash = await bcrypt.hash(newPassword, 10);
           user.password_hash = newHash;
-          saveStore(store);
+          saveStore(store, env);
 
           return jsonResponse({
             success: true,
@@ -3796,7 +4124,7 @@ export async function handleApiRequest(
         const msg = err instanceof Error ? err.message : String(err);
         return jsonResponse(
           { success: false, error: "Database error while updating password: " + msg },
-          500,
+          isProd ? 503 : 500,
         );
       }
     }
@@ -3825,7 +4153,17 @@ export async function handleApiRequest(
             "If an account associated with that User ID or Email exists, a password reset link has been dispatched to your registered email address.",
         };
 
-        const pool = getMysqlPool();
+        const pool = resolvePool();
+        if (isProd && !pool) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database connection unavailable in production. Persistent storage is required.",
+            },
+            503,
+          );
+        }
         let targetUser: { id: string; user_id: string; name: string; email: string } | null = null;
 
         if (pool) {
@@ -3942,7 +4280,7 @@ export async function handleApiRequest(
             used: false,
             created_at: new Date().toISOString(),
           });
-          saveStore(store);
+          saveStore(store, env);
         }
 
         const clientOrigin =
@@ -3964,7 +4302,7 @@ export async function handleApiRequest(
         const msg = err instanceof Error ? err.message : String(err);
         return jsonResponse(
           { success: false, error: "Error processing password reset request: " + msg },
-          500,
+          isProd ? 503 : 500,
         );
       }
     }
@@ -4005,7 +4343,17 @@ export async function handleApiRequest(
         }
 
         const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
-        const pool = getMysqlPool();
+        const pool = resolvePool();
+        if (isProd && !pool) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database connection unavailable in production. Persistent storage is required.",
+            },
+            503,
+          );
+        }
 
         if (pool) {
           const [tokenRows]: any = await pool.query(
@@ -4115,7 +4463,7 @@ export async function handleApiRequest(
             }
           }
 
-          saveStore(store);
+          saveStore(store, env);
 
           return jsonResponse({
             success: true,
@@ -4127,7 +4475,7 @@ export async function handleApiRequest(
         const msg = err instanceof Error ? err.message : String(err);
         return jsonResponse(
           { success: false, error: "Database error while resetting password: " + msg },
-          500,
+          isProd ? 503 : 500,
         );
       }
     }
@@ -4137,9 +4485,15 @@ export async function handleApiRequest(
   if (route === "users/profile") {
     if (method === "GET") {
       const qUserId = url.searchParams.get("userId") || url.searchParams.get("user_id");
+      const pool = resolvePool();
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (qUserId) {
         const norm = qUserId.trim().toUpperCase();
-        const pool = getMysqlPool();
         if (pool) {
           try {
             const [rows]: any = await pool.query(
@@ -4152,8 +4506,13 @@ export async function handleApiRequest(
             if (rows && rows.length > 0) {
               return jsonResponse({ success: true, profile: rows[0] });
             }
-          } catch (_e) {
-            // Ignore query error and fall through
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                { success: false, error: "Database error fetching profile: " + dbErr.message },
+                503,
+              );
+            }
           }
         }
       }
@@ -4162,7 +4521,13 @@ export async function handleApiRequest(
     if (method === "POST") {
       const body = await request.json();
       const targetUserId = body.userId || "FT102857";
-      const pool = getMysqlPool();
+      const pool = resolvePool();
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (pool) {
         try {
           const updates: string[] = [];
@@ -4191,14 +4556,22 @@ export async function handleApiRequest(
                FROM users WHERE id = ? OR UPPER(user_id) = UPPER(?) LIMIT 1`,
               [targetUserId, targetUserId],
             );
+            if (!rows || rows.length === 0) {
+              return jsonResponse({ success: false, error: "User not found" }, 404);
+            }
             return jsonResponse({
               success: true,
               profile: rows[0],
               message: "Profile updated",
             });
           }
-        } catch (_e) {
-          // Ignore update error
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error updating profile: " + dbErr.message },
+              503,
+            );
+          }
         }
       }
       return jsonResponse({ success: false, error: "User not found" }, 404);
@@ -4207,21 +4580,39 @@ export async function handleApiRequest(
 
   if (route === "users/list") {
     if (method === "GET") {
-      const pool = getMysqlPool();
+      const pool = resolvePool();
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (pool) {
         try {
           const [rows]: any = await pool.query(
             `SELECT id, user_id, name, mobile, email, role, referral_code, avatar_url, created_at
              FROM users ORDER BY created_at DESC LIMIT 100`,
           );
+          const list = Array.isArray(rows) ? rows : [];
           return jsonResponse({
             success: true,
-            users: rows,
-            total: rows.length,
+            users: list,
+            total: list.length,
           });
-        } catch (_e) {
-          // Ignore list error
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error listing users: " + dbErr.message },
+              503,
+            );
+          }
         }
+      }
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
       return jsonResponse({
         success: true,
@@ -4240,7 +4631,13 @@ export async function handleApiRequest(
       const category = url.searchParams.get("category");
       const search = url.searchParams.get("search");
 
-      const pool = getMysqlPool();
+      const pool = resolvePool();
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (pool) {
         try {
           const where: string[] = [];
@@ -4284,7 +4681,7 @@ export async function handleApiRequest(
             LIMIT 100
           `;
           const [rows] = (await pool.query(sql, params)) as any;
-          if (Array.isArray(rows) && rows.length > 0) {
+          if (Array.isArray(rows)) {
             const formatted = rows.map((r: any) => {
               const active = isAdPromotionActive({
                 is_promoted: r.is_promoted,
@@ -4334,9 +4731,22 @@ export async function handleApiRequest(
             });
             return jsonResponse({ success: true, videos: formatted, total: formatted.length });
           }
-        } catch (dbErr) {
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error listing videos: " + dbErr.message },
+              503,
+            );
+          }
           console.warn("MySQL videos/list fallback to local store:", dbErr);
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       let filtered = [...store.videos];
@@ -4412,7 +4822,13 @@ export async function handleApiRequest(
       const id = url.searchParams.get("id");
       if (!id) return jsonResponse({ success: false, error: "Missing video id" }, 400);
 
-      const pool = getMysqlPool();
+      const pool = resolvePool();
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (pool) {
         try {
           const [rows] = (await pool.query("SELECT * FROM uploaded_videos WHERE id = ? LIMIT 1", [
@@ -4479,9 +4895,24 @@ export async function handleApiRequest(
               },
             });
           }
-        } catch (_dbErr) {
-          // fallback
+          if (isProd) {
+            return jsonResponse({ success: false, error: "Video not found" }, 404);
+          }
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error loading video: " + dbErr.message },
+              503,
+            );
+          }
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       const v = store.videos.find((item) => item.id === id);
@@ -4593,8 +5024,8 @@ export async function handleApiRequest(
       };
 
       // Persist to MySQL uploaded_videos table if pool is configured
-      const pool = getMysqlPool();
-      if (process.env["NODE_ENV"] === "production" && !pool) {
+      const pool = resolvePool();
+      if (isProd && !pool) {
         return jsonResponse(
           {
             success: false,
@@ -4648,7 +5079,7 @@ export async function handleApiRequest(
           return jsonResponse({ success: true, video: newVideo }, 201);
         } catch (dbErr: any) {
           console.warn("MySQL uploaded_videos insert warning:", dbErr?.message);
-          if (process.env["NODE_ENV"] === "production") {
+          if (isProd) {
             return jsonResponse(
               {
                 success: false,
@@ -4660,7 +5091,7 @@ export async function handleApiRequest(
         }
       }
 
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProd) {
         return jsonResponse(
           {
             success: false,
@@ -4672,7 +5103,7 @@ export async function handleApiRequest(
       }
 
       store.videos.unshift(newVideo);
-      saveStore(store);
+      saveStore(store, env);
       return jsonResponse({ success: true, video: newVideo }, 201);
     }
   }
@@ -4680,12 +5111,44 @@ export async function handleApiRequest(
   if (route === "videos/like") {
     if (method === "POST") {
       const body = await request.json();
+      const pool = resolvePool();
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const [res]: any = await pool.query(
+            "UPDATE uploaded_videos SET likes = likes + 1 WHERE id = ?",
+            [body.videoId],
+          );
+          if (!res || res.affectedRows === 0) {
+            return jsonResponse({ success: false, error: "Video not found" }, 404);
+          }
+          const [rows]: any = await pool.query(
+            "SELECT likes FROM uploaded_videos WHERE id = ? LIMIT 1",
+            [body.videoId],
+          );
+          return jsonResponse({
+            success: true,
+            liked: true,
+            likes: Number(rows?.[0]?.likes || 0),
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error liking video: " + dbErr.message },
+            503,
+          );
+        }
+      }
+
       const vid = store.videos.find((v) => v.id === body.videoId);
       if (vid) {
         vid.likes = (vid.likes || 0) + 1;
-        saveStore(store);
+        saveStore(store, env);
 
-        const pool = getMysqlPool();
         if (pool) {
           try {
             await pool.query("UPDATE uploaded_videos SET likes = likes + 1 WHERE id = ?", [
@@ -4705,6 +5168,53 @@ export async function handleApiRequest(
   if (route === "videos/counts") {
     if (method === "GET") {
       const userId = url.searchParams.get("userId");
+      const pool = resolvePool();
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const sql = userId
+            ? "SELECT video_type, content_type, COUNT(*) AS cnt FROM uploaded_videos WHERE UPPER(user_id) = UPPER(?) GROUP BY video_type, content_type"
+            : "SELECT video_type, content_type, COUNT(*) AS cnt FROM uploaded_videos GROUP BY video_type, content_type";
+          const [rows]: any = await pool.query(sql, userId ? [userId.trim()] : []);
+          let freeShort = 0;
+          let freeLong = 0;
+          let premiumShort = 0;
+          let premiumLong = 0;
+          for (const r of rows || []) {
+            const cnt = Number(r.cnt) || 0;
+            if (r.video_type === "free") {
+              if (r.content_type === "short") freeShort += cnt;
+              else freeLong += cnt;
+            } else if (r.video_type === "premium") {
+              if (r.content_type === "short") premiumShort += cnt;
+              else premiumLong += cnt;
+            }
+          }
+          return jsonResponse({
+            success: true,
+            counts: {
+              freeShort,
+              freeLong,
+              premiumShort,
+              premiumLong,
+              totalFree: freeShort + freeLong,
+              totalPremium: premiumShort + premiumLong,
+              totalUploaded: freeShort + freeLong + premiumShort + premiumLong,
+            },
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error loading video counts: " + dbErr.message },
+            503,
+          );
+        }
+      }
+
       const list = userId
         ? store.videos.filter((v) => v.user_id.toUpperCase() === userId.trim().toUpperCase())
         : store.videos;
@@ -4749,8 +5259,8 @@ export async function handleApiRequest(
       const planId = body.planId || body.plan_id || "plan-monthly";
       const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
 
-      const pool = getMysqlPool();
-      if (process.env["NODE_ENV"] === "production" && !pool) {
+      const pool = resolvePool();
+      if (isProd && !pool) {
         return jsonResponse(
           {
             success: false,
@@ -4774,7 +5284,7 @@ export async function handleApiRequest(
           });
         } catch (dbErr: any) {
           console.warn("MySQL promote error:", dbErr);
-          if (process.env["NODE_ENV"] === "production") {
+          if (isProductionRuntimeEnv(env)) {
             return jsonResponse(
               {
                 success: false,
@@ -4787,7 +5297,7 @@ export async function handleApiRequest(
         }
       }
 
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProductionRuntimeEnv(env)) {
         return jsonResponse(
           {
             success: false,
@@ -4978,6 +5488,40 @@ export async function handleApiRequest(
   if (route === "comments/list") {
     if (method === "GET") {
       const videoId = url.searchParams.get("videoId");
+      const pool = resolvePool();
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const sql = videoId
+            ? "SELECT id, video_id, user_id, user_name, avatar_url, comment, created_at FROM video_comments WHERE video_id = ? ORDER BY created_at DESC LIMIT 200"
+            : "SELECT id, video_id, user_id, user_name, avatar_url, comment, created_at FROM video_comments ORDER BY created_at DESC LIMIT 200";
+          const [rows]: any = await pool.query(sql, videoId ? [videoId] : []);
+          const list = Array.isArray(rows) ? rows : [];
+          return jsonResponse({
+            success: true,
+            comments: list.map((c: any) => ({
+              ...c,
+              videoId: c.video_id,
+              userId: c.user_id,
+              userName: c.user_name,
+              avatarUrl: c.avatar_url,
+              createdAt: c.created_at,
+            })),
+            total: list.length,
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error loading comments: " + dbErr.message },
+            503,
+          );
+        }
+      }
+
       const cmts = videoId ? store.comments.filter((c) => c.video_id === videoId) : store.comments;
       return jsonResponse({
         success: true,
@@ -4997,6 +5541,7 @@ export async function handleApiRequest(
   if (route === "comments/create") {
     if (method === "POST") {
       const body = await request.json();
+      const pool = resolvePool();
       const newComment = {
         id: `cmt-${Date.now()}`,
         video_id: body.videoId,
@@ -5006,8 +5551,37 @@ export async function handleApiRequest(
         comment: body.comment,
         created_at: new Date().toISOString(),
       };
+
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          await pool.query(
+            "INSERT INTO video_comments (id, video_id, user_id, user_name, avatar_url, comment, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())",
+            [
+              newComment.id,
+              newComment.video_id,
+              newComment.user_id,
+              newComment.user_name,
+              newComment.avatar_url || null,
+              newComment.comment,
+            ],
+          );
+          return jsonResponse({ success: true, comment: newComment });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error saving comment: " + dbErr.message },
+            503,
+          );
+        }
+      }
+
       store.comments.unshift(newComment);
-      saveStore(store);
+      saveStore(store, env);
       return jsonResponse({ success: true, comment: newComment });
     }
   }
@@ -5016,14 +5590,20 @@ export async function handleApiRequest(
   if (route === "images/list") {
     if (method === "GET") {
       const userId = url.searchParams.get("userId");
-      const pool = getMysqlPool();
+      const pool = resolvePool();
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (pool) {
         try {
           const sql = userId
             ? "SELECT * FROM uploaded_images WHERE UPPER(user_id) = UPPER(?) ORDER BY created_at DESC"
             : "SELECT * FROM uploaded_images ORDER BY created_at DESC";
           const [rows] = (await pool.query(sql, userId ? [userId.trim()] : [])) as any;
-          if (Array.isArray(rows) && rows.length > 0) {
+          if (Array.isArray(rows)) {
             const mapped = rows.map((r: any) => ({
               id: String(r.id),
               userId: r.user_id,
@@ -5047,9 +5627,21 @@ export async function handleApiRequest(
             }));
             return jsonResponse({ success: true, images: mapped, total: mapped.length });
           }
-        } catch (_dbErr) {
-          // fallback to store.images
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error loading images: " + dbErr.message },
+              503,
+            );
+          }
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       const imgs = userId
@@ -5104,7 +5696,13 @@ export async function handleApiRequest(
         created_at: new Date().toISOString(),
       };
 
-      const pool = getMysqlPool();
+      const pool = resolvePool();
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (pool) {
         try {
           await pool.query(
@@ -5122,13 +5720,39 @@ export async function handleApiRequest(
               newImage.category,
             ],
           );
-        } catch (_dbErr) {
-          // ignore error if MySQL is unreachable
+          if (isProd) {
+            return jsonResponse({
+              success: true,
+              image: {
+                ...newImage,
+                userId: newImage.user_id,
+                creatorName: newImage.creator_name,
+                imageUrl: newImage.image_url,
+                thumbnailUrl: newImage.thumbnail_url,
+                fileSize: newImage.file_size,
+                createdAt: newImage.created_at,
+              },
+            });
+          }
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error creating image: " + dbErr.message },
+              503,
+            );
+          }
         }
       }
 
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
+
       store.images.unshift(newImage);
-      saveStore(store);
+      saveStore(store, env);
       return jsonResponse({
         success: true,
         image: {
@@ -5148,8 +5772,11 @@ export async function handleApiRequest(
   if (route === "wallet/balance") {
     if (method === "GET") {
       const qUserId = url.searchParams.get("userId") || url.searchParams.get("user_id");
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       const auth = requireAuth(authUser, qUserId);
       if (!auth.success) {
         return auth.response;
@@ -5202,8 +5829,39 @@ export async function handleApiRequest(
               },
             });
           }
+          if (isProd) {
+            const nowIso = new Date().toISOString();
+            return jsonResponse({
+              success: true,
+              wallet: {
+                userId,
+                user_id: userId,
+                balance: 0,
+                totalBalance: 0,
+                withdrawableBalance: 0,
+                referralIncome: 0,
+                referral_income: 0,
+                directReferralIncome: 0,
+                globalIncome: 0,
+                global_income: 0,
+                adsenseIncome: 0,
+                adsense_income: 0,
+                admobIncome: 0,
+                admob_income: 0,
+                affiliateIncome: 0,
+                affiliate_income: 0,
+                totalEarnings: 0,
+                total_earned: 0,
+                totalWithdrawn: 0,
+                total_withdrawn: 0,
+                pendingWithdrawals: 0,
+                updatedAt: nowIso,
+                updated_at: nowIso,
+              },
+            });
+          }
         } catch (_e) {
-          if (process.env["NODE_ENV"] === "production") {
+          if (isProd) {
             return jsonResponse(
               {
                 success: false,
@@ -5215,7 +5873,7 @@ export async function handleApiRequest(
         }
       }
 
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProd) {
         return jsonResponse(
           {
             success: false,
@@ -5272,8 +5930,11 @@ export async function handleApiRequest(
   if (route === "wallet/transactions") {
     if (method === "GET") {
       const qUserId = url.searchParams.get("userId") || url.searchParams.get("user_id");
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       if (!authUser) {
         return jsonResponse(
           {
@@ -5288,6 +5949,17 @@ export async function handleApiRequest(
         return auth.response;
       }
       const targetUserId = auth.effectiveUserId;
+
+      if (isProd && !pool) {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Database connection unavailable. In production, wallet transactions require a persistent database connection.",
+          },
+          503,
+        );
+      }
 
       if (pool) {
         try {
@@ -5320,7 +5992,7 @@ export async function handleApiRequest(
               });
             }
           } catch (_e2) {
-            if (process.env["NODE_ENV"] === "production") {
+            if (isProd) {
               return jsonResponse(
                 {
                   success: false,
@@ -5333,7 +6005,7 @@ export async function handleApiRequest(
         }
       }
 
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProd) {
         return jsonResponse(
           {
             success: false,
@@ -5362,8 +6034,11 @@ export async function handleApiRequest(
 
   if (route === "wallet/withdraw") {
     if (method === "POST") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       if (!authUser) {
         return jsonResponse(
           {
@@ -5716,7 +6391,7 @@ export async function handleApiRequest(
         }
       }
 
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProductionRuntimeEnv(env)) {
         return jsonResponse(
           {
             success: false,
@@ -5877,7 +6552,7 @@ export async function handleApiRequest(
         created_at: new Date().toISOString(),
       };
       store.walletTransactions.unshift(tx);
-      saveStore(store);
+      saveStore(store, env);
 
       return jsonResponse({
         success: true,
@@ -5896,7 +6571,7 @@ export async function handleApiRequest(
 
   // 9. KYC
   if (route === "kyc/personal") {
-    if (process.env["NODE_ENV"] === "production") {
+    if (isProd) {
       return jsonResponse(
         {
           success: false,
@@ -5921,7 +6596,7 @@ export async function handleApiRequest(
         status: "Submitted",
         updatedAt: new Date().toISOString(),
       };
-      saveStore(store);
+      saveStore(store, env);
       return jsonResponse({
         success: true,
         message: "Personal KYC saved",
@@ -5931,7 +6606,7 @@ export async function handleApiRequest(
   }
 
   if (route === "kyc/bank") {
-    if (process.env["NODE_ENV"] === "production") {
+    if (isProd) {
       return jsonResponse(
         {
           success: false,
@@ -5956,7 +6631,7 @@ export async function handleApiRequest(
         status: "Submitted",
         updatedAt: new Date().toISOString(),
       };
-      saveStore(store);
+      saveStore(store, env);
       return jsonResponse({ success: true, message: "Bank KYC saved", kyc: store.bankKyc[userId] });
     }
   }
@@ -5965,13 +6640,27 @@ export async function handleApiRequest(
   if (route === "referrals/dashboard") {
     if (method === "GET") {
       const qUserId = url.searchParams.get("userId") || url.searchParams.get("user_id");
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       const auth = requireAuth(authUser, qUserId);
       if (!auth.success) {
         return auth.response;
       }
       const userId = auth.effectiveUserId;
+
+      if (isProd && !pool) {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Database connection unavailable. In production, referrals dashboard requires a persistent database connection.",
+          },
+          503,
+        );
+      }
 
       if (pool) {
         try {
@@ -6056,9 +6745,27 @@ export async function handleApiRequest(
               },
             });
           }
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "User record not found in database." },
+              404,
+            );
+          }
         } catch (_e) {
-          // fallback to store
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error loading referrals dashboard." },
+              503,
+            );
+          }
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       // Store fallback:
@@ -6123,13 +6830,27 @@ export async function handleApiRequest(
     if (method === "GET") {
       const qUserId = url.searchParams.get("userId") || url.searchParams.get("user_id");
       const levelParam = url.searchParams.get("level");
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       const auth = requireAuth(authUser, qUserId);
       if (!auth.success) {
         return auth.response;
       }
       const userId = auth.effectiveUserId;
+
+      if (isProd && !pool) {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Database connection unavailable. In production, referral team queries require a persistent database connection.",
+          },
+          503,
+        );
+      }
 
       let downline: ReturnType<typeof calculateDownlineLevelsTs>;
 
@@ -6148,6 +6869,12 @@ export async function handleApiRequest(
             downline = calculateDownlineLevelsTs(userId, [], 10);
           }
         } catch (_e) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error loading referral team." },
+              503,
+            );
+          }
           downline = calculateDownlineLevelsTs(userId, store.users, 10);
         }
       } else {
@@ -6176,6 +6903,16 @@ export async function handleApiRequest(
   // 11. Certificates
   if (route === "certificates/get") {
     if (method === "GET") {
+      if (isProd) {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Database connection unavailable. In production, certificates cannot be loaded from local JSON fallback.",
+          },
+          503,
+        );
+      }
       const userId = (url.searchParams.get("userId") || "FT102857").toUpperCase();
       const cert = store.certificates[userId] || {
         certificateId: `FT-CERT-${userId}`,
@@ -6190,10 +6927,20 @@ export async function handleApiRequest(
 
   if (route === "certificates/save") {
     if (method === "POST") {
+      if (isProd) {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Database connection unavailable. In production, certificates cannot be saved to local JSON fallback.",
+          },
+          503,
+        );
+      }
       const body = await request.json();
       const userId = (body.userId || "FT102857").toUpperCase();
       store.certificates[userId] = body;
-      saveStore(store);
+      saveStore(store, env);
       return jsonResponse({
         success: true,
         message: "Certificate saved successfully",
@@ -6205,6 +6952,16 @@ export async function handleApiRequest(
   // 12. Uploads Mock
   if (route.startsWith("uploads/")) {
     if (method === "POST") {
+      if (isProd) {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Upload storage endpoint unavailable; use /api/uploads/video or /api/uploads/image in production.",
+          },
+          503,
+        );
+      }
       return jsonResponse({
         success: true,
         url: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800&auto=format&fit=crop&q=60",
@@ -6218,6 +6975,91 @@ export async function handleApiRequest(
   // 13. Admin
   if (route === "admin/stats") {
     if (method === "GET") {
+      if (isProd) {
+        const pool = resolvePool();
+        const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+          request,
+          store,
+          pool,
+          env,
+        );
+        if (earlyResponse) {
+          return earlyResponse;
+        }
+        if (!authUser) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Authentication required. Please provide a valid Bearer session token.",
+            },
+            401,
+          );
+        }
+        if (authUser.role !== "admin") {
+          return jsonResponse(
+            { success: false, error: "Admin authorization required." },
+            403,
+          );
+        }
+        if (!pool) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Database connection unavailable in production.",
+            },
+            503,
+          );
+        }
+        try {
+          const [uRows]: any = await pool.query("SELECT COUNT(*) AS cnt FROM users");
+          const [vRows]: any = await pool.query("SELECT COUNT(*) AS cnt FROM uploaded_videos");
+          const [txRows]: any = await pool.query(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS rev FROM payment_transactions",
+          );
+          let activeSubscriptions = 0;
+          try {
+            const [subRows]: any = await pool.query(
+              "SELECT COUNT(*) AS cnt FROM user_subscriptions WHERE status = 'active' AND expires_at > NOW()",
+            );
+            activeSubscriptions = Number(subRows?.[0]?.cnt || 0);
+          } catch {
+            activeSubscriptions = 0;
+          }
+          let pendingKyc = 0;
+          try {
+            const [pkRows]: any = await pool.query(
+              "SELECT COUNT(*) AS cnt FROM personal_kyc WHERE LOWER(status) IN ('submitted', 'pending')",
+            );
+            pendingKyc += Number(pkRows?.[0]?.cnt || 0);
+          } catch {
+            // Optional table
+          }
+          try {
+            const [bkRows]: any = await pool.query(
+              "SELECT COUNT(*) AS cnt FROM bank_kyc WHERE LOWER(status) IN ('submitted', 'pending')",
+            );
+            pendingKyc += Number(bkRows?.[0]?.cnt || 0);
+          } catch {
+            // Optional table
+          }
+          return jsonResponse({
+            success: true,
+            stats: {
+              totalUsers: Number(uRows?.[0]?.cnt || 0),
+              totalVideos: Number(vRows?.[0]?.cnt || 0),
+              totalTransactions: Number(txRows?.[0]?.cnt || 0),
+              totalRevenue: Number(txRows?.[0]?.rev || 0),
+              activeSubscriptions,
+              pendingKyc,
+            },
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error loading admin stats: " + dbErr.message },
+            503,
+          );
+        }
+      }
       return jsonResponse({
         success: true,
         stats: {
@@ -6234,8 +7076,11 @@ export async function handleApiRequest(
 
   if (route === "admin/role") {
     if (method === "POST") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       if (!authUser) {
         return jsonResponse(
           {
@@ -6255,7 +7100,7 @@ export async function handleApiRequest(
         );
       }
 
-      if (process.env["NODE_ENV"] === "production" && !pool) {
+      if (isProd && !pool) {
         return jsonResponse(
           {
             success: false,
@@ -6290,13 +7135,20 @@ export async function handleApiRequest(
           }
           return jsonResponse({ success: false, error: "User not found" }, 404);
         } catch (dbErr: any) {
-          if (process.env["NODE_ENV"] === "production") {
+          if (isProd) {
             return jsonResponse(
               { success: false, error: "Database error during role update: " + dbErr.message },
               503,
             );
           }
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       const user = store.users.find(
@@ -6306,7 +7158,7 @@ export async function handleApiRequest(
       );
       if (user) {
         user.role = newRole;
-        saveStore(store);
+        saveStore(store, env);
         return jsonResponse({
           success: true,
           message: `User role updated to ${newRole} successfully.`,
@@ -6318,13 +7170,48 @@ export async function handleApiRequest(
 
   // 14. Admin Video Moderation (Shorts & Long Videos)
   if (route === "admin/videos") {
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser || authUser.role !== "admin") {
       return jsonResponse({ success: false, error: "Admin authorization required" }, 403);
     }
 
     if (method === "GET") {
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const [rows]: any = await pool.query(
+            "SELECT * FROM uploaded_videos ORDER BY created_at DESC",
+          );
+          const list = (Array.isArray(rows) ? rows : []).map((v: any) => ({
+            ...v,
+            is_blocked: Boolean(v.is_blocked),
+          }));
+          return jsonResponse({
+            success: true,
+            videos: list,
+            counts: {
+              total: list.length,
+              blocked: list.filter((v: any) => v.is_blocked).length,
+              shorts: list.filter((v: any) => v.content_type === "short").length,
+              long: list.filter((v: any) => v.content_type === "long").length,
+            },
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error loading videos: " + dbErr.message },
+            503,
+          );
+        }
+      }
       const list = store.videos.map((v) => ({
         ...v,
         is_blocked: Boolean(v.is_blocked),
@@ -6347,12 +7234,41 @@ export async function handleApiRequest(
       const isBlocked = Boolean(body.isBlocked ?? body.is_blocked);
       const reason = body.reason || body.block_reason || "Content moderation policy violation";
 
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const [res]: any = await pool.query(
+            "UPDATE uploaded_videos SET is_blocked = ?, block_reason = ?, blocked_at = ? WHERE id = ?",
+            [isBlocked ? 1 : 0, isBlocked ? reason : null, isBlocked ? new Date() : null, videoId],
+          );
+          if (!res || res.affectedRows === 0) {
+            return jsonResponse({ success: false, error: "Video not found" }, 404);
+          }
+          return jsonResponse({
+            success: true,
+            message: isBlocked ? "Video has been blocked" : "Video has been unblocked",
+            video_id: videoId,
+            is_blocked: isBlocked,
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error moderating video: " + dbErr.message },
+            503,
+          );
+        }
+      }
+
       const vid = store.videos.find((v) => v.id === videoId);
       if (vid) {
         vid.is_blocked = isBlocked;
         vid.block_reason = isBlocked ? reason : undefined;
         vid.blocked_at = isBlocked ? new Date().toISOString() : undefined;
-        saveStore(store);
+        saveStore(store, env);
       }
       if (pool) {
         await pool
@@ -6374,10 +7290,23 @@ export async function handleApiRequest(
   // 15. Admin Bulk Withdrawal Payouts
   if (route === "admin/bulk-payout") {
     if (method === "POST") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       if (!authUser || authUser.role !== "admin") {
         return jsonResponse({ success: false, error: "Admin authorization required" }, 403);
+      }
+      if (isProd && !pool) {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Database connection unavailable. In production, bulk payouts require a persistent database connection.",
+          },
+          503,
+        );
       }
 
       const body = await request.json();
@@ -7061,7 +7990,7 @@ export async function handleApiRequest(
             notes: `${notes} (Chunk failure: ${chunkErr.message})`,
             created_at: new Date().toISOString(),
           });
-          saveStore(store);
+          saveStore(store, env);
 
           return jsonResponse(
             {
@@ -7090,7 +8019,7 @@ export async function handleApiRequest(
         notes,
         created_at: new Date().toISOString(),
       });
-      saveStore(store);
+      saveStore(store, env);
 
       return jsonResponse({
         success: true,
@@ -7118,8 +8047,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -7137,6 +8069,16 @@ export async function handleApiRequest(
           error: "Admin authorization required. Access denied.",
         },
         403,
+      );
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Database connection unavailable in production.",
+        },
+        503,
       );
     }
 
@@ -7208,69 +8150,71 @@ export async function handleApiRequest(
 
     // 1. Load from MySQL if active
     if (pool) {
-      try {
-        if (typeFilter === "all" || typeFilter === "personal") {
-          let pRows: any[] = [];
+      if (typeFilter === "all" || typeFilter === "personal") {
+        let pRows: any[] = [];
+        try {
+          const [rows]: any = await pool.query(
+            "SELECT * FROM personal_kyc ORDER BY updated_at DESC",
+          );
+          pRows = rows || [];
+        } catch (_e1) {
           try {
-            const [rows]: any = await pool.query(
-              "SELECT * FROM personal_kyc ORDER BY updated_at DESC",
+            const [rows2]: any = await pool.query(
+              "SELECT * FROM kyc_records ORDER BY updated_at DESC",
             );
-            pRows = rows || [];
-          } catch (_e1) {
-            try {
-              const [rows2]: any = await pool.query(
-                "SELECT * FROM kyc_records ORDER BY updated_at DESC",
+            pRows = rows2 || [];
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                { success: false, error: "Database error loading personal KYC: " + dbErr.message },
+                503,
               );
-              pRows = rows2 || [];
-            } catch (_e2) {
-              // fallback
-            }
-          }
-          for (const r of pRows) {
-            const item = formatPersonalKycRow(r);
-            const key = `personal_${item.userId.toUpperCase()}`;
-            if (!seen[key]) {
-              seen[key] = true;
-              allSubmissions.push(item);
             }
           }
         }
-      } catch (_e) {
-        // Safe fallback
+        for (const r of pRows) {
+          const item = formatPersonalKycRow(r);
+          const key = `personal_${item.userId.toUpperCase()}`;
+          if (!seen[key]) {
+            seen[key] = true;
+            allSubmissions.push(item);
+          }
+        }
       }
 
-      try {
-        if (typeFilter === "all" || typeFilter === "bank") {
-          let bRows: any[] = [];
+      if (typeFilter === "all" || typeFilter === "bank") {
+        let bRows: any[] = [];
+        try {
+          const [rows]: any = await pool.query("SELECT * FROM bank_kyc ORDER BY updated_at DESC");
+          bRows = rows || [];
+        } catch (_e1) {
           try {
-            const [rows]: any = await pool.query("SELECT * FROM bank_kyc ORDER BY updated_at DESC");
-            bRows = rows || [];
-          } catch (_e1) {
-            try {
-              const [rows2]: any = await pool.query(
-                "SELECT * FROM kyc_bank_details ORDER BY updated_at DESC",
+            const [rows2]: any = await pool.query(
+              "SELECT * FROM kyc_bank_details ORDER BY updated_at DESC",
+            );
+            bRows = rows2 || [];
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                { success: false, error: "Database error loading bank KYC: " + dbErr.message },
+                503,
               );
-              bRows = rows2 || [];
-            } catch (_e2) {
-              // fallback
-            }
-          }
-          for (const r of bRows) {
-            const item = formatBankKycRow(r);
-            const key = `bank_${item.userId.toUpperCase()}`;
-            if (!seen[key]) {
-              seen[key] = true;
-              allSubmissions.push(item);
             }
           }
         }
-      } catch (_e) {
-        // Safe fallback
+        for (const r of bRows) {
+          const item = formatBankKycRow(r);
+          const key = `bank_${item.userId.toUpperCase()}`;
+          if (!seen[key]) {
+            seen[key] = true;
+            allSubmissions.push(item);
+          }
+        }
       }
     }
 
-    // 2. Load/merge from local/preview store
-    if (store.personalKyc && (typeFilter === "all" || typeFilter === "personal")) {
+    // 2. Load/merge from local/preview store (never in production)
+    if (!isProd && store.personalKyc && (typeFilter === "all" || typeFilter === "personal")) {
       for (const [uId, r] of Object.entries(store.personalKyc)) {
         const key = `personal_${uId.toUpperCase()}`;
         if (!seen[key] && r && typeof r === "object") {
@@ -7280,7 +8224,7 @@ export async function handleApiRequest(
       }
     }
 
-    if (store.bankKyc && (typeFilter === "all" || typeFilter === "bank")) {
+    if (!isProd && store.bankKyc && (typeFilter === "all" || typeFilter === "bank")) {
       for (const [uId, r] of Object.entries(store.bankKyc)) {
         const key = `bank_${uId.toUpperCase()}`;
         if (!seen[key] && r && typeof r === "object") {
@@ -7385,8 +8329,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -7404,6 +8351,16 @@ export async function handleApiRequest(
           error: "Admin authorization required. Access denied.",
         },
         403,
+      );
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Database connection unavailable in production.",
+        },
+        503,
       );
     }
 
@@ -7453,6 +8410,7 @@ export async function handleApiRequest(
     const newStatus = decision === "approved" ? "Verified" : "Rejected";
 
     let targetRecord: any = null;
+    let resolvedTableName = type === "personal" ? "personal_kyc" : "bank_kyc";
 
     // 1. Locate in MySQL if available
     if (pool) {
@@ -7464,6 +8422,7 @@ export async function handleApiRequest(
         );
         if (rows && rows.length > 0) {
           targetRecord = rows[0];
+          resolvedTableName = tbl;
         }
       } catch (_e1) {
         try {
@@ -7474,16 +8433,22 @@ export async function handleApiRequest(
           );
           if (rows2 && rows2.length > 0) {
             targetRecord = rows2[0];
+            resolvedTableName = tblFallback;
           }
-        } catch (_e2) {
-          // ignore
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error loading KYC submission: " + dbErr.message },
+              503,
+            );
+          }
         }
       }
     }
 
-    // 2. Locate in local store if not found in DB
+    // 2. Locate in local store if not found in DB (never in production)
     const prop = type === "personal" ? "personalKyc" : "bankKyc";
-    if (!targetRecord && store[prop] && store[prop][userId]) {
+    if (!isProd && !targetRecord && store[prop] && store[prop][userId]) {
       targetRecord = store[prop][userId];
     }
 
@@ -7526,15 +8491,14 @@ export async function handleApiRequest(
     // 3. Update in MySQL
     if (pool) {
       try {
-        const tbl = type === "personal" ? "personal_kyc" : "bank_kyc";
         await pool.query(
-          `UPDATE ${tbl} SET status = ?, updated_at = NOW() WHERE UPPER(user_id) = UPPER(?)`,
+          `UPDATE ${resolvedTableName} SET status = ?, updated_at = NOW() WHERE UPPER(user_id) = UPPER(?)`,
           [newStatus, userId],
         );
 
         try {
           await pool.query(
-            `UPDATE ${tbl} SET reviewed_by = ?, reviewed_at = NOW(), admin_note = ?, rejection_reason = ? WHERE UPPER(user_id) = UPPER(?)`,
+            `UPDATE ${resolvedTableName} SET reviewed_by = ?, reviewed_at = NOW(), admin_note = ?, rejection_reason = ? WHERE UPPER(user_id) = UPPER(?)`,
             [
               adminUserId,
               adminNote || null,
@@ -7565,17 +8529,18 @@ export async function handleApiRequest(
         } catch (_logEx) {
           // audit table might not exist
         }
-      } catch (_e) {
-        // Fallback to json
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error updating KYC review: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    // 4. Update in local store
-    if (!store[prop]) store[prop] = {};
-    if (!store[prop][userId]) store[prop][userId] = targetRecord;
-
-    store[prop][userId] = {
-      ...store[prop][userId],
+    const updatedKyc = {
+      ...targetRecord,
       status: newStatus,
       reviewedBy: adminUserId,
       reviewedAt: nowIso,
@@ -7584,16 +8549,32 @@ export async function handleApiRequest(
       updatedAt: nowIso,
     };
 
-    if (!store.kycAuditLog) store.kycAuditLog = [];
-    store.kycAuditLog.unshift(auditEntry);
-    saveStore(store);
+    // 4. Update in local store (never in production)
+    if (!isProd) {
+      if (!store[prop]) store[prop] = {};
+      if (!store[prop][userId]) store[prop][userId] = targetRecord;
+
+      store[prop][userId] = {
+        ...store[prop][userId],
+        status: newStatus,
+        reviewedBy: adminUserId,
+        reviewedAt: nowIso,
+        adminNote: adminNote || null,
+        rejectionReason: decision === "rejected" ? rejectionReason : null,
+        updatedAt: nowIso,
+      };
+
+      if (!store.kycAuditLog) store.kycAuditLog = [];
+      store.kycAuditLog.unshift(auditEntry);
+      saveStore(store, env);
+    }
 
     return jsonResponse({
       success: true,
       message: `KYC ${type} submission for user ${userId} has been ${newStatus} successfully.`,
       decision,
       status: newStatus,
-      kyc: store[prop][userId],
+      kyc: isProd ? updatedKyc : store[prop][userId],
       audit: auditEntry,
     });
   }
@@ -7604,8 +8585,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -7623,6 +8607,13 @@ export async function handleApiRequest(
           error: "Admin authorization required. Access denied.",
         },
         403,
+      );
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
       );
     }
 
@@ -7661,13 +8652,18 @@ export async function handleApiRequest(
             createdAt: String(r.created_at),
           });
         }
-      } catch (_e) {
-        // Table unapplied
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error loading KYC audit log: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    // 2. Load from local store
-    if (Array.isArray(store.kycAuditLog)) {
+    // 2. Load from local store (never in production)
+    if (!isProd && Array.isArray(store.kycAuditLog)) {
       for (const r of store.kycAuditLog) {
         const id = String(r["id"] || "");
         if (id && !seen[id]) {
@@ -7729,21 +8725,54 @@ export async function handleApiRequest(
   // 16. Channel Logo & Details
   if (route === "users/channel-logo") {
     if (method === "POST") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       if (!authUser) {
         return jsonResponse({ success: false, error: "Authentication required" }, 401);
       }
       const body = await request.json();
       const logoUrl = body.channel_logo_url || body.channelLogoUrl;
       const channelName = body.channel_name || body.channelName;
+
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const [res]: any = await pool.query(
+            "UPDATE users SET channel_logo_url = COALESCE(?, channel_logo_url), channel_name = COALESCE(?, channel_name), updated_at = NOW() WHERE UPPER(user_id) = UPPER(?)",
+            [logoUrl || null, channelName || null, authUser.user_id],
+          );
+          if (!res || res.affectedRows === 0) {
+            return jsonResponse({ success: false, error: "User not found" }, 404);
+          }
+          return jsonResponse({
+            success: true,
+            message: "Channel details updated successfully",
+            channel_logo_url: logoUrl || null,
+            channel_name: channelName || null,
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error updating channel details: " + dbErr.message },
+            503,
+          );
+        }
+      }
+
       const user = store.users.find(
         (u) => u.user_id.toUpperCase() === authUser.user_id.toUpperCase(),
       );
       if (user) {
         if (logoUrl) user.channel_logo_url = logoUrl;
         if (channelName) user.channel_name = channelName;
-        saveStore(store);
+        saveStore(store, env);
       }
       if (pool) {
         await pool
@@ -7765,9 +8794,18 @@ export async function handleApiRequest(
   // 17. Wallet Earnings Time-Series History
   if (route === "wallet/earnings-history") {
     if (method === "GET") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       const requestedUserId = url.searchParams.get("user_id") || authUser?.user_id || "FT483921";
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       const rawPeriod = (url.searchParams.get("period") || "").toUpperCase();
       const rawDays = parseInt(url.searchParams.get("days") || "0", 10);
 
@@ -7922,9 +8960,25 @@ export async function handleApiRequest(
             summary,
             history: Object.values(timelineMap),
           });
-        } catch (dbErr) {
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error: "Database error loading earnings history: " + dbErr.message,
+              },
+              503,
+            );
+          }
           console.warn("[Earnings History] MySQL query failed, falling back to store:", dbErr);
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       // 2. Fallback to local store
@@ -8079,6 +9133,26 @@ export async function handleApiRequest(
   // 18. Live Streams & Chat
   if (route === "live/streams") {
     if (method === "GET") {
+      if (isProd) {
+        const pool = resolvePool();
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const [rows]: any = await pool.query(
+            "SELECT * FROM live_streams ORDER BY created_at DESC",
+          );
+          return jsonResponse({ success: true, streams: Array.isArray(rows) ? rows : [] });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error loading live streams: " + dbErr.message },
+            503,
+          );
+        }
+      }
       if (!store.liveStreams || store.liveStreams.length === 0) {
         store.liveStreams = [
           {
@@ -8096,13 +9170,17 @@ export async function handleApiRequest(
             created_at: new Date().toISOString(),
           },
         ];
-        saveStore(store);
+        saveStore(store, env);
       }
       return jsonResponse({ success: true, streams: store.liveStreams });
     }
     if (method === "POST") {
-      const pool = getMysqlPool();
-      if (process.env["NODE_ENV"] === "production" && !pool) {
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
+      if (isProd && !pool) {
         return jsonResponse(
           {
             success: false,
@@ -8111,7 +9189,6 @@ export async function handleApiRequest(
           503,
         );
       }
-      const authUser = await getAuthUserFromRequest(request, store, pool);
       if (!authUser) {
         return jsonResponse({ success: false, error: "Authentication required" }, 401);
       }
@@ -8167,14 +9244,21 @@ export async function handleApiRequest(
                 newStream.thumbnail_url || null,
               ],
             );
-          } catch (_e) {
-            // Ignore
+          } catch (dbErr2: any) {
+            if (isProd) {
+              return jsonResponse(
+                { success: false, error: "Database error creating stream: " + dbErr2.message },
+                503,
+              );
+            }
           }
         }
       }
-      if (!store.liveStreams) store.liveStreams = [];
-      store.liveStreams.unshift(newStream);
-      saveStore(store);
+      if (!isProd) {
+        if (!store.liveStreams) store.liveStreams = [];
+        store.liveStreams.unshift(newStream);
+        saveStore(store, env);
+      }
       return jsonResponse({ success: true, message: "Stream created", stream: newStream }, 201);
     }
   }
@@ -8184,8 +9268,12 @@ export async function handleApiRequest(
     if (method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    if (process.env["NODE_ENV"] === "production" && !pool) {
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
+    if (isProd && !pool) {
       return jsonResponse(
         {
           success: false,
@@ -8195,7 +9283,6 @@ export async function handleApiRequest(
       );
     }
 
-    const authUser = await getAuthUserFromRequest(request, store, pool);
     if (!authUser) {
       return jsonResponse(
         { success: false, error: "Authentication required to access live stream token" },
@@ -8218,12 +9305,17 @@ export async function handleApiRequest(
         if (rows && rows.length > 0) {
           stream = rows[0];
         }
-      } catch (_e) {
-        // Fallback
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error loading stream: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    if (!stream) {
+    if (!isProd && !stream) {
       stream = (store.liveStreams || []).find((s) => s.id === streamId);
     }
 
@@ -8292,8 +9384,12 @@ export async function handleApiRequest(
     if (method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    if (process.env["NODE_ENV"] === "production" && !pool) {
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
+    if (isProd && !pool) {
       return jsonResponse(
         {
           success: false,
@@ -8303,7 +9399,6 @@ export async function handleApiRequest(
       );
     }
 
-    const authUser = await getAuthUserFromRequest(request, store, pool);
     if (!authUser) {
       return jsonResponse({ success: false, error: "Authentication required" }, 401);
     }
@@ -8323,12 +9418,17 @@ export async function handleApiRequest(
         if (rows && rows.length > 0) {
           stream = rows[0];
         }
-      } catch (_e) {
-        // Fallback
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error loading stream: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    if (!stream) {
+    if (!isProd && !stream) {
       stream = (store.liveStreams || []).find((s) => s.id === streamId);
     }
 
@@ -8358,19 +9458,26 @@ export async function handleApiRequest(
             "UPDATE live_streams SET broadcaster_last_ping_at = NOW() WHERE id = ?",
             [stream.id],
           );
-        } catch (_e) {
-          // Ignore
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error updating heartbeat: " + dbErr.message },
+              503,
+            );
+          }
         }
       }
     } else {
-      // Record presence in live_stream_viewers without using it as authoritative count
-      if (!store.liveStreamViewers) store.liveStreamViewers = {};
-      const viewerKey = `${stream.id}_${authUser.user_id}`;
-      store.liveStreamViewers[viewerKey] = {
-        stream_id: stream.id,
-        user_id: authUser.user_id,
-        last_seen_at: new Date().toISOString(),
-      };
+      if (!isProd) {
+        // Record presence in live_stream_viewers without using it as authoritative count
+        if (!store.liveStreamViewers) store.liveStreamViewers = {};
+        const viewerKey = `${stream.id}_${authUser.user_id}`;
+        store.liveStreamViewers[viewerKey] = {
+          stream_id: stream.id,
+          user_id: authUser.user_id,
+          last_seen_at: new Date().toISOString(),
+        };
+      }
       if (pool) {
         try {
           await pool.query(
@@ -8379,12 +9486,19 @@ export async function handleApiRequest(
              ON DUPLICATE KEY UPDATE last_heartbeat_at = NOW()`,
             [stream.id, authUser.user_id],
           );
-        } catch (_e) {
-          // Ignore
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error recording viewer heartbeat: " + dbErr.message },
+              503,
+            );
+          }
         }
       }
     }
-    saveStore(store);
+    if (!isProd) {
+      saveStore(store, env);
+    }
 
     return jsonResponse({
       success: true,
@@ -8400,8 +9514,12 @@ export async function handleApiRequest(
     if (method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    if (process.env["NODE_ENV"] === "production" && !pool) {
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
+    if (isProd && !pool) {
       return jsonResponse(
         {
           success: false,
@@ -8411,7 +9529,6 @@ export async function handleApiRequest(
       );
     }
 
-    const authUser = await getAuthUserFromRequest(request, store, pool);
     if (!authUser) {
       return jsonResponse({ success: false, error: "Authentication required" }, 401);
     }
@@ -8431,12 +9548,17 @@ export async function handleApiRequest(
         if (rows && rows.length > 0) {
           stream = rows[0];
         }
-      } catch (_e) {
-        // Fallback
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error loading stream: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    if (!stream) {
+    if (!isProd && !stream) {
       stream = (store.liveStreams || []).find((s) => s.id === streamId);
     }
 
@@ -8482,11 +9604,18 @@ export async function handleApiRequest(
           [stream.id],
         );
         await pool.query("DELETE FROM live_stream_viewers WHERE stream_id = ?", [stream.id]);
-      } catch (_e) {
-        // Ignore
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error ending stream: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
-    saveStore(store);
+    if (!isProd) {
+      saveStore(store, env);
+    }
 
     return jsonResponse({
       success: true,
@@ -8505,8 +9634,8 @@ export async function handleApiRequest(
     if (method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    if (process.env["NODE_ENV"] === "production" && !pool) {
+    const pool = resolvePool();
+    if (isProd && !pool) {
       return jsonResponse(
         {
           success: false,
@@ -8539,18 +9668,20 @@ export async function handleApiRequest(
     }
 
     const eventId = String(eventData.id || eventData.sid || "").trim();
-    if (!store.livekitWebhookEvents) store.livekitWebhookEvents = {};
+    if (!isProd) {
+      if (!store.livekitWebhookEvents) store.livekitWebhookEvents = {};
 
-    if (eventId && store.livekitWebhookEvents[eventId]) {
-      return jsonResponse(
-        {
-          success: true,
-          idempotent: true,
-          duplicate: true,
-          message: "Webhook event already processed",
-        },
-        200,
-      );
+      if (eventId && store.livekitWebhookEvents[eventId]) {
+        return jsonResponse(
+          {
+            success: true,
+            idempotent: true,
+            duplicate: true,
+            message: "Webhook event already processed",
+          },
+          200,
+        );
+      }
     }
 
     if (pool && eventId) {
@@ -8580,13 +9711,32 @@ export async function handleApiRequest(
             rawBody.slice(0, 10000),
           ],
         );
-      } catch (_e) {
-        // Ignore duplicate key collision
+      } catch (dbErr: any) {
+        if (
+          dbErr?.code === "ER_DUP_ENTRY" ||
+          String(dbErr?.message || "").includes("Duplicate entry")
+        ) {
+          return jsonResponse(
+            {
+              success: true,
+              idempotent: true,
+              duplicate: true,
+              message: "Webhook event already processed",
+            },
+            200,
+          );
+        }
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error recording LiveKit webhook: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    if (eventId) {
-      store.livekitWebhookEvents[eventId] = {
+    if (!isProd && eventId) {
+      store.livekitWebhookEvents![eventId] = {
         event_id: eventId,
         event_type: eventData.event,
         processed_at: new Date().toISOString(),
@@ -8607,12 +9757,17 @@ export async function handleApiRequest(
         if (rows && rows.length > 0) {
           stream = rows[0];
         }
-      } catch (_e) {
-        // Fallback
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error looking up stream: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    if (!stream && roomName) {
+    if (!isProd && !stream && roomName) {
       const streamIdFromRoom = roomName.replace(/^room_/, "");
       stream = (store.liveStreams || []).find(
         (s) => s.livekit_room_name === roomName || s.id === streamIdFromRoom,
@@ -8632,8 +9787,13 @@ export async function handleApiRequest(
               num,
               stream.id,
             ]);
-          } catch (_e) {
-            // Ignore
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                { success: false, error: "Database error updating viewer count: " + dbErr.message },
+                503,
+              );
+            }
           }
         }
       } else if (eventType === "participant_left") {
@@ -8648,8 +9808,13 @@ export async function handleApiRequest(
               num,
               stream.id,
             ]);
-          } catch (_e) {
-            // Ignore
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                { success: false, error: "Database error updating viewer count: " + dbErr.message },
+                503,
+              );
+            }
           }
         }
       } else if (eventType === "room_finished") {
@@ -8662,12 +9827,19 @@ export async function handleApiRequest(
               "UPDATE live_streams SET status = 'ended', ended_at = NOW(), viewers_count = 0 WHERE id = ?",
               [stream.id],
             );
-          } catch (_e) {
-            // Ignore
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                { success: false, error: "Database error finishing room: " + dbErr.message },
+                503,
+              );
+            }
           }
         }
       }
-      saveStore(store);
+      if (!isProd) {
+        saveStore(store, env);
+      }
     }
 
     return jsonResponse({
@@ -8681,12 +9853,44 @@ export async function handleApiRequest(
   if (route === "live/chat") {
     if (method === "GET") {
       const streamId = url.searchParams.get("stream_id") || "live_seed_001";
+      if (isProd) {
+        const pool = resolvePool();
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          const [rows]: any = await pool.query(
+            `SELECT id, stream_id, user_id, user_name, avatar_url, message, is_superchat, superchat_amount, created_at
+             FROM live_chat_messages
+             WHERE stream_id = ?
+             ORDER BY created_at ASC
+             LIMIT 200`,
+            [streamId],
+          );
+          return jsonResponse({
+            success: true,
+            stream_id: streamId,
+            messages: Array.isArray(rows) ? rows : [],
+          });
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error loading chat messages: " + dbErr.message },
+            503,
+          );
+        }
+      }
       const messages = (store.liveChatMessages || []).filter((m) => m.stream_id === streamId);
       return jsonResponse({ success: true, stream_id: streamId, messages });
     }
     if (method === "POST") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       const body = await request.json();
       const streamId = body.stream_id || body.streamId;
       const msgText = String(body.message || "").trim();
@@ -8716,9 +9920,39 @@ export async function handleApiRequest(
       if (authUser?.avatar_url) {
         msgRecord.avatar_url = authUser.avatar_url;
       }
+      if (isProd) {
+        if (!pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+        try {
+          await pool.query(
+            `INSERT INTO live_chat_messages (id, stream_id, user_id, user_name, avatar_url, message, is_superchat, superchat_amount, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+            [
+              msgRecord.id,
+              msgRecord.stream_id,
+              msgRecord.user_id,
+              msgRecord.user_name,
+              msgRecord.avatar_url || null,
+              msgRecord.message,
+              msgRecord.is_superchat ? 1 : 0,
+              msgRecord.superchat_amount || 0,
+            ],
+          );
+          return jsonResponse({ success: true, message: msgRecord }, 201);
+        } catch (dbErr: any) {
+          return jsonResponse(
+            { success: false, error: "Database error saving chat message: " + dbErr.message },
+            503,
+          );
+        }
+      }
       if (!store.liveChatMessages) store.liveChatMessages = [];
       store.liveChatMessages.push(msgRecord);
-      saveStore(store);
+      saveStore(store, env);
       return jsonResponse({ success: true, message: msgRecord }, 201);
     }
   }
@@ -8726,7 +9960,7 @@ export async function handleApiRequest(
   // 19. Categories List
   if (route === "categories/list") {
     if (method === "GET") {
-      const pool = getMysqlPool();
+      const pool = resolvePool();
       if (pool) {
         try {
           const [rows]: any = await pool.query(
@@ -8756,7 +9990,7 @@ export async function handleApiRequest(
           const isTableMissing =
             dbErr?.code === "ER_NO_SUCH_TABLE" ||
             String(dbErr?.message || "").includes("doesn't exist");
-          if (!isTableMissing && process.env["NODE_ENV"] === "production") {
+          if (!isTableMissing && isProd) {
             return jsonResponse(
               {
                 success: false,
@@ -8772,7 +10006,7 @@ export async function handleApiRequest(
 
       // In production, when database is unavailable or migration is pending,
       // return clean baseline categories without using local JSON mock data.
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProd) {
         return jsonResponse({
           success: true,
           source: "baseline_fallback",
@@ -8782,7 +10016,7 @@ export async function handleApiRequest(
 
       if (!store.categories || store.categories.length === 0) {
         store.categories = getInitialCategories();
-        saveStore(store);
+        saveStore(store, env);
       } else {
         const existingLower = new Set(
           store.categories.map((c: any) =>
@@ -8803,7 +10037,7 @@ export async function handleApiRequest(
           }
         }
         if (updated) {
-          saveStore(store);
+          saveStore(store, env);
         }
       }
 
@@ -8821,8 +10055,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -8878,7 +10115,7 @@ export async function handleApiRequest(
         const isTableMissing =
           dbErr?.code === "ER_NO_SUCH_TABLE" ||
           String(dbErr?.message || "").includes("doesn't exist");
-        if (!isTableMissing && process.env["NODE_ENV"] === "production") {
+        if (!isTableMissing && isProd) {
           return jsonResponse(
             {
               success: false,
@@ -8909,8 +10146,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -8918,6 +10158,13 @@ export async function handleApiRequest(
           error: "Authentication required. Please provide a valid Bearer session token.",
         },
         401,
+      );
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
       );
     }
 
@@ -8930,7 +10177,7 @@ export async function handleApiRequest(
       "member-vip-monthly": "VIP Supporter",
       "member-annual": "All-Access Annual",
     };
-    if (store.subscriberPlans) {
+    if (!isProd && store.subscriberPlans) {
       for (const p of store.subscriberPlans) {
         if (p.plan_id && p.name) {
           planNameMap[p.plan_id] = p.name;
@@ -9009,12 +10256,17 @@ export async function handleApiRequest(
         if (rows && Array.isArray(rows) && rows.length > 0) {
           allFormatted = rows.map(mapSubscription);
         }
-      } catch (_dbErr) {
-        // fallback to store
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database error loading subscriptions: " + dbErr.message },
+            503,
+          );
+        }
       }
     }
 
-    if (allFormatted.length === 0) {
+    if (!isProd && allFormatted.length === 0) {
       let persistentFound = false;
       try {
         const premiumPath = path.resolve(process.cwd(), "data", "premium_transactions.json");
@@ -9062,8 +10314,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -9081,6 +10336,13 @@ export async function handleApiRequest(
           error: "Admin authorization required. Access denied.",
         },
         403,
+      );
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
       );
     }
 
@@ -9125,7 +10387,7 @@ export async function handleApiRequest(
       duration: 365,
     });
 
-    if (store.subscriberPlans) {
+    if (!isProd && store.subscriberPlans) {
       for (const p of store.subscriberPlans) {
         if (p.plan_id) {
           planMap.set(p.plan_id, {
@@ -9139,8 +10401,10 @@ export async function handleApiRequest(
 
     // Map users
     const userMap = new Map<string, { name: string; email: string }>();
-    for (const u of store.users || []) {
-      userMap.set(u.user_id.toUpperCase(), { name: u.name, email: u.email });
+    if (!isProd) {
+      for (const u of store.users || []) {
+        userMap.set(u.user_id.toUpperCase(), { name: u.name, email: u.email });
+      }
     }
 
     const mapRow = (r: any) => {
@@ -9219,12 +10483,21 @@ export async function handleApiRequest(
             return mapRow({ ...row, perks });
           });
         }
-      } catch (_err) {
-        // fallback to persistent file / store
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Database error loading subscriptions: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // fallback to persistent file / store in dev/test only
       }
     }
 
-    if (allSubs.length === 0) {
+    if (!isProd && allSubs.length === 0) {
       let persistentFound = false;
       try {
         const premiumPath = path.resolve(process.cwd(), "data", "premium_transactions.json");
@@ -9312,8 +10585,11 @@ export async function handleApiRequest(
 
   // 19e. User Subscription Refund Requests (POST/GET /api/subscriptions/refund-request or /api/subscriptions/refund-requests)
   if (route === "subscriptions/refund-request" || route === "subscriptions/refund-requests") {
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -9321,6 +10597,21 @@ export async function handleApiRequest(
           error: "Authentication required. Please provide a valid Bearer session token.",
         },
         401,
+      );
+    }
+
+    if (method !== "POST" && method !== "GET") {
+      return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
+    }
+
+    if (isProd) {
+      return jsonResponse(
+        {
+          success: false,
+          error:
+            "Subscription refund persistence in Node handler is not implemented; configure USE_REMOTE_PHP_API=true. JSON fallback is disabled in production.",
+        },
+        503,
       );
     }
 
@@ -9458,7 +10749,7 @@ export async function handleApiRequest(
       }
 
       // 4. Duplicate prevention under lock
-      const persistentRequests = await getPersistentRefundRequests();
+      const persistentRequests = await getPersistentRefundRequests(env);
       const allRequests = [...persistentRequests, ...(store.subscriptionRefundRequests || [])];
 
       const existingActiveReq = allRequests.find(
@@ -9516,13 +10807,13 @@ export async function handleApiRequest(
         updatedAt: new Date().toISOString(),
       };
 
-      await savePersistentRefundRequest(newRefundReq);
+      await savePersistentRefundRequest(newRefundReq, env);
 
       if (!store.subscriptionRefundRequests) {
         store.subscriptionRefundRequests = [];
       }
       store.subscriptionRefundRequests.unshift(newRefundReq);
-      saveStore(store);
+      saveStore(store, env);
 
       return jsonResponse(
         {
@@ -9536,7 +10827,7 @@ export async function handleApiRequest(
     }
 
     if (method === "GET") {
-      const persistentRequests = await getPersistentRefundRequests();
+      const persistentRequests = await getPersistentRefundRequests(env);
       const inStore = store.subscriptionRefundRequests || [];
       const combined = [...persistentRequests, ...inStore];
 
@@ -9569,8 +10860,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -9591,6 +10885,17 @@ export async function handleApiRequest(
       );
     }
 
+    if (isProd) {
+      return jsonResponse(
+        {
+          success: false,
+          error:
+            "Subscription refund persistence in Node handler is not implemented; configure USE_REMOTE_PHP_API=true. JSON fallback is disabled in production.",
+        },
+        503,
+      );
+    }
+
     const url = new URL(request.url);
     const search = (url.searchParams.get("search") || "").trim().toLowerCase();
     const statusFilter = (url.searchParams.get("status") || "all").trim().toLowerCase();
@@ -9598,7 +10903,7 @@ export async function handleApiRequest(
     const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get("limit") || "10", 10)));
     const detailId = (url.searchParams.get("id") || "").trim();
 
-    const persistentRequests = await getPersistentRefundRequests();
+    const persistentRequests = await getPersistentRefundRequests(env);
     const inStore = store.subscriptionRefundRequests || [];
     const combined = [...persistentRequests, ...inStore];
 
@@ -9699,8 +11004,11 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -9718,6 +11026,17 @@ export async function handleApiRequest(
           error: "Admin authorization required. Access denied.",
         },
         403,
+      );
+    }
+
+    if (isProd) {
+      return jsonResponse(
+        {
+          success: false,
+          error:
+            "Subscription refund persistence in Node handler is not implemented; configure USE_REMOTE_PHP_API=true. JSON fallback is disabled in production.",
+        },
+        503,
       );
     }
 
@@ -9742,7 +11061,7 @@ export async function handleApiRequest(
       );
     }
 
-    const persistentRequests = await getPersistentRefundRequests();
+    const persistentRequests = await getPersistentRefundRequests(env);
     const inStore = store.subscriptionRefundRequests || [];
     const target =
       persistentRequests.find((r) => r.id === requestId) || inStore.find((r) => r.id === requestId);
@@ -9765,12 +11084,16 @@ export async function handleApiRequest(
     const nowIso = new Date().toISOString();
 
     if (decision === "rejected") {
-      const updated = await updatePersistentRefundRequest(target.id, {
-        status: "rejected",
-        adminNote: adminNote || "Refund request rejected by administrator.",
-        reviewedBy: authUser.user_id,
-        reviewedAt: nowIso,
-      });
+      const updated = await updatePersistentRefundRequest(
+        target.id,
+        {
+          status: "rejected",
+          adminNote: adminNote || "Refund request rejected by administrator.",
+          reviewedBy: authUser.user_id,
+          reviewedAt: nowIso,
+        },
+        env,
+      );
 
       if (store.subscriptionRefundRequests) {
         const sIdx = store.subscriptionRefundRequests.findIndex((r) => r.id === target.id);
@@ -9778,7 +11101,7 @@ export async function handleApiRequest(
           store.subscriptionRefundRequests[sIdx] = updated;
         }
       }
-      saveStore(store);
+      saveStore(store, env);
 
       return jsonResponse({
         success: true,
@@ -9799,14 +11122,18 @@ export async function handleApiRequest(
 
     if (gatewayRes.success && gatewayRes.refundId) {
       // Verified gateway refund succeeded
-      const updated = await updatePersistentRefundRequest(target.id, {
-        status: "refunded",
-        gatewayStatus: "gateway_refund_succeeded",
-        gatewayRefundId: gatewayRes.refundId,
-        adminNote: adminNote || "Refund approved and successfully processed via Razorpay gateway.",
-        reviewedBy: authUser.user_id,
-        reviewedAt: nowIso,
-      });
+      const updated = await updatePersistentRefundRequest(
+        target.id,
+        {
+          status: "refunded",
+          gatewayStatus: "gateway_refund_succeeded",
+          gatewayRefundId: gatewayRes.refundId,
+          adminNote: adminNote || "Refund approved and successfully processed via Razorpay gateway.",
+          reviewedBy: authUser.user_id,
+          reviewedAt: nowIso,
+        },
+        env,
+      );
 
       if (store.subscriptionRefundRequests) {
         const sIdx = store.subscriptionRefundRequests.findIndex((r) => r.id === target.id);
@@ -9826,7 +11153,7 @@ export async function handleApiRequest(
           }
         }
       }
-      saveStore(store);
+      saveStore(store, env);
 
       return jsonResponse({
         success: true,
@@ -9843,14 +11170,18 @@ export async function handleApiRequest(
       ? `${adminNote} [Safe Review: Live gateway refund unavailable - ${gatewayRes.error || "Credentials unconfigured"}]`
       : `Approved in safe review workflow. Live Razorpay gateway credentials are not configured on server; actual gateway refund remains unavailable. No simulated refund was dispatched.`;
 
-    const updated = await updatePersistentRefundRequest(target.id, {
-      status: "approved",
-      gatewayStatus: gatewayRes.gatewayStatus || "gateway_unavailable",
-      gatewayRefundId: null,
-      adminNote: safeNote,
-      reviewedBy: authUser.user_id,
-      reviewedAt: nowIso,
-    });
+    const updated = await updatePersistentRefundRequest(
+      target.id,
+      {
+        status: "approved",
+        gatewayStatus: gatewayRes.gatewayStatus || "gateway_unavailable",
+        gatewayRefundId: null,
+        adminNote: safeNote,
+        reviewedBy: authUser.user_id,
+        reviewedAt: nowIso,
+      },
+      env,
+    );
 
     if (store.subscriptionRefundRequests) {
       const sIdx = store.subscriptionRefundRequests.findIndex((r) => r.id === target.id);
@@ -9858,7 +11189,7 @@ export async function handleApiRequest(
         store.subscriptionRefundRequests[sIdx] = updated;
       }
     }
-    saveStore(store);
+    saveStore(store, env);
 
     return jsonResponse({
       success: true,
@@ -9874,8 +11205,11 @@ export async function handleApiRequest(
   // 20. Admin Category Creation
   if (route === "admin/categories") {
     if (method === "POST") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       if (!authUser) {
         return jsonResponse(
           {
@@ -9924,7 +11258,7 @@ export async function handleApiRequest(
       // In production, persistent MySQL database connection is strictly required.
       // Return HTTP 503 if the required MySQL pool is unavailable before any category
       // can be saved to local JSON or in-memory storage.
-      if (process.env["NODE_ENV"] === "production" && !pool) {
+      if (isProd && !pool) {
         return jsonResponse(
           {
             success: false,
@@ -9963,9 +11297,11 @@ export async function handleApiRequest(
             created_at: new Date().toISOString(),
           };
 
-          if (!store.categories) store.categories = getInitialCategories();
-          store.categories.push(newCat);
-          saveStore(store);
+          if (!isProd) {
+            if (!store.categories) store.categories = getInitialCategories();
+            store.categories.push(newCat);
+            saveStore(store, env);
+          }
 
           return jsonResponse(
             {
@@ -9989,13 +11325,13 @@ export async function handleApiRequest(
               503,
             );
           }
-          if (process.env["NODE_ENV"] === "production") {
+          if (isProd) {
             return jsonResponse({ success: false, error: "Database error: " + dbErr.message }, 500);
           }
         }
       }
 
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProd) {
         return jsonResponse(
           {
             success: false,
@@ -10033,7 +11369,7 @@ export async function handleApiRequest(
         created_at: new Date().toISOString(),
       };
       store.categories.push(newCat);
-      saveStore(store);
+      saveStore(store, env);
 
       return jsonResponse(
         {
@@ -10048,8 +11384,11 @@ export async function handleApiRequest(
 
   // 20b. Admin Platform Settings (Marketing Commission Percentage)
   if (route === "admin/settings") {
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -10070,6 +11409,13 @@ export async function handleApiRequest(
     }
 
     if (method === "GET") {
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
+
       let marketingPct = 15.0;
       const adsRates: Record<number, number> = { 1: 15, 2: 10, 3: 5, 4: 4, 5: 3, 6: 2, 7: 1 };
       let adsenseClientId = "";
@@ -10101,8 +11447,17 @@ export async function handleApiRequest(
               adsRates[lvl] = parseInt(r.setting_value, 10) || adsRates[lvl] || 0;
             }
           }
-        } catch {
-          // Table not yet migrated, fallback to defaults
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error: "Database error loading platform settings: " + (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
+          // Table not yet migrated in dev/test, fallback to defaults
         }
       }
 
@@ -10148,6 +11503,13 @@ export async function handleApiRequest(
             error: "Marketing income percentage must be between 0% and 100%.",
           },
           400,
+        );
+      }
+
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
         );
       }
 
@@ -10223,6 +11585,15 @@ export async function handleApiRequest(
           }
         } catch (dbErr: any) {
           console.error("[admin/settings] DB error:", dbErr);
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error: "Database error updating platform settings: " + (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
         }
       }
 
@@ -10238,11 +11609,11 @@ export async function handleApiRequest(
 
   // 20b-2. Admin Premium Video Payment Recovery (dryRun defaults to true; live writes gated)
   if (route === "admin/recover-premium-payment") {
-    const pool = getMysqlPool();
+    const pool = resolvePool();
     return handleAdminRecoverPremiumPayment(request, {
       pool,
       env,
-      getAuthUser: (req) => getAuthUserFromRequest(req, store, pool),
+      getAuthUser: (req) => getAuthUserFromRequest(req, store, pool, env),
     });
   }
 
@@ -10251,8 +11622,11 @@ export async function handleApiRequest(
     if (method !== "POST" && method !== "GET") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -10278,6 +11652,12 @@ export async function handleApiRequest(
       const action = String(url.searchParams.get("action") || "conflicts").toLowerCase();
 
       if (action === "conflicts") {
+        if (isProd && !pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
         if (pool) {
           try {
             const [rows]: any = await pool.query(
@@ -10288,7 +11668,17 @@ export async function handleApiRequest(
               count: (rows || []).length,
               conflicts: rows || [],
             });
-          } catch (_e) {
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                {
+                  success: false,
+                  error:
+                    "Database error loading AdSense conflicts: " + (dbErr?.message || "Query failed"),
+                },
+                503,
+              );
+            }
             return jsonResponse({ success: true, count: 0, conflicts: [] });
           }
         }
@@ -10301,6 +11691,12 @@ export async function handleApiRequest(
       }
 
       if (action === "statements") {
+        if (isProd && !pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
         if (pool) {
           try {
             const [rows]: any = await pool.query(
@@ -10311,7 +11707,17 @@ export async function handleApiRequest(
               count: (rows || []).length,
               statements: rows || [],
             });
-          } catch (_e) {
+          } catch (dbErr: any) {
+            if (isProd) {
+              return jsonResponse(
+                {
+                  success: false,
+                  error:
+                    "Database error loading AdSense statements: " + (dbErr?.message || "Query failed"),
+                },
+                503,
+              );
+            }
             return jsonResponse({ success: true, count: 0, statements: [] });
           }
         }
@@ -10371,6 +11777,13 @@ export async function handleApiRequest(
     }
     const normalizedMonth = `${monthMatch[1]}-${monthMatch[2]}`;
     const cleanMonth = `${monthMatch[1]}${monthMatch[2]}`;
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
 
     const ledgerUuid = crypto.randomUUID();
 
@@ -10552,11 +11965,18 @@ export async function handleApiRequest(
         console.error("[record-adsense-earning] Error:", err);
         return jsonResponse(
           { success: false, error: "Database error recording AdSense earnings: " + err.message },
-          500,
+          isProd ? 503 : 500,
         );
       } finally {
         conn.release();
       }
+    }
+
+    if (isProd) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
     }
 
     // Fallback store update (preview/offline)
@@ -10656,7 +12076,7 @@ export async function handleApiRequest(
       referenceId,
       creditedAt: new Date().toISOString(),
     };
-    saveStore(store);
+    saveStore(store, env);
 
     return jsonResponse({
       success: true,
@@ -10674,8 +12094,11 @@ export async function handleApiRequest(
     if (method !== "POST" && method !== "GET") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -10697,6 +12120,12 @@ export async function handleApiRequest(
     }
 
     if (method === "GET") {
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       if (pool) {
         try {
           const [rows]: any = await pool.query(
@@ -10707,7 +12136,17 @@ export async function handleApiRequest(
             count: (rows || []).length,
             statements: rows || [],
           });
-        } catch (_e) {
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Database error loading AdMob statements: " + (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
           return jsonResponse({ success: true, count: 0, statements: [] });
         }
       }
@@ -10806,6 +12245,13 @@ export async function handleApiRequest(
         );
       }
       appId = resolvedAppId;
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
     }
 
     if (pool) {
@@ -10913,6 +12359,13 @@ export async function handleApiRequest(
       }
     }
 
+    if (isProd) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
+
     // Local / In-memory fallback
     const upperId = targetUserId.toUpperCase();
     const userFound = store.users.find(
@@ -10985,7 +12438,7 @@ export async function handleApiRequest(
       reportMonth: normalizedMonth,
       creditedAt: new Date().toISOString(),
     };
-    saveStore(store);
+    saveStore(store, env);
 
     return jsonResponse(
       {
@@ -11109,7 +12562,7 @@ export async function handleApiRequest(
   }
 
   function isProductionHttps(request: Request): boolean {
-    if (process.env["NODE_ENV"] === "production") {
+    if (isProductionRuntimeEnv(env)) {
       return true;
     }
     const url = new URL(request.url);
@@ -11133,8 +12586,8 @@ export async function handleApiRequest(
     if (method !== "GET") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const authUser = await getAuthUserFromRequest(request, store, pool, env);
     if (!authUser) {
       return jsonResponse(
         {
@@ -11235,7 +12688,7 @@ export async function handleApiRequest(
         );
       }
     } else {
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProductionRuntimeEnv(env)) {
         return jsonResponse(
           {
             success: false,
@@ -11258,7 +12711,7 @@ export async function handleApiRequest(
         expires_at: expiresAt,
         created_at: new Date().toISOString(),
       });
-      saveStore(store);
+      saveStore(store, env);
     }
 
     const scopes = [
@@ -11300,7 +12753,7 @@ export async function handleApiRequest(
 
   // 2. GET or POST /api/admin/admob/oauth-callback
   if (route === "admin/admob/oauth-callback") {
-    const pool = getMysqlPool();
+    const pool = resolvePool();
     const isBrowserGet = method === "GET";
     const clearCookieHeader = createClearCookieHeader(request);
 
@@ -11384,7 +12837,7 @@ export async function handleApiRequest(
     const stateHash = crypto.createHash("sha256").update(state).digest("hex");
 
     // 1. If caller session belongs to non-admin user, reject immediately
-    const callerAuthUser = await getAuthUserFromRequest(request, store, pool);
+    const callerAuthUser = await getAuthUserFromRequest(request, store, pool, env);
     if (callerAuthUser && callerAuthUser.role !== "admin") {
       return reply(
         403,
@@ -11539,7 +12992,7 @@ export async function handleApiRequest(
       }
     } else {
       // Local JSON fallback storage: ONLY permitted when MySQL is unconfigured and NOT in production
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProductionRuntimeEnv(env)) {
         return reply(
           500,
           {
@@ -11551,7 +13004,7 @@ export async function handleApiRequest(
         );
       }
 
-      const currentStore = loadStore();
+      const currentStore = loadStore(env);
       const localStates: any[] = (currentStore as any).admobOAuthStates || [];
       const stateIndex = localStates.findIndex(
         (s: any) =>
@@ -11640,7 +13093,7 @@ export async function handleApiRequest(
       inMemoryConsumedNonces.add(stateNonce);
       stateRecord.is_consumed = 1;
       stateRecord.consumed_at = new Date().toISOString();
-      saveStore(currentStore);
+      saveStore(currentStore, env);
     }
 
     const adminUserId = stateUserId;
@@ -11653,20 +13106,37 @@ export async function handleApiRequest(
       );
     }
 
-    const clientId = (process.env["ADMOB_OAUTH_CLIENT_ID"] || "").trim();
-    const clientSecret = (process.env["ADMOB_OAUTH_CLIENT_SECRET"] || "").trim();
-    const redirectUri = (
-      process.env["ADMOB_OAUTH_REDIRECT_URI"] ||
-      "https://facetube.online/api/admin/admob/oauth-callback"
-    ).trim();
+    const readOAuthEnv = (key: string) => String(env?.[key] ?? process.env[key] ?? "").trim();
+    const isProduction = isFailClosedProductionEnv(
+      readOAuthEnv("APP_ENV"),
+      readOAuthEnv("NODE_ENV"),
+    );
+
+    const clientId = readOAuthEnv("ADMOB_OAUTH_CLIENT_ID");
+    const clientSecret = readOAuthEnv("ADMOB_OAUTH_CLIENT_SECRET");
+    const redirectUri =
+      readOAuthEnv("ADMOB_OAUTH_REDIRECT_URI") ||
+      "https://facetube.online/api/admin/admob/oauth-callback";
 
     let accessToken = "";
     let refreshToken = "";
     let expiresIn = 3600;
 
-    // Check if test / mock mode or real code exchange
-    const isMock =
-      code.startsWith("test_mock_code_") || process.env["ADMOB_SKIP_REMOTE_CHECK"] === "true";
+    // Production MUST NEVER bypass Google OAuth verification via env flags or test mock codes
+    if (isProduction && code.startsWith("test_mock_code_")) {
+      return reply(
+        400,
+        {
+          success: false,
+          error: "Test mock authorization codes are not permitted in production.",
+        },
+        "admob_error=invalid_mock_code",
+      );
+    }
+
+    const skipRemote =
+      !isProduction && parseStrictBooleanFlag(readOAuthEnv("ADMOB_SKIP_REMOTE_CHECK"));
+    const isMock = !isProduction && (code.startsWith("test_mock_code_") || skipRemote);
     if (isMock) {
       accessToken = `mock_admob_access_${crypto.randomBytes(8).toString("hex")}`;
       refreshToken = `mock_admob_refresh_${crypto.randomBytes(16).toString("hex")}`;
@@ -11706,12 +13176,6 @@ export async function handleApiRequest(
         );
       }
     }
-
-    const readOAuthEnv = (key: string) => String(env?.[key] ?? process.env[key] ?? "").trim();
-    const isProduction = isFailClosedProductionEnv(
-      readOAuthEnv("APP_ENV"),
-      readOAuthEnv("NODE_ENV"),
-    );
 
     let publisherId = readOAuthEnv("ADMOB_PUBLISHER_ID");
     let accountName = "FaceTube Mobile App";
@@ -11804,7 +13268,7 @@ export async function handleApiRequest(
           );
         }
       } else {
-        if (process.env["NODE_ENV"] === "production") {
+        if (isProductionRuntimeEnv(env)) {
           return reply(
             500,
             {
@@ -11888,6 +13352,13 @@ export async function handleApiRequest(
         );
       }
     } else {
+      if (isProd) {
+        return reply(
+          500,
+          { success: false, error: "Failed to persist AdMob credentials: database uninitialized." },
+          "admob_error=database_error",
+        );
+      }
       (store as any).admobOauth = {
         publisher_id: publisherId,
         account_name: accountName,
@@ -11901,7 +13372,7 @@ export async function handleApiRequest(
         connected_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
-      saveStore(store);
+      saveStore(store, env);
     }
 
     return reply(
@@ -11924,8 +13395,8 @@ export async function handleApiRequest(
     if (method !== "GET") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const authUser = await getAuthUserFromRequest(request, store, pool, env);
     if (!authUser) {
       return jsonResponse(
         {
@@ -11989,7 +13460,7 @@ export async function handleApiRequest(
         );
       }
     } else {
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProductionRuntimeEnv(env)) {
         return jsonResponse(
           {
             success: false,
@@ -12031,8 +13502,8 @@ export async function handleApiRequest(
     if (method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const authUser = await getAuthUserFromRequest(request, store, pool, env);
     if (!authUser) {
       return jsonResponse(
         {
@@ -12078,7 +13549,7 @@ export async function handleApiRequest(
         );
       }
     } else {
-      if (process.env["NODE_ENV"] === "production") {
+      if (isProductionRuntimeEnv(env)) {
         return jsonResponse(
           {
             success: false,
@@ -12134,9 +13605,9 @@ export async function handleApiRequest(
       }
     }
 
-    if (!isDbConfigured) {
+    if (!isDbConfigured && !isProd) {
       delete (store as any).admobOauth;
-      saveStore(store);
+      saveStore(store, env);
     }
 
     return jsonResponse({
@@ -12183,10 +13654,13 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
 
-    const pool = getMysqlPool();
+    const pool = resolvePool();
 
     // 1. Authenticated Creator Verification (Strictly enforce session token identity)
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -12194,6 +13668,13 @@ export async function handleApiRequest(
           error: "Authentication required. Please sign in to generate your creator affiliate link.",
         },
         401,
+      );
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
       );
     }
 
@@ -12251,7 +13732,17 @@ export async function handleApiRequest(
             .split(",")
             .map((s: string) => s.trim());
         }
-      } catch (_e) {
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error validating affiliate network: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
         // Fallback
       }
     }
@@ -12343,7 +13834,13 @@ export async function handleApiRequest(
       );
     }
 
-    const pool = getMysqlPool();
+    const pool = resolvePool();
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
     let allowedDomains: string[] = [];
 
     if (pool) {
@@ -12357,12 +13854,23 @@ export async function handleApiRequest(
             .split(",")
             .map((s) => s.trim());
         }
-      } catch (_e) {
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error loading affiliate network config: " +
+                (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
         // Fallback
       }
     }
 
-    if (allowedDomains.length === 0 && store.affiliateNetworks?.[network]?.allowed_domains) {
+    if (!isProd && allowedDomains.length === 0 && store.affiliateNetworks?.[network]?.allowed_domains) {
       allowedDomains = store.affiliateNetworks[network].allowed_domains
         .split(",")
         .map((s) => s.trim());
@@ -12403,10 +13911,25 @@ export async function handleApiRequest(
           );
         }
         canonicalCreatorId = uRows[0].user_id;
-      } catch (_e) {
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Database error verifying creator user: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
         // Fallback
       }
     } else {
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       const u = store.users.find((x) => x.user_id.toUpperCase() === creatorUserId);
       if (!u) {
         return jsonResponse(
@@ -12442,24 +13965,35 @@ export async function handleApiRequest(
             referrer,
           ],
         );
-      } catch (_clkErr) {
-        // Continue
+      } catch (clkErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Database error recording affiliate click: " + (clkErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Continue in dev/test
       }
     }
 
-    if (!store.affiliateClicks) store.affiliateClicks = [];
-    store.affiliateClicks.unshift({
-      id: clickId,
-      network,
-      creator_user_id: canonicalCreatorId,
-      video_id: videoId || null,
-      target_url: validation.url!,
-      ip_hash: ipHash,
-      user_agent: userAgent,
-      referrer,
-      created_at: new Date().toISOString(),
-    });
-    saveStore(store);
+    if (!isProd) {
+      if (!store.affiliateClicks) store.affiliateClicks = [];
+      store.affiliateClicks.unshift({
+        id: clickId,
+        network,
+        creator_user_id: canonicalCreatorId,
+        video_id: videoId || null,
+        target_url: validation.url!,
+        ip_hash: ipHash,
+        user_agent: userAgent,
+        referrer,
+        created_at: new Date().toISOString(),
+      });
+      saveStore(store, env);
+    }
 
     if (shouldRedirect && validation.url) {
       return Response.redirect(validation.url, 302);
@@ -12505,7 +14039,13 @@ export async function handleApiRequest(
       );
     }
 
-    const pool = getMysqlPool();
+    const pool = resolvePool();
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
     let netConfig: any = null;
 
     if (pool) {
@@ -12517,12 +14057,23 @@ export async function handleApiRequest(
         if (netRows && netRows.length > 0) {
           netConfig = netRows[0];
         }
-      } catch (_e) {
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error loading affiliate network config: " +
+                (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
         // Fallback
       }
     }
 
-    if (!netConfig && store.affiliateNetworks?.[network]) {
+    if (!isProd && !netConfig && store.affiliateNetworks?.[network]) {
       netConfig = store.affiliateNetworks[network];
     }
 
@@ -12633,10 +14184,37 @@ export async function handleApiRequest(
 
     // Resolve creator from click if not directly provided
     if (!creatorUserId && clickId) {
-      const clk = (store.affiliateClicks || []).find((c) => c.id === clickId);
-      if (clk) {
-        creatorUserId = clk.creator_user_id;
-        if (!videoId && clk.video_id) videoId = clk.video_id;
+      if (pool) {
+        try {
+          const [clkRows]: any = await pool.query(
+            "SELECT creator_user_id, video_id FROM affiliate_clicks WHERE id = ? LIMIT 1",
+            [clickId],
+          );
+          if (clkRows && clkRows.length > 0 && clkRows[0].creator_user_id) {
+            creatorUserId = String(clkRows[0].creator_user_id).toUpperCase().trim();
+            if (!videoId && clkRows[0].video_id) {
+              videoId = String(clkRows[0].video_id).trim();
+            }
+          }
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Database error resolving affiliate click attribution: " +
+                  (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
+        }
+      } else if (!isProd) {
+        const clk = (store.affiliateClicks || []).find((c) => c.id === clickId);
+        if (clk) {
+          creatorUserId = clk.creator_user_id;
+          if (!videoId && clk.video_id) videoId = clk.video_id;
+        }
       }
     }
 
@@ -12655,19 +14233,21 @@ export async function handleApiRequest(
     const conversionId = `conv_${crypto.randomUUID().replace(/-/g, "")}`;
     const dedupeKey = `${network}_${externalActionId}`;
 
-    if (!store.affiliateConversions) store.affiliateConversions = {};
-    if (store.affiliateConversions[dedupeKey]) {
-      const existing = store.affiliateConversions[dedupeKey];
-      return jsonResponse(
-        {
-          success: true,
-          idempotent: true,
-          message: `Conversion already processed for network '${network}' and action ID '${externalActionId}'.`,
-          conversion_id: existing.id,
-          status: existing.status,
-        },
-        200,
-      );
+    if (!isProd) {
+      if (!store.affiliateConversions) store.affiliateConversions = {};
+      if (store.affiliateConversions[dedupeKey]) {
+        const existing = store.affiliateConversions[dedupeKey];
+        return jsonResponse(
+          {
+            success: true,
+            idempotent: true,
+            message: `Conversion already processed for network '${network}' and action ID '${externalActionId}'.`,
+            conversion_id: existing.id,
+            status: existing.status,
+          },
+          200,
+        );
+      }
     }
 
     if (pool) {
@@ -12736,44 +14316,58 @@ export async function handleApiRequest(
             200,
           );
         }
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error recording affiliate conversion: " +
+                (poolErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
       }
     }
 
-    store.affiliateConversions[dedupeKey] = {
-      id: conversionId,
-      network,
-      external_action_id: externalActionId,
-      click_id: clickId || null,
-      creator_user_id: creatorUserId,
-      video_id: videoId || null,
-      order_amount: orderAmount,
-      total_commission: totalCommission,
-      creator_share_percentage: creatorSharePct,
-      creator_payout: creatorPayout,
-      currency,
-      status: "pending",
-      settlement_due_at: settlementDueAt,
-      settled_at: null,
-      ledger_transaction_id: null,
-      notes: `Ingested via verified ${netConfig.name} webhook callback`,
-      raw_payload_hash: payloadHash,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
+    if (!isProd) {
+      if (!store.affiliateConversions) store.affiliateConversions = {};
+      store.affiliateConversions[dedupeKey] = {
+        id: conversionId,
+        network,
+        external_action_id: externalActionId,
+        click_id: clickId || null,
+        creator_user_id: creatorUserId,
+        video_id: videoId || null,
+        order_amount: orderAmount,
+        total_commission: totalCommission,
+        creator_share_percentage: creatorSharePct,
+        creator_payout: creatorPayout,
+        currency,
+        status: "pending",
+        settlement_due_at: settlementDueAt,
+        settled_at: null,
+        ledger_transaction_id: null,
+        notes: `Ingested via verified ${netConfig.name} webhook callback`,
+        raw_payload_hash: payloadHash,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
 
-    if (!store.affiliateAuditLog) store.affiliateAuditLog = [];
-    store.affiliateAuditLog.unshift({
-      id: `aud_${crypto.randomUUID().replace(/-/g, "")}`,
-      conversion_id: conversionId,
-      action: "ingested",
-      previous_status: null,
-      new_status: "pending",
-      amount_adjusted: 0.0,
-      performed_by: "SYSTEM_WEBHOOK",
-      notes: `Initial verified ingestion from ${network} webhook.`,
-      created_at: new Date().toISOString(),
-    });
-    saveStore(store);
+      if (!store.affiliateAuditLog) store.affiliateAuditLog = [];
+      store.affiliateAuditLog.unshift({
+        id: `aud_${crypto.randomUUID().replace(/-/g, "")}`,
+        conversion_id: conversionId,
+        action: "ingested",
+        previous_status: null,
+        new_status: "pending",
+        amount_adjusted: 0.0,
+        performed_by: "SYSTEM_WEBHOOK",
+        notes: `Initial verified ingestion from ${network} webhook.`,
+        created_at: new Date().toISOString(),
+      });
+      saveStore(store, env);
+    }
 
     return jsonResponse(
       {
@@ -12794,8 +14388,11 @@ export async function handleApiRequest(
 
   // 20f. Admin Affiliate Networks Settings (GET/POST /api/admin/affiliate/settings)
   if (route === "admin/affiliate/settings") {
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -12816,6 +14413,12 @@ export async function handleApiRequest(
     }
 
     if (method === "GET") {
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       const defaultNetworks = [
         {
           id: "amazon",
@@ -12878,9 +14481,23 @@ export async function handleApiRequest(
             }));
             return jsonResponse({ success: true, networks: list });
           }
-        } catch (_e) {
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Database error loading affiliate settings: " + (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
           // Fallback
         }
+      }
+
+      if (isProd) {
+        return jsonResponse({ success: true, networks: [] });
       }
 
       if (store.affiliateNetworks) {
@@ -12947,6 +14564,13 @@ export async function handleApiRequest(
         );
       }
 
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
+
       if (pool) {
         try {
           const fields: string[] = [];
@@ -12984,9 +14608,28 @@ export async function handleApiRequest(
               params,
             );
           }
-        } catch (_err) {
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Database error updating affiliate settings: " +
+                  (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
           // Fallback
         }
+      }
+
+      if (isProd) {
+        return jsonResponse({
+          success: true,
+          message: `Successfully updated affiliate configuration for ${networkId}.`,
+          network_id: networkId,
+        });
       }
 
       if (!store.affiliateNetworks) store.affiliateNetworks = {};
@@ -13024,7 +14667,7 @@ export async function handleApiRequest(
       if (webhookSecret !== undefined) netObj.webhook_secret = webhookSecret;
       netObj.updated_by = authUser.user_id;
       netObj.updated_at = new Date().toISOString();
-      saveStore(store);
+      saveStore(store, env);
 
       return jsonResponse({
         success: true,
@@ -13038,8 +14681,11 @@ export async function handleApiRequest(
 
   // 20g. Admin Affiliate Conversions & Settlements (GET/POST /api/admin/affiliate/conversions)
   if (route === "admin/affiliate/conversions") {
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         {
@@ -13060,6 +14706,12 @@ export async function handleApiRequest(
     }
 
     if (method === "GET") {
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
       const netFilter = String(url.searchParams.get("network") || "")
         .toLowerCase()
         .trim();
@@ -13140,9 +14792,27 @@ export async function handleApiRequest(
               reversedCount: Number(sRow.reversed_count || 0),
             },
           });
-        } catch (_e) {
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Database error loading affiliate conversions: " +
+                  (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
           // Fallback
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       let allConvs = Object.values(store.affiliateConversions || {});
@@ -13210,6 +14880,13 @@ export async function handleApiRequest(
             error: "Invalid action. Supported actions: 'approve', 'settle', 'reject', 'reverse'.",
           },
           400,
+        );
+      }
+
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
         );
       }
 
@@ -13507,11 +15184,18 @@ export async function handleApiRequest(
           await conn.rollback();
           return jsonResponse(
             { success: false, error: "Database error executing action: " + dbErr.message },
-            500,
+            isProd ? 503 : 500,
           );
         } finally {
           conn.release();
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       // Fallback store processing
@@ -13561,7 +15245,7 @@ export async function handleApiRequest(
           notes,
           created_at: new Date().toISOString(),
         });
-        saveStore(store);
+        saveStore(store, env);
         return jsonResponse({
           success: true,
           message: "Conversion approved successfully.",
@@ -13641,7 +15325,7 @@ export async function handleApiRequest(
           notes,
           created_at: new Date().toISOString(),
         });
-        saveStore(store);
+        saveStore(store, env);
 
         return jsonResponse({
           success: true,
@@ -13678,7 +15362,7 @@ export async function handleApiRequest(
           notes,
           created_at: new Date().toISOString(),
         });
-        saveStore(store);
+        saveStore(store, env);
         return jsonResponse({
           success: true,
           message: "Conversion marked as rejected.",
@@ -13746,7 +15430,7 @@ export async function handleApiRequest(
             notes,
             created_at: new Date().toISOString(),
           });
-          saveStore(store);
+          saveStore(store, env);
 
           return jsonResponse({
             success: true,
@@ -13773,7 +15457,7 @@ export async function handleApiRequest(
             notes,
             created_at: new Date().toISOString(),
           });
-          saveStore(store);
+          saveStore(store, env);
 
           return jsonResponse({
             success: true,
@@ -13790,8 +15474,11 @@ export async function handleApiRequest(
   // 21. Admin User-Wise Earnings & Payouts Report
   if (route === "admin/earnings-report") {
     if (method === "GET") {
-      const pool = getMysqlPool();
-      const authUser = await getAuthUserFromRequest(request, store, pool);
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+      if (earlyResponse) {
+        return earlyResponse;
+      }
       if (!authUser) {
         return jsonResponse(
           {
@@ -13840,6 +15527,13 @@ export async function handleApiRequest(
           ""
         ).trim();
 
+        if (isProd && !pool) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
+        }
+
         if (pool) {
           try {
             let sql = `
@@ -13879,7 +15573,25 @@ export async function handleApiRequest(
             });
           } catch (dbErr: any) {
             console.error("[earnings-report] MySQL error querying user withdrawals:", dbErr);
+            if (isProd) {
+              return jsonResponse(
+                {
+                  success: false,
+                  error:
+                    "Database error querying user withdrawals: " +
+                    (dbErr?.message || "Query failed"),
+                },
+                503,
+              );
+            }
           }
+        }
+
+        if (isProd) {
+          return jsonResponse(
+            { success: false, error: "Database connection unavailable in production." },
+            503,
+          );
         }
 
         // Store fallback for dev/test environments
@@ -13954,6 +15666,13 @@ export async function handleApiRequest(
         page = 1;
       }
       const offset = (page - 1) * limit;
+
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
 
       if (pool) {
         try {
@@ -14150,7 +15869,23 @@ export async function handleApiRequest(
           });
         } catch (dbErr: any) {
           console.error("[earnings-report] MySQL report error:", dbErr);
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error: "Database error loading earnings report: " + (dbErr?.message || "Query failed"),
+              },
+              503,
+            );
+          }
         }
+      }
+
+      if (isProd) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
       }
 
       // In-Memory store implementation for dev/test environment
@@ -14328,8 +16063,11 @@ export async function handleApiRequest(
     if (method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         { success: false, error: "Authentication required to subscribe to a channel." },
@@ -14348,6 +16086,13 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Creator user ID is required." }, 400);
     }
 
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
+
     // Resolve canonical creator user ID if UUID or casing variation was provided
     if (pool) {
       try {
@@ -14358,10 +16103,20 @@ export async function handleApiRequest(
         if (uRows && uRows.length > 0 && uRows[0].user_id) {
           creatorUserId = String(uRows[0].user_id).trim();
         }
-      } catch (_e) {
-        // Ignore lookup failure
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error resolving creator identity: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Ignore lookup failure in dev/test
       }
-    } else {
+    } else if (!isProd) {
       const match = store.users.find(
         (u) =>
           u.user_id.toUpperCase() === creatorUserId.toUpperCase() ||
@@ -14401,9 +16156,26 @@ export async function handleApiRequest(
           creator_user_id: creatorUserId,
           subscriber_count: count,
         });
-      } catch (_e) {
-        // Fall through to store
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error saving channel subscription: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Fall through to store in dev/test
       }
+    }
+
+    if (isProd) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
     }
 
     if (!store.channelSubscriptions) store.channelSubscriptions = [];
@@ -14419,7 +16191,7 @@ export async function handleApiRequest(
         subscriber_user_id: subscriberUserId,
         created_at: new Date().toISOString(),
       });
-      saveStore(store);
+      saveStore(store, env);
     }
     const count = new Set(
       store.channelSubscriptions
@@ -14440,8 +16212,11 @@ export async function handleApiRequest(
     if (method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         { success: false, error: "Authentication required to unsubscribe from a channel." },
@@ -14460,6 +16235,13 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Creator user ID is required." }, 400);
     }
 
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
+
     if (pool) {
       try {
         const [uRows]: any = await pool.query(
@@ -14469,10 +16251,20 @@ export async function handleApiRequest(
         if (uRows && uRows.length > 0 && uRows[0].user_id) {
           creatorUserId = String(uRows[0].user_id).trim();
         }
-      } catch (_e) {
-        // Ignore lookup failure
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error resolving creator identity: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Ignore lookup failure in dev/test
       }
-    } else {
+    } else if (!isProd) {
       const match = store.users.find(
         (u) =>
           u.user_id.toUpperCase() === creatorUserId.toUpperCase() ||
@@ -14503,9 +16295,27 @@ export async function handleApiRequest(
           creator_user_id: creatorUserId,
           subscriber_count: count,
         });
-      } catch (_e) {
-        // Fall through to store
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error removing channel subscription: " +
+                (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Fall through to store in dev/test
       }
+    }
+
+    if (isProd) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
     }
 
     if (!store.channelSubscriptions) store.channelSubscriptions = [];
@@ -14516,7 +16326,7 @@ export async function handleApiRequest(
           s.subscriber_user_id.toUpperCase() === subscriberUserId.toUpperCase()
         ),
     );
-    saveStore(store);
+    saveStore(store, env);
 
     const count = new Set(
       store.channelSubscriptions
@@ -14537,8 +16347,11 @@ export async function handleApiRequest(
     if (method !== "GET" && method !== "POST") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
-    const authUser = await getAuthUserFromRequest(request, store, pool);
+    const pool = resolvePool();
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
     if (!authUser) {
       return jsonResponse(
         { success: false, error: "Authentication required to access creator subscriber count." },
@@ -14571,6 +16384,13 @@ export async function handleApiRequest(
       }
     }
 
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
+
     if (pool) {
       try {
         const [uRows]: any = await pool.query(
@@ -14580,10 +16400,20 @@ export async function handleApiRequest(
         if (uRows && uRows.length > 0 && uRows[0].user_id) {
           creatorUserId = String(uRows[0].user_id).trim();
         }
-      } catch (_e) {
-        // Ignore lookup failure
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error resolving creator identity: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Ignore lookup failure in dev/test
       }
-    } else {
+    } else if (!isProd) {
       const match = store.users.find(
         (u) =>
           u.user_id.toUpperCase() === creatorUserId.toUpperCase() ||
@@ -14608,9 +16438,26 @@ export async function handleApiRequest(
           creator_user_id: creatorUserId,
           subscriber_count: count,
         });
-      } catch (_e) {
-        // Fall through to store
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error loading subscriber count: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Fall through to store in dev/test
       }
+    }
+
+    if (isProd) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
     }
 
     if (!store.channelSubscriptions) store.channelSubscriptions = [];
@@ -14632,7 +16479,7 @@ export async function handleApiRequest(
     if (method !== "GET") {
       return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
     }
-    const pool = getMysqlPool();
+    const pool = resolvePool();
     let creatorUserId = String(
       url.searchParams.get("creator_user_id") ||
         url.searchParams.get("creatorId") ||
@@ -14644,6 +16491,18 @@ export async function handleApiRequest(
       return jsonResponse({ success: false, error: "Creator user ID is required." }, 400);
     }
 
+    const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(request, store, pool, env);
+    if (earlyResponse) {
+      return earlyResponse;
+    }
+
+    if (isProd && !pool) {
+      return jsonResponse(
+        { success: false, error: "Database connection unavailable in production." },
+        503,
+      );
+    }
+
     if (pool) {
       try {
         const [uRows]: any = await pool.query(
@@ -14653,10 +16512,20 @@ export async function handleApiRequest(
         if (uRows && uRows.length > 0 && uRows[0].user_id) {
           creatorUserId = String(uRows[0].user_id).trim();
         }
-      } catch (_e) {
-        // Ignore lookup failure
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error resolving creator identity: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Ignore lookup failure in dev/test
       }
-    } else {
+    } else if (!isProd) {
       const match = store.users.find(
         (u) =>
           u.user_id.toUpperCase() === creatorUserId.toUpperCase() ||
@@ -14666,8 +16535,6 @@ export async function handleApiRequest(
         creatorUserId = match.user_id;
       }
     }
-
-    const authUser = await getAuthUserFromRequest(request, store, pool);
 
     let totalSubscribers = 0;
     if (pool) {
@@ -14679,11 +16546,21 @@ export async function handleApiRequest(
           [creatorUserId],
         );
         totalSubscribers = Number(countRows?.[0]?.subscriber_count || 0);
-      } catch (_e) {
-        // Fall through to store count
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error loading subscriber count: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Fall through to store count in dev/test
       }
     }
-    if (!pool || totalSubscribers === 0) {
+    if (!isProd && (!pool || totalSubscribers === 0)) {
       if (!store.channelSubscriptions) store.channelSubscriptions = [];
       totalSubscribers = new Set(
         store.channelSubscriptions
@@ -14716,11 +16593,21 @@ export async function handleApiRequest(
           [creatorUserId, subscriberUserId],
         );
         isSubscribed = subRows && subRows.length > 0;
-      } catch (_e) {
-        // Fall through to store
+      } catch (dbErr: any) {
+        if (isProd) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Database error checking subscription status: " + (dbErr?.message || "Query failed"),
+            },
+            503,
+          );
+        }
+        // Fall through to store in dev/test
       }
     }
-    if (!isSubscribed) {
+    if (!isProd && !isSubscribed) {
       if (!store.channelSubscriptions) store.channelSubscriptions = [];
       isSubscribed = store.channelSubscriptions.some(
         (s) =>

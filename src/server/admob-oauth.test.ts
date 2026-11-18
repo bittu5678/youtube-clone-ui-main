@@ -1169,10 +1169,10 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
   });
 
   // --------------------------------------------------------------------------
-  // 12. Production OAuth Publisher ID Fail-Closed Enforcement (No Test Fallback)
+  // 12. Production OAuth Publisher ID Fail-Closed Enforcement & Non-Bypassable OAuth
   // --------------------------------------------------------------------------
   describe("12. Production OAuth Publisher Fail-Closed Enforcement", () => {
-    it("fails closed in production when ADMOB_PUBLISHER_ID is unset or test ID and never exposes tokens", async () => {
+    it("fails closed in production when ADMOB_PUBLISHER_ID is unset or test ID and never skips Google OAuth", async () => {
       const origAppEnv = process.env["APP_ENV"];
       const origNodeEnv = process.env["NODE_ENV"];
       const origPubId = process.env["ADMOB_PUBLISHER_ID"];
@@ -1180,35 +1180,32 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
       const origHost = process.env["DB_HOST"];
       const origName = process.env["DB_NAME"];
       const origUser = process.env["DB_USER"];
+      const origFetch = globalThis.fetch;
 
       try {
-        // Generate valid state while in test mode
+        // Generate valid states while in test mode
         process.env["NODE_ENV"] = "test";
-        const urlRes1 = await callApi(
-          new Request("http://localhost:3000/api/admin/admob/auth-url", {
-            method: "GET",
-            headers: { Authorization: `Bearer ${adminSessionToken}` },
-          }),
-        );
-        const urlData1 = (await urlRes1.json()) as any;
-        const state1 = new URL(urlData1.auth_url).searchParams.get("state") || "";
-        const cookie1 =
-          (urlRes1.headers.get("Set-Cookie") || "").match(
-            /facetube_admob_oauth_binding=[^;]+/,
-          )?.[0] || "";
+        process.env["APP_ENV"] = "test";
+        const issueStateAndCookie = async () => {
+          const urlRes = await callApi(
+            new Request("http://localhost:3000/api/admin/admob/auth-url", {
+              method: "GET",
+              headers: { Authorization: `Bearer ${adminSessionToken}` },
+            }),
+          );
+          const urlData = (await urlRes.json()) as any;
+          const state = new URL(urlData.auth_url).searchParams.get("state") || "";
+          const cookie =
+            (urlRes.headers.get("Set-Cookie") || "").match(
+              /facetube_admob_oauth_binding=[^;]+/,
+            )?.[0] || "";
+          return { state, cookie };
+        };
 
-        const urlRes2 = await callApi(
-          new Request("http://localhost:3000/api/admin/admob/auth-url", {
-            method: "GET",
-            headers: { Authorization: `Bearer ${adminSessionToken}` },
-          }),
-        );
-        const urlData2 = (await urlRes2.json()) as any;
-        const state2 = new URL(urlData2.auth_url).searchParams.get("state") || "";
-        const cookie2 =
-          (urlRes2.headers.get("Set-Cookie") || "").match(
-            /facetube_admob_oauth_binding=[^;]+/,
-          )?.[0] || "";
+        const pair1 = await issueStateAndCookie();
+        const pair2 = await issueStateAndCookie();
+        const pair3 = await issueStateAndCookie();
+        const pair4 = await issueStateAndCookie();
 
         // Configure MySQL mock pool and switch to production mode
         process.env["DB_HOST"] = "127.0.0.1";
@@ -1221,6 +1218,29 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
 
         const adminHash = crypto.createHash("sha256").update(adminSessionToken).digest("hex");
         let credentialInserts = 0;
+        let googleTokenCalls = 0;
+
+        globalThis.fetch = (async (input: string | URL | Request) => {
+          const urlStr = typeof input === "string" ? input : input.toString();
+          if (urlStr.startsWith("https://oauth2.googleapis.com/token")) {
+            googleTokenCalls += 1;
+            return new Response(
+              JSON.stringify({
+                access_token: "live_google_access_token_123",
+                refresh_token: "live_google_refresh_token_123",
+                expires_in: 3600,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (urlStr.startsWith("https://admob.googleapis.com/v1/accounts")) {
+            return new Response(JSON.stringify({ account: [] }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          throw new Error(`Unexpected fetch URL in AdMob test: ${urlStr}`);
+        }) as typeof fetch;
 
         setMysqlPoolForTesting({
           query: async (sql: string) => {
@@ -1247,16 +1267,22 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
           },
         });
 
+        // 12a. Even with ADMOB_SKIP_REMOTE_CHECK=true in production, real Google OAuth token exchange runs (NOT bypassed)
         const prodMissingRes = await callApi(
           new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Cookie: cookie1,
+              Cookie: pair1.cookie,
               Authorization: `Bearer ${adminSessionToken}`,
             },
-            body: JSON.stringify({ code: "test_mock_code_prod_fail", state: state1 }),
+            body: JSON.stringify({ code: "4/real_google_auth_code_prod_fail", state: pair1.state }),
           }),
+        );
+        assert.equal(
+          googleTokenCalls,
+          1,
+          "Production must call Google token endpoint even when ADMOB_SKIP_REMOTE_CHECK=true",
         );
         assert.equal(prodMissingRes.status, 500);
         const missingBody = (await prodMissingRes.json()) as any;
@@ -1266,19 +1292,20 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
         assert.equal(missingBody.refresh_token, undefined);
         assert.equal(credentialInserts, 0, "Must never store credentials without valid publisher");
 
-        // Explicitly setting test publisher ID in production must also fail closed
+        // 12b. Explicitly setting test publisher ID in production must also fail closed
         process.env["ADMOB_PUBLISHER_ID"] = "pub-3940256099942544";
         const prodTestPubRes = await callApi(
           new Request(
-            `http://localhost:3000/api/admin/admob/oauth-callback?code=test_mock_code_prod_test_pub&state=${encodeURIComponent(state2)}`,
+            `http://localhost:3000/api/admin/admob/oauth-callback?code=4/real_google_auth_code_test_pub&state=${encodeURIComponent(pair2.state)}`,
             {
               method: "GET",
               headers: {
-                Cookie: cookie2,
+                Cookie: pair2.cookie,
               },
             },
           ),
         );
+        assert.equal(googleTokenCalls, 2);
         assert.equal(prodTestPubRes.status, 302);
         const loc = prodTestPubRes.headers.get("Location") || "";
         assert.ok(
@@ -1286,6 +1313,51 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
           `Expected missing_publisher_id redirect, got: ${loc}`,
         );
         assert.equal(credentialInserts, 0, "Must never store test publisher pub-3940256099942544");
+
+        // 12c. Test mock code is rejected in production even when ADMOB_SKIP_REMOTE_CHECK=true
+        const mockCodeProdRes = await callApi(
+          new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: pair3.cookie,
+              Authorization: `Bearer ${adminSessionToken}`,
+            },
+            body: JSON.stringify({ code: "test_mock_code_forbidden_prod", state: pair3.state }),
+          }),
+        );
+        assert.equal(mockCodeProdRes.status, 400);
+        const mockCodeProdData = (await mockCodeProdRes.json()) as any;
+        assert.equal(mockCodeProdData.success, false);
+        assert.match(mockCodeProdData.error, /mock authorization codes/i);
+        assert.equal(credentialInserts, 0);
+
+        // 12d. APP_ENV=production overrides NODE_ENV=development for Google OAuth verification
+        process.env["NODE_ENV"] = "development";
+        process.env["APP_ENV"] = "production";
+        process.env["ADMOB_PUBLISHER_ID"] = "pub-1234567890123456";
+        process.env["ADMOB_SKIP_REMOTE_CHECK"] = "1";
+        const appEnvProdRes = await callApi(
+          new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: pair4.cookie,
+              Authorization: `Bearer ${adminSessionToken}`,
+            },
+            body: JSON.stringify({
+              code: "4/real_google_auth_code_app_env_prod",
+              state: pair4.state,
+            }),
+          }),
+        );
+        assert.equal(appEnvProdRes.status, 200);
+        assert.equal(
+          googleTokenCalls,
+          3,
+          "APP_ENV=production must call Google token endpoint despite NODE_ENV=development and ADMOB_SKIP_REMOTE_CHECK=1",
+        );
+        assert.equal(credentialInserts, 1);
 
         // Verify PHP OAuth callback also removes unconditional pub-3940256099942544 production fallback
         const phpOauthCallback = fs.readFileSync(
@@ -1303,6 +1375,7 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
           "PHP OAuth callback must fail closed in production when publisher ID is missing or test ID",
         );
       } finally {
+        globalThis.fetch = origFetch;
         setMysqlPoolForTesting(null);
         if (origHost !== undefined) process.env["DB_HOST"] = origHost;
         else delete process.env["DB_HOST"];
@@ -1316,6 +1389,113 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
         else delete process.env["NODE_ENV"];
         if (origPubId !== undefined) process.env["ADMOB_PUBLISHER_ID"] = origPubId;
         else delete process.env["ADMOB_PUBLISHER_ID"];
+        if (origSkip !== undefined) process.env["ADMOB_SKIP_REMOTE_CHECK"] = origSkip;
+        else delete process.env["ADMOB_SKIP_REMOTE_CHECK"];
+      }
+    });
+
+    it("does NOT skip remote Google OAuth when ADMOB_SKIP_REMOTE_CHECK is 'false' or '0' in test/development mode", async () => {
+      const origAppEnv = process.env["APP_ENV"];
+      const origNodeEnv = process.env["NODE_ENV"];
+      const origSkip = process.env["ADMOB_SKIP_REMOTE_CHECK"];
+      const origFetch = globalThis.fetch;
+
+      try {
+        process.env["APP_ENV"] = "development";
+        process.env["NODE_ENV"] = "development";
+
+        for (const flagVal of ["false", "0", " FALSE "]) {
+          const urlRes = await callApi(
+            new Request("http://localhost:3000/api/admin/admob/auth-url", {
+              method: "GET",
+              headers: { Authorization: `Bearer ${adminSessionToken}` },
+            }),
+          );
+          const urlData = (await urlRes.json()) as any;
+          const state = new URL(urlData.auth_url).searchParams.get("state") || "";
+          const cookie =
+            (urlRes.headers.get("Set-Cookie") || "").match(
+              /facetube_admob_oauth_binding=[^;]+/,
+            )?.[0] || "";
+
+          let tokenExchangeCalled = false;
+          globalThis.fetch = (async (input: string | URL | Request) => {
+            const urlStr = typeof input === "string" ? input : input.toString();
+            if (urlStr.startsWith("https://oauth2.googleapis.com/token")) {
+              tokenExchangeCalled = true;
+              return new Response(
+                JSON.stringify({
+                  error: "invalid_grant",
+                  error_description: "Mock remote check enforced",
+                }),
+                { status: 400, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            throw new Error(`Unexpected fetch URL: ${urlStr}`);
+          }) as typeof fetch;
+
+          process.env["ADMOB_SKIP_REMOTE_CHECK"] = flagVal;
+          const res = await callApi(
+            new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Cookie: cookie,
+                Authorization: `Bearer ${adminSessionToken}`,
+              },
+              body: JSON.stringify({ code: "4/non_mock_code_123", state }),
+            }),
+          );
+          assert.equal(
+            tokenExchangeCalled,
+            true,
+            `Flag '${flagVal}' must NOT skip remote Google OAuth check`,
+          );
+          assert.equal(res.status, 502);
+        }
+
+        // Verify "1" skips in explicit development mode
+        const devUrlRes = await callApi(
+          new Request("http://localhost:3000/api/admin/admob/auth-url", {
+            method: "GET",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+        );
+        const devUrlData = (await devUrlRes.json()) as any;
+        const devState = new URL(devUrlData.auth_url).searchParams.get("state") || "";
+        const devCookie =
+          (devUrlRes.headers.get("Set-Cookie") || "").match(
+            /facetube_admob_oauth_binding=[^;]+/,
+          )?.[0] || "";
+
+        let fetchCalledWhenOne = false;
+        globalThis.fetch = (async () => {
+          fetchCalledWhenOne = true;
+          throw new Error(
+            "Should not call remote fetch when ADMOB_SKIP_REMOTE_CHECK='1' in development",
+          );
+        }) as typeof fetch;
+
+        process.env["ADMOB_SKIP_REMOTE_CHECK"] = " 1 ";
+        const skipRes = await callApi(
+          new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: devCookie,
+              Authorization: `Bearer ${adminSessionToken}`,
+            },
+            body: JSON.stringify({ code: "4/non_mock_code_skip", state: devState }),
+          }),
+        );
+        assert.equal(fetchCalledWhenOne, false);
+        assert.equal(skipRes.status, 200);
+      } finally {
+        globalThis.fetch = origFetch;
+        if (origAppEnv !== undefined) process.env["APP_ENV"] = origAppEnv;
+        else delete process.env["APP_ENV"];
+        if (origNodeEnv !== undefined) process.env["NODE_ENV"] = origNodeEnv;
+        else delete process.env["NODE_ENV"];
         if (origSkip !== undefined) process.env["ADMOB_SKIP_REMOTE_CHECK"] = origSkip;
         else delete process.env["ADMOB_SKIP_REMOTE_CHECK"];
       }

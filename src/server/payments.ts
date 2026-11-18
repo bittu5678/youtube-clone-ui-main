@@ -3,6 +3,47 @@ import fs from "node:fs";
 import path from "node:path";
 
 /**
+ * Fail-closed production environment check.
+ * Production, staging, or unknown/unset environments evaluate to `true` (fail closed).
+ * Only explicit non-production environments ("development", "dev", "local", "test")
+ * evaluate to `false`, and any "production" value in either APP_ENV or NODE_ENV wins.
+ */
+export function isFailClosedProductionEnv(appEnvRaw?: string, nodeEnvRaw?: string): boolean {
+  const appEnv = String(appEnvRaw ?? "")
+    .trim()
+    .toLowerCase();
+  const nodeEnv = String(nodeEnvRaw ?? "")
+    .trim()
+    .toLowerCase();
+  if (appEnv === "production" || nodeEnv === "production") {
+    return true;
+  }
+  const nonProdEnvs = new Set(["development", "dev", "local", "test"]);
+  const presentEnvs = [appEnv, nodeEnv].filter((v) => v !== "");
+  return presentEnvs.length === 0 || presentEnvs.some((v) => !nonProdEnvs.has(v));
+}
+
+export function isProductionRuntimeEnv(env?: Record<string, string | undefined>): boolean {
+  const appEnv = env?.["APP_ENV"] ?? process.env["APP_ENV"];
+  const nodeEnv = env?.["NODE_ENV"] ?? process.env["NODE_ENV"];
+  return isFailClosedProductionEnv(appEnv, nodeEnv);
+}
+
+/**
+ * Strict boolean flag parser for environment toggles.
+ * Only trimmed, case-insensitive "true" and "1" evaluate to true.
+ */
+export function parseStrictBooleanFlag(
+  value: string | boolean | number | null | undefined,
+): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value === 1;
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "true" || normalized === "1";
+}
+
+/**
  * FaceTube Monetization & Pricing Constants
  */
 export const PRICING_CONFIG = {
@@ -479,11 +520,24 @@ function withLock<T>(fn: () => Promise<T> | T): Promise<T> {
   return result;
 }
 
+function assertNonProductionJsonAllowed(
+  env?: Record<string, string | undefined>,
+  context = "JSON persistence",
+): void {
+  if (isProductionRuntimeEnv(env)) {
+    throw new Error(
+      `[Payments Server] ${context} using data/premium_transactions.json is strictly disabled in production.`,
+    );
+  }
+}
+
 /**
  * Initializes or loads the persistent transaction state from disk/database.
  * Ensures the sequence starts with historical records 1..10, so the next transaction is #11.
+ * Disabled strictly in production environments.
  */
-function loadPersistentState(): PersistentPremiumState {
+function loadPersistentState(env?: Record<string, string | undefined>): PersistentPremiumState {
+  assertNonProductionJsonAllowed(env, "loadPersistentState");
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -542,7 +596,11 @@ function loadPersistentState(): PersistentPremiumState {
   return defaultState;
 }
 
-function savePersistentState(state: PersistentPremiumState): void {
+function savePersistentState(
+  state: PersistentPremiumState,
+  env?: Record<string, string | undefined>,
+): void {
+  assertNonProductionJsonAllowed(env, "savePersistentState");
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -558,9 +616,12 @@ function savePersistentState(state: PersistentPremiumState): void {
 /**
  * Returns current persistent sequence number.
  */
-export async function getPersistentPremiumTxNumber(): Promise<number> {
+export async function getPersistentPremiumTxNumber(
+  env?: Record<string, string | undefined>,
+): Promise<number> {
+  assertNonProductionJsonAllowed(env, "getPersistentPremiumTxNumber");
   return withLock(() => {
-    const state = loadPersistentState();
+    const state = loadPersistentState(env);
     return state.lastTxNumber;
   });
 }
@@ -568,9 +629,12 @@ export async function getPersistentPremiumTxNumber(): Promise<number> {
 /**
  * Returns all recorded persistent premium transactions.
  */
-export async function getPersistentTransactions(): Promise<PersistentPremiumTxRecord[]> {
+export async function getPersistentTransactions(
+  env?: Record<string, string | undefined>,
+): Promise<PersistentPremiumTxRecord[]> {
+  assertNonProductionJsonAllowed(env, "getPersistentTransactions");
   return withLock(() => {
-    const state = loadPersistentState();
+    const state = loadPersistentState(env);
     return [...state.transactions];
   });
 }
@@ -578,9 +642,12 @@ export async function getPersistentTransactions(): Promise<PersistentPremiumTxRe
 /**
  * Returns all recorded persistent refund requests.
  */
-export async function getPersistentRefundRequests(): Promise<RefundRequestRecord[]> {
+export async function getPersistentRefundRequests(
+  env?: Record<string, string | undefined>,
+): Promise<RefundRequestRecord[]> {
+  assertNonProductionJsonAllowed(env, "getPersistentRefundRequests");
   return withLock(() => {
-    const state = loadPersistentState();
+    const state = loadPersistentState(env);
     return [...(state.refundRequests || [])];
   });
 }
@@ -590,14 +657,16 @@ export async function getPersistentRefundRequests(): Promise<RefundRequestRecord
  */
 export async function savePersistentRefundRequest(
   req: RefundRequestRecord,
+  env?: Record<string, string | undefined>,
 ): Promise<RefundRequestRecord> {
+  assertNonProductionJsonAllowed(env, "savePersistentRefundRequest");
   return withLock(() => {
-    const state = loadPersistentState();
+    const state = loadPersistentState(env);
     if (!state.refundRequests) {
       state.refundRequests = [];
     }
     state.refundRequests.unshift(req);
-    savePersistentState(state);
+    savePersistentState(state, env);
     return req;
   });
 }
@@ -608,9 +677,11 @@ export async function savePersistentRefundRequest(
 export async function updatePersistentRefundRequest(
   requestId: string,
   updates: Partial<RefundRequestRecord>,
+  env?: Record<string, string | undefined>,
 ): Promise<RefundRequestRecord | null> {
+  assertNonProductionJsonAllowed(env, "updatePersistentRefundRequest");
   return withLock(() => {
-    const state = loadPersistentState();
+    const state = loadPersistentState(env);
     if (!state.refundRequests) return null;
     const idx = state.refundRequests.findIndex((r) => r.id === requestId);
     if (idx === -1) return null;
@@ -636,7 +707,7 @@ export async function updatePersistentRefundRequest(
       }
     }
 
-    savePersistentState(state);
+    savePersistentState(state, env);
     return updated;
   });
 }
@@ -660,9 +731,9 @@ export async function executeRazorpayRefund(
   gatewayStatus:
     "gateway_unavailable" | "gateway_not_configured" | "gateway_refund_succeeded" | "gateway_error";
 }> {
-  const keyId = sanitizeSecret(env?.["RAZORPAY_KEY_ID"] || process.env["RAZORPAY_KEY_ID"]);
+  const keyId = sanitizeSecret(env?.["RAZORPAY_KEY_ID"] ?? process.env["RAZORPAY_KEY_ID"]);
   const keySecret = sanitizeSecret(
-    env?.["RAZORPAY_KEY_SECRET"] || process.env["RAZORPAY_KEY_SECRET"],
+    env?.["RAZORPAY_KEY_SECRET"] ?? process.env["RAZORPAY_KEY_SECRET"],
   );
 
   if (!keyId || !keySecret) {
@@ -674,9 +745,10 @@ export async function executeRazorpayRefund(
     };
   }
 
-  const skipRemote = Boolean(
-    env?.["RAZORPAY_SKIP_REMOTE_CHECK"] || process.env["RAZORPAY_SKIP_REMOTE_CHECK"],
-  );
+  const isProduction = isProductionRuntimeEnv(env);
+  const rawSkipRemote =
+    env?.["RAZORPAY_SKIP_REMOTE_CHECK"] ?? process.env["RAZORPAY_SKIP_REMOTE_CHECK"];
+  const skipRemote = !isProduction && parseStrictBooleanFlag(rawSkipRemote);
 
   if (skipRemote) {
     return {
@@ -740,14 +812,19 @@ export async function resetPersistentPremiumState(
   transactions: PersistentPremiumTxRecord[] = [],
   userSubscriptions: UserSubscriptionRecord[] = [],
   refundRequests: RefundRequestRecord[] = [],
+  env?: Record<string, string | undefined>,
 ): Promise<void> {
+  assertNonProductionJsonAllowed(env, "resetPersistentPremiumState");
   return withLock(() => {
-    savePersistentState({
-      lastTxNumber: txNumber,
-      transactions,
-      userSubscriptions,
-      refundRequests,
-    });
+    savePersistentState(
+      {
+        lastTxNumber: txNumber,
+        transactions,
+        userSubscriptions,
+        refundRequests,
+      },
+      env,
+    );
   });
 }
 
@@ -850,9 +927,9 @@ export async function createServerPaymentOrder(
     amount = plan ? plan.price : 49.0;
   }
 
-  const keyId = sanitizeSecret(env?.["RAZORPAY_KEY_ID"] || process.env["RAZORPAY_KEY_ID"]);
+  const keyId = sanitizeSecret(env?.["RAZORPAY_KEY_ID"] ?? process.env["RAZORPAY_KEY_ID"]);
   const keySecret = sanitizeSecret(
-    env?.["RAZORPAY_KEY_SECRET"] || process.env["RAZORPAY_KEY_SECRET"],
+    env?.["RAZORPAY_KEY_SECRET"] ?? process.env["RAZORPAY_KEY_SECRET"],
   );
 
   if (!keyId || !keySecret) {
@@ -863,10 +940,11 @@ export async function createServerPaymentOrder(
 
   const amountInSubunits = Math.round(amount * 100);
 
-  // If running in a test suite where live calls are bypassed
-  const skipRemote = Boolean(
-    env?.["RAZORPAY_SKIP_REMOTE_CHECK"] || process.env["RAZORPAY_SKIP_REMOTE_CHECK"],
-  );
+  // Remote Razorpay API calls may only be bypassed in explicit non-production environments
+  const isProduction = isProductionRuntimeEnv(env);
+  const rawSkipRemote =
+    env?.["RAZORPAY_SKIP_REMOTE_CHECK"] ?? process.env["RAZORPAY_SKIP_REMOTE_CHECK"];
+  const skipRemote = !isProduction && parseStrictBooleanFlag(rawSkipRemote);
 
   let orderId: string;
   if (skipRemote) {
@@ -942,13 +1020,14 @@ export async function verifyServerPayment(
   env?: Record<string, string | undefined>,
   uplines?: AdsUplineSponsor[],
 ): Promise<PaymentVerifyResult> {
-  const keyId = sanitizeSecret(env?.["RAZORPAY_KEY_ID"] || process.env["RAZORPAY_KEY_ID"]);
+  const isProduction = isProductionRuntimeEnv(env);
+  const keyId = sanitizeSecret(env?.["RAZORPAY_KEY_ID"] ?? process.env["RAZORPAY_KEY_ID"]);
   const secretKey = sanitizeSecret(
-    env?.["RAZORPAY_KEY_SECRET"] || process.env["RAZORPAY_KEY_SECRET"],
+    env?.["RAZORPAY_KEY_SECRET"] ?? process.env["RAZORPAY_KEY_SECRET"],
   );
 
-  // Strictly fail closed if secret key is missing
-  if (!secretKey) {
+  // Strictly fail closed if secret key is missing (and keyId is required in production)
+  if (!secretKey || (isProduction && !keyId)) {
     return {
       verified: false,
       paymentId: req.paymentId,
@@ -956,7 +1035,7 @@ export async function verifyServerPayment(
       amount: 0,
       purpose: req.purpose,
       error:
-        "Payment verification failed closed: RAZORPAY_KEY_SECRET is not configured on the server",
+        "Payment verification failed closed: Razorpay credentials (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET) are not configured on the server",
     };
   }
 
@@ -1024,12 +1103,12 @@ export async function verifyServerPayment(
   }
   const expectedPaise = Math.round(expectedAmount * 100);
 
-  // 2. Real Razorpay API Confirmation
-  const skipRemote = Boolean(
-    env?.["RAZORPAY_SKIP_REMOTE_CHECK"] || process.env["RAZORPAY_SKIP_REMOTE_CHECK"],
-  );
+  // 2. Real Razorpay API Confirmation (mandatory in production; never skipped in production)
+  const rawSkipRemote =
+    env?.["RAZORPAY_SKIP_REMOTE_CHECK"] ?? process.env["RAZORPAY_SKIP_REMOTE_CHECK"];
+  const skipRemote = !isProduction && parseStrictBooleanFlag(rawSkipRemote);
 
-  if (keyId && !skipRemote) {
+  if ((isProduction || keyId) && !skipRemote) {
     try {
       const authHeader = `Basic ${Buffer.from(`${keyId}:${secretKey}`).toString("base64")}`;
       const rzpRes = await fetch(`https://api.razorpay.com/v1/payments/${req.paymentId}`, {
@@ -1138,9 +1217,21 @@ export async function verifyServerPayment(
     }
   }
 
+  // In production, JSON persistent state is strictly forbidden; MySQL must handle payment settlement
+  if (isProductionRuntimeEnv(env)) {
+    return {
+      verified: false,
+      paymentId: req.paymentId,
+      orderId: req.orderId,
+      amount: 0,
+      purpose: req.purpose,
+      error: "Database persistence is required in production; JSON transaction storage is disabled.",
+    };
+  }
+
   // Atomic critical section for sequence allocation & duplicate prevention
   return withLock(async () => {
-    const state = loadPersistentState();
+    const state = loadPersistentState(env);
 
     // 1. DUPLICATE CHECK: Prevent duplicate processing of the same Razorpay payment
     const existingTx = state.transactions.find((t) => t.paymentId === req.paymentId);
@@ -1317,7 +1408,7 @@ export async function verifyServerPayment(
       };
 
       state.transactions.unshift(record);
-      savePersistentState(state);
+      savePersistentState(state, env);
 
       return {
         verified: true,
@@ -1385,7 +1476,7 @@ export async function verifyServerPayment(
       };
 
       state.transactions.unshift(subRecord);
-      savePersistentState(state);
+      savePersistentState(state, env);
 
       return {
         verified: true,
@@ -1450,7 +1541,7 @@ export async function verifyServerPayment(
     };
 
     state.transactions.unshift(adsRecord);
-    savePersistentState(state);
+    savePersistentState(state, env);
 
     const directL1 = dist.levelPayouts.find((p) => p.level === 1);
 
