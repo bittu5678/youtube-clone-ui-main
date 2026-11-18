@@ -28,6 +28,7 @@ import {
   sendPasswordResetEmailServer,
   resolveSmtpConfig,
 } from "./email.ts";
+import { handleAdminRecoverPremiumPayment } from "./premium-recovery.ts";
 
 const DATA_DIR = path.resolve(process.cwd(), "data");
 const STORE_FILE = path.join(DATA_DIR, "facetube_store.json");
@@ -10175,6 +10176,16 @@ export async function handleApiRequest(
     }
 
     return jsonResponse({ success: false, error: "Method Not Allowed" }, 405);
+  }
+
+  // 20b-2. Admin Premium Video Payment Recovery (dryRun defaults to true; live writes gated)
+  if (route === "admin/recover-premium-payment") {
+    const pool = getMysqlPool();
+    return handleAdminRecoverPremiumPayment(request, {
+      pool,
+      env,
+      getAuthUser: (req) => getAuthUserFromRequest(req, store, pool),
+    });
   }
 
   // 20c. Admin Record Verified AdSense Earnings Report
