@@ -287,31 +287,78 @@ describe("Priority 3: Admin Category Management & Verification Tests", () => {
       }
     });
 
-    it("returns clean baseline categories in production without silently relying on local JSON storage", async () => {
-      const prevEnv = process.env["NODE_ENV"];
-      try {
-        process.env["NODE_ENV"] = "production";
+    it("fails closed with HTTP 503 on /api/categories/list when production DB is missing, query fails, or table is missing", async () => {
+      const prodEnv = { APP_ENV: "production", NODE_ENV: "development" };
 
-        const req = new Request("http://localhost:3000/api/categories/list", {
-          method: "GET",
-        });
+      // 1. Missing production pool
+      const missingPoolRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/categories/list", { method: "GET" }),
+        prodEnv,
+        { pool: null },
+      );
+      assert.ok(missingPoolRes);
+      assert.equal(missingPoolRes.status, 503);
+      const missingData = await missingPoolRes.json();
+      assert.equal(missingData.success, false);
+      assert.equal(missingData.categories, undefined);
+      assert.match(missingData.error, /database connection unavailable/i);
 
-        const res = await handleApiRequest(req);
-        assert.ok(res);
-        assert.equal(res.status, 200);
+      // 2. Missing categories table (ER_NO_SUCH_TABLE) in production
+      const missingTablePool = {
+        query: async () => {
+          const err = new Error("Table 'facetube.categories' doesn't exist") as Error & {
+            code?: string;
+          };
+          err.code = "ER_NO_SUCH_TABLE";
+          throw err;
+        },
+      } as any;
+      const tableMissingRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/categories/list", { method: "GET" }),
+        prodEnv,
+        { pool: missingTablePool },
+      );
+      assert.ok(tableMissingRes);
+      assert.equal(tableMissingRes.status, 503);
+      const tableMissingData = await tableMissingRes.json();
+      assert.equal(tableMissingData.success, false);
+      assert.equal(tableMissingData.categories, undefined);
 
-        const data = await res.json();
-        assert.equal(data.success, true);
-        assert.equal(data.source, "baseline_fallback");
-        assert.ok(Array.isArray(data.categories));
-        assert.ok(data.categories.length >= 13);
+      // 3. Generic query error in production
+      const failingPool = {
+        query: async () => {
+          throw new Error("Connection lost");
+        },
+      } as any;
+      const queryFailRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/categories/list", { method: "GET" }),
+        prodEnv,
+        { pool: failingPool },
+      );
+      assert.ok(queryFailRes);
+      assert.equal(queryFailRes.status, 503);
+      const queryFailData = await queryFailRes.json();
+      assert.equal(queryFailData.success, false);
+      assert.equal(queryFailData.categories, undefined);
+    });
 
-        const names = data.categories.map((c: any) => c.name);
-        assert.ok(names.includes("Cartoon"));
-        assert.ok(names.includes("Coding"));
-      } finally {
-        process.env["NODE_ENV"] = prevEnv;
-      }
+    it("returns empty categories array in production when DB query genuinely returns 0 rows", async () => {
+      const zeroRowPool = {
+        query: async () => [[]],
+      } as any;
+
+      const res = await handleApiRequest(
+        new Request("http://localhost:3000/api/categories/list", { method: "GET" }),
+        { APP_ENV: "production", NODE_ENV: "development" },
+        { pool: zeroRowPool },
+      );
+      assert.ok(res);
+      assert.equal(res.status, 200);
+
+      const data = await res.json();
+      assert.equal(data.success, true);
+      assert.equal(data.source, "database");
+      assert.deepEqual(data.categories, []);
     });
   });
 });

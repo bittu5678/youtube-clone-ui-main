@@ -572,5 +572,85 @@ describe("LiveKit WebRTC Live Streaming Backend Foundation Tests (Stage 1)", () 
         process.env["NODE_ENV"] = origEnv;
       }
     });
+
+    it("fails closed with 500 on /api/live/token and /api/live/webhook in production when LiveKit credentials are missing", async () => {
+      const prodMissingLkEnv = {
+        APP_ENV: "production",
+        NODE_ENV: "development",
+        LIVEKIT_API_KEY: "",
+        LIVEKIT_API_SECRET: "",
+      };
+
+      const mockStreamPool = {
+        query: async (sql: string) => {
+          if (sql.includes("FROM sessions")) {
+            return [
+              [
+                {
+                  id: "u-1",
+                  user_id: "FT483921",
+                  name: "Alex",
+                  mobile: "",
+                  email: "alex@facetube.com",
+                  role: "user",
+                  referral_code: null,
+                  created_at: new Date().toISOString(),
+                },
+              ],
+            ];
+          }
+          if (sql.includes("FROM live_streams")) {
+            return [
+              [
+                {
+                  id: testStreamId,
+                  user_id: "FT483921",
+                  livekit_room_name: `room_${testStreamId}`,
+                  status: "live",
+                },
+              ],
+            ];
+          }
+          return [[]];
+        },
+      } as any;
+
+      const tokenRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/live/token", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${creatorToken}`,
+          },
+          body: JSON.stringify({ streamId: testStreamId, role: "publisher" }),
+        }),
+        prodMissingLkEnv,
+        { pool: mockStreamPool },
+      );
+      assert.ok(tokenRes);
+      assert.equal(tokenRes.status, 500);
+      const tokenData = await tokenRes.json();
+      assert.equal(tokenData.success, false);
+      assert.equal(tokenData.token, undefined);
+      assert.match(tokenData.error, /LIVEKIT_API_KEY|LIVEKIT_API_SECRET/i);
+
+      const webhookRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/live/webhook", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer dummy",
+          },
+          body: JSON.stringify({ id: "EV_PROD_MISSING_SECRET", event: "participant_joined" }),
+        }),
+        prodMissingLkEnv,
+        { pool: mockStreamPool },
+      );
+      assert.ok(webhookRes);
+      assert.equal(webhookRes.status, 500);
+      const webhookData = await webhookRes.json();
+      assert.equal(webhookData.success, false);
+      assert.match(webhookData.error, /LIVEKIT_API_SECRET/i);
+    });
   });
 });

@@ -2045,4 +2045,55 @@ describe("Premium Payment Recovery Endpoint — PHP Structural & Node Functional
       "release:facetube_premium_tx_seq",
     ]);
   });
+
+  it("Phase 2: /api/admin/recover-premium-payment returns HTTP 503 (never 401) on missing or failing production DB and keeps dryRun=true default", async () => {
+    const prodEnv = { APP_ENV: "production", NODE_ENV: "development" };
+
+    // 1. Missing production pool without token -> 503
+    const missingPoolRes = await handleApiRequest(
+      new Request("http://localhost:3000/api/admin/recover-premium-payment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: [LONG_ITEM] }),
+      }),
+      prodEnv,
+      { pool: null },
+    );
+    assert.ok(missingPoolRes);
+    assert.equal(missingPoolRes.status, 503);
+
+    // 2. Failing production DB on session check -> 503
+    const failingPool = {
+      query: async () => {
+        throw new Error("Simulated MySQL session error");
+      },
+    } as unknown as Pool;
+    const failingDbRes = await handleApiRequest(
+      new Request("http://localhost:3000/api/admin/recover-premium-payment", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer admin_tok",
+        },
+        body: JSON.stringify({ items: [LONG_ITEM] }),
+      }),
+      prodEnv,
+      { pool: failingPool },
+    );
+    assert.ok(failingDbRes);
+    assert.equal(failingDbRes.status, 503);
+
+    // 3. Direct handler call in prod with failing getAuthUser -> 503
+    const directFailRes = await handleAdminRecoverPremiumPayment(
+      buildRequest({ items: [LONG_ITEM] }),
+      {
+        pool: failingPool,
+        env: prodEnv,
+        getAuthUser: async () => {
+          throw new Error("DB unavailable");
+        },
+      },
+    );
+    assert.equal(directFailRes.status, 503);
+  });
 });

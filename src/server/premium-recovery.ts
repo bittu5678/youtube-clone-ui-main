@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { Pool, PoolConnection } from "mysql2/promise";
+import { isProductionRuntimeEnv } from "./payments.ts";
 
 export interface RecoveryAuthUser {
   id: string;
@@ -910,6 +911,17 @@ export async function handleAdminRecoverPremiumPayment(
     return jsonRecoveryResponse({ success: false, error: "Method Not Allowed" }, 405);
   }
 
+  const isProd = isProductionRuntimeEnv(options.env);
+  if (isProd && !options.pool) {
+    return jsonRecoveryResponse(
+      {
+        success: false,
+        error: "MySQL connection pool is unavailable. Premium payment recovery requires MySQL.",
+      },
+      503,
+    );
+  }
+
   let authUser: RecoveryAuthUser | null = null;
   try {
     authUser = await options.getAuthUser(request);
@@ -919,7 +931,7 @@ export async function handleAdminRecoverPremiumPayment(
         success: false,
         error: "Database error while verifying administrator session.",
       },
-      500,
+      isProd ? 503 : 500,
     );
   }
   if (!authUser) {

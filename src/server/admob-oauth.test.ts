@@ -1501,4 +1501,117 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
       }
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 13. Phase 2: AdMob OAuth Production DB Guard & Env Injection
+  // --------------------------------------------------------------------------
+  describe("13. Phase 2: AdMob OAuth Production DB Guard & Env Injection", () => {
+    const prodEnv = {
+      APP_ENV: "production",
+      NODE_ENV: "development",
+      ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+      ADMOB_OAUTH_CLIENT_ID: "injected-client-id",
+      ADMOB_OAUTH_CLIENT_SECRET: "injected-client-secret",
+    };
+
+    it("returns HTTP 503 (never 401) across auth-url, oauth-callback, status, and disconnect when production DB is missing or failing", async () => {
+      const failingSessionPool = {
+        query: async () => {
+          throw new Error("MySQL connection refused");
+        },
+      } as any;
+
+      for (const routeSpec of [
+        { path: "/api/admin/admob/auth-url", method: "GET" },
+        { path: "/api/admin/admob/status", method: "GET" },
+        { path: "/api/admin/admob/disconnect", method: "POST" },
+        { path: "/api/admin/admob/oauth-callback", method: "POST" },
+      ]) {
+        // Missing DB without Bearer token -> 503 (not 401)
+        const noAuthRes = await callApi(
+          new Request(`http://localhost:3000${routeSpec.path}`, { method: routeSpec.method }),
+          prodEnv,
+        );
+        assert.equal(
+          noAuthRes.status,
+          503,
+          `${routeSpec.path} with missing prod DB and no token must return 503`,
+        );
+
+        // Failing DB session check with Bearer token -> 503 (not 401)
+        const failDbRes = await handleApiRequest(
+          new Request(`http://localhost:3000${routeSpec.path}`, {
+            method: routeSpec.method,
+            headers: {
+              Authorization: `Bearer ${adminSessionToken}`,
+              "Content-Type": "application/json",
+            },
+            body: routeSpec.method === "POST" ? JSON.stringify({ code: "x", state: "y" }) : null,
+          }),
+          prodEnv,
+          { pool: failingSessionPool },
+        );
+        assert.ok(failDbRes);
+        assert.equal(
+          failDbRes.status,
+          503,
+          `${routeSpec.path} with failing prod DB session query must return 503`,
+        );
+      }
+    });
+
+    it("respects injected ADMOB_* env values and DB configuration over process.env", async () => {
+      const savedKey = process.env["ADMOB_ENCRYPTION_KEY"];
+      const savedCid = process.env["ADMOB_OAUTH_CLIENT_ID"];
+      const savedCsec = process.env["ADMOB_OAUTH_CLIENT_SECRET"];
+      delete process.env["ADMOB_ENCRYPTION_KEY"];
+      delete process.env["ADMOB_OAUTH_CLIENT_ID"];
+      delete process.env["ADMOB_OAUTH_CLIENT_SECRET"];
+
+      try {
+        const mockPool = {
+          query: async (sql: string) => {
+            if (sql.includes("FROM sessions")) {
+              return [
+                [
+                  {
+                    id: adminUserId,
+                    user_id: adminUserId,
+                    name: "Admin",
+                    mobile: "",
+                    email: "admin@facetube.com",
+                    role: "admin",
+                    referral_code: null,
+                    created_at: new Date().toISOString(),
+                  },
+                ],
+              ];
+            }
+            if (sql.includes("INSERT INTO admob_oauth_states")) {
+              return [{ affectedRows: 1 }];
+            }
+            return [[]];
+          },
+        } as any;
+
+        const res = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/auth-url", {
+            method: "GET",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+          prodEnv,
+          { pool: mockPool },
+        );
+        assert.ok(res);
+        assert.equal(res.status, 200);
+        const data = (await res.json()) as any;
+        assert.equal(data.success, true);
+        assert.ok(String(data.auth_url).includes("client_id=injected-client-id"));
+      } finally {
+        if (savedKey !== undefined) process.env["ADMOB_ENCRYPTION_KEY"] = savedKey;
+        if (savedCid !== undefined) process.env["ADMOB_OAUTH_CLIENT_ID"] = savedCid;
+        if (savedCsec !== undefined) process.env["ADMOB_OAUTH_CLIENT_SECRET"] = savedCsec;
+      }
+    });
+  });
 });

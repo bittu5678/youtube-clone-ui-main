@@ -475,7 +475,8 @@ try {
         $unallocatedReferrerPaise = $hasReferrer ? 0 : 100; // 100 paise if no referrer
 
         $creatorPayouts = [];
-        $eligibleCreatorCount = 0;
+        $eligibleVideoCount = 0;
+        $distinctCreatorCount = 0;
 
         if ($isSpecial) {
             // Special transaction (11th, 21st, 31st...):
@@ -503,6 +504,14 @@ try {
             $stmtEligibleVideos->execute([$userId]);
             $eligibleVideos = $stmtEligibleVideos->fetchAll(PDO::FETCH_ASSOC);
             $eligibleVideoCount = count($eligibleVideos);
+            $distinctCreatorIds = [];
+            foreach ($eligibleVideos as $ev) {
+                $evUid = strtoupper(trim((string)($ev['user_id'] ?? '')));
+                if ($evUid !== '') {
+                    $distinctCreatorIds[$evUid] = true;
+                }
+            }
+            $distinctCreatorCount = count($distinctCreatorIds);
 
             if ($eligibleVideoCount === 0) {
                 // If there are no eligible previous videos, redirect the entire ₹3 pool to Admin
@@ -1202,8 +1211,10 @@ try {
             'adminAmount' => $adminAllocation,
             'adminPercent' => $adminPercent,
             'globalPoolAmount' => $globalPoolAllocation,
-            'eligibleMembersCount' => $isPremiumUpload ? $eligibleCreatorCount : 0,
-            'perMemberShare' => $isPremiumUpload && $eligibleCreatorCount > 0 && !empty($creatorPayouts[0]) ? $creatorPayouts[0]['amount'] : 0.0,
+            'eligibleMembersCount' => $isPremiumUpload ? $eligibleVideoCount : 0,
+            'eligibleVideoCount' => $isPremiumUpload ? $eligibleVideoCount : 0,
+            'distinctCreatorCount' => $isPremiumUpload ? $distinctCreatorCount : 0,
+            'perMemberShare' => $isPremiumUpload && $eligibleVideoCount > 0 && !empty($creatorPayouts[0]) ? $creatorPayouts[0]['amount'] : 0.0,
             'creatorPayouts' => $creatorPayouts,
             'totalReferralAmount' => $totalReferralAmount,
             'levelPayouts' => $levelPayouts,

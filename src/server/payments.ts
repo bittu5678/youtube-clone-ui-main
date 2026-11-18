@@ -24,8 +24,12 @@ export function isFailClosedProductionEnv(appEnvRaw?: string, nodeEnvRaw?: strin
 }
 
 export function isProductionRuntimeEnv(env?: Record<string, string | undefined>): boolean {
-  const appEnv = env?.["APP_ENV"] ?? process.env["APP_ENV"];
-  const nodeEnv = env?.["NODE_ENV"] ?? process.env["NODE_ENV"];
+  const hasExplicitAppEnv =
+    env !== undefined && Object.prototype.hasOwnProperty.call(env, "APP_ENV");
+  const hasExplicitNodeEnv =
+    env !== undefined && Object.prototype.hasOwnProperty.call(env, "NODE_ENV");
+  const appEnv = hasExplicitAppEnv ? env["APP_ENV"] : process.env["APP_ENV"];
+  const nodeEnv = hasExplicitNodeEnv ? env["NODE_ENV"] : process.env["NODE_ENV"];
   return isFailClosedProductionEnv(appEnv, nodeEnv);
 }
 
@@ -878,6 +882,8 @@ export interface PaymentVerifyResult {
     adminPercent?: number;
     globalPoolAmount: number;
     eligibleMembersCount: number;
+    eligibleVideoCount?: number;
+    distinctCreatorCount?: number;
     perMemberShare: number;
     creatorPayouts?: Array<{
       userId: string;
@@ -1225,7 +1231,8 @@ export async function verifyServerPayment(
       orderId: req.orderId,
       amount: 0,
       purpose: req.purpose,
-      error: "Database persistence is required in production; JSON transaction storage is disabled.",
+      error:
+        "Database persistence is required in production; JSON transaction storage is disabled.",
     };
   }
 
@@ -1286,6 +1293,7 @@ export async function verifyServerPayment(
           adminAmount: existingTx.adminAllocation,
           globalPoolAmount: existingTx.globalPoolAllocation,
           eligibleMembersCount: isSpec || isAds ? 0 : eligibleCount,
+          eligibleVideoCount: isSpec || isAds ? 0 : eligibleCount,
           perMemberShare,
           totalReferralAmount: existingTx.referralCommission,
         },
@@ -1342,6 +1350,7 @@ export async function verifyServerPayment(
         }
       }
       const eligibleCount = eligibleItems.length;
+      const distinctCreatorCount = new Set(eligibleItems.map((item) => item.userId)).size;
 
       let adminAllocation = 0.0;
       let globalPoolAllocation = 0.0;
@@ -1425,6 +1434,8 @@ export async function verifyServerPayment(
           adminAmount: adminAllocation,
           globalPoolAmount: globalPoolAllocation,
           eligibleMembersCount: isSpecial ? 0 : eligibleCount,
+          eligibleVideoCount: isSpecial ? 0 : eligibleCount,
+          distinctCreatorCount: isSpecial ? 0 : distinctCreatorCount,
           perMemberShare,
           creatorPayouts,
           totalReferralAmount: referralCommission,
@@ -1560,6 +1571,8 @@ export async function verifyServerPayment(
         adminPercent: dist.adminPercent,
         globalPoolAmount: 0,
         eligibleMembersCount: 0,
+        eligibleVideoCount: 0,
+        distinctCreatorCount: 0,
         perMemberShare: 0,
         totalReferralAmount: dist.totalReferralAmount,
         levelPayouts: dist.levelPayouts,

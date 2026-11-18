@@ -217,4 +217,94 @@ describe("Task 2 - Phase 2A: Paid Subscriber Plans Foundation Tests", () => {
       );
     });
   });
+
+  // Test Suite 6: Phase 2 Production DB Fail-Closed Protection
+  describe("6. Production Safety & No Baseline/JSON Fallback on /api/subscriptions/plans", () => {
+    const prodEnv = { APP_ENV: "production", NODE_ENV: "development" };
+
+    it("fails closed with 503 (never 401 or baseline_fallback) when production DB is unavailable", async () => {
+      const noTokenRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/subscriptions/plans", { method: "GET" }),
+        prodEnv,
+        { pool: null },
+      );
+      assert.ok(noTokenRes);
+      assert.equal(noTokenRes.status, 503);
+      const noTokenData = await noTokenRes.json();
+      assert.equal(noTokenData.success, false);
+      assert.equal(noTokenData.plans, undefined);
+
+      const withTokenRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/subscriptions/plans", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${userToken}` },
+        }),
+        prodEnv,
+        { pool: null },
+      );
+      assert.ok(withTokenRes);
+      assert.equal(withTokenRes.status, 503);
+    });
+
+    it("fails closed with 503 when subscriber_plans table is missing or query fails in production", async () => {
+      const makePool = (throwOnPlans: boolean) =>
+        ({
+          query: async (sql: string) => {
+            if (sql.includes("FROM sessions")) {
+              return [
+                [
+                  {
+                    id: "u-1",
+                    user_id: "FT483921",
+                    name: "Alex",
+                    mobile: "",
+                    email: "alex@facetube.com",
+                    role: "user",
+                    referral_code: null,
+                    created_at: new Date().toISOString(),
+                  },
+                ],
+              ];
+            }
+            if (throwOnPlans) {
+              const err = new Error("Table 'facetube.subscriber_plans' doesn't exist") as Error & {
+                code?: string;
+              };
+              err.code = "ER_NO_SUCH_TABLE";
+              throw err;
+            }
+            return [[]];
+          },
+        }) as any;
+
+      const missingTableRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/subscriptions/plans", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${userToken}` },
+        }),
+        prodEnv,
+        { pool: makePool(true) },
+      );
+      assert.ok(missingTableRes);
+      assert.equal(missingTableRes.status, 503);
+      const missingData = await missingTableRes.json();
+      assert.equal(missingData.success, false);
+      assert.equal(missingData.plans, undefined);
+
+      const zeroRowRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/subscriptions/plans", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${userToken}` },
+        }),
+        prodEnv,
+        { pool: makePool(false) },
+      );
+      assert.ok(zeroRowRes);
+      assert.equal(zeroRowRes.status, 200);
+      const zeroData = await zeroRowRes.json();
+      assert.equal(zeroData.success, true);
+      assert.equal(zeroData.source, "database");
+      assert.deepEqual(zeroData.plans, []);
+    });
+  });
 });

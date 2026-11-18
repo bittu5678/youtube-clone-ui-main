@@ -1,6 +1,7 @@
 import mysql from "mysql2/promise";
 import dotenv from "dotenv";
 import path from "path";
+import { isProductionRuntimeEnv } from "./payments.ts";
 
 try {
   dotenv.config();
@@ -20,12 +21,22 @@ export interface DbConfig {
   isConfigured: boolean;
 }
 
-export function getDbConfig(): DbConfig {
-  const host = process.env["DB_HOST"] || process.env["MYSQL_HOST"];
-  const port = Number(process.env["DB_PORT"] || process.env["MYSQL_PORT"] || 3306);
-  const database = process.env["DB_NAME"] || process.env["MYSQL_DATABASE"];
-  const user = process.env["DB_USER"] || process.env["MYSQL_USER"];
-  const password = process.env["DB_PASSWORD"] || process.env["MYSQL_PASSWORD"] || "";
+function readDbEnv(
+  key: string,
+  env?: Record<string, string | undefined> | undefined,
+): string | undefined {
+  if (env !== undefined && Object.prototype.hasOwnProperty.call(env, key)) {
+    return env[key];
+  }
+  return process.env[key];
+}
+
+export function getDbConfig(env?: Record<string, string | undefined> | undefined): DbConfig {
+  const host = readDbEnv("DB_HOST", env) || readDbEnv("MYSQL_HOST", env);
+  const port = Number(readDbEnv("DB_PORT", env) || readDbEnv("MYSQL_PORT", env) || 3306);
+  const database = readDbEnv("DB_NAME", env) || readDbEnv("MYSQL_DATABASE", env);
+  const user = readDbEnv("DB_USER", env) || readDbEnv("MYSQL_USER", env);
+  const password = readDbEnv("DB_PASSWORD", env) || readDbEnv("MYSQL_PASSWORD", env) || "";
 
   // Verify that required connection parameters exist
   const isConfigured = Boolean(host && database && user);
@@ -41,14 +52,30 @@ export function getDbConfig(): DbConfig {
 }
 
 let pool: mysql.Pool | null = null;
+let testingPoolOverride = false;
+let poolConfigKey = "";
 
-export function getMysqlPool(): mysql.Pool | null {
-  const conf = getDbConfig();
+export function getMysqlPool(
+  env?: Record<string, string | undefined> | undefined,
+): mysql.Pool | null {
+  const conf = getDbConfig(env);
+  if (testingPoolOverride && pool) {
+    const hasExplicitHostOverride =
+      env !== undefined &&
+      (Object.prototype.hasOwnProperty.call(env, "DB_HOST") ||
+        Object.prototype.hasOwnProperty.call(env, "MYSQL_HOST"));
+    if (hasExplicitHostOverride && !conf.isConfigured) {
+      return null;
+    }
+    return pool;
+  }
+
   if (!conf.isConfigured || !conf.host || !conf.database || !conf.user) {
     return null;
   }
 
-  if (!pool) {
+  const nextKey = `${conf.host}:${conf.port}:${conf.database}:${conf.user}:${conf.password ?? ""}`;
+  if (!pool || poolConfigKey !== nextKey) {
     try {
       pool = mysql.createPool({
         host: conf.host,
@@ -62,8 +89,16 @@ export function getMysqlPool(): mysql.Pool | null {
         enableKeepAlive: true,
         keepAliveInitialDelay: 0,
       });
+      poolConfigKey = nextKey;
     } catch (err) {
-      console.warn("[AI Studio] MySQL pool creation failed — fallback store active", err);
+      if (isProductionRuntimeEnv(env)) {
+        console.error(
+          "[FaceTube] MySQL pool creation failed in production — JSON fallback disabled",
+          err,
+        );
+      } else {
+        console.warn("[AI Studio] MySQL pool creation failed — fallback store active", err);
+      }
       return null;
     }
   }
@@ -73,19 +108,23 @@ export function getMysqlPool(): mysql.Pool | null {
 
 export function setMysqlPoolForTesting(mockPool: any): void {
   pool = mockPool;
+  testingPoolOverride = mockPool !== null;
+  poolConfigKey = "";
 }
 
 /**
  * Verifies live MySQL connection health and returns safe diagnostics
  */
-export async function testDatabaseConnection(): Promise<{
+export async function testDatabaseConnection(
+  env?: Record<string, string | undefined> | undefined,
+): Promise<{
   connected: boolean;
   error?: string | undefined;
   host?: string | undefined;
   database?: string | undefined;
   user?: string | undefined;
 }> {
-  const conf = getDbConfig();
+  const conf = getDbConfig(env);
   if (!conf.isConfigured) {
     return {
       connected: false,
@@ -98,7 +137,7 @@ export async function testDatabaseConnection(): Promise<{
   }
 
   try {
-    const p = getMysqlPool();
+    const p = getMysqlPool(env);
     if (!p) throw new Error("Could not initialize MySQL connection pool");
     const connection = await p.getConnection();
     try {

@@ -3603,3 +3603,263 @@ describe("Phase 1 Production Safety: Environment Detection, Strict Parsing & Gat
     assert.equal(devLoginRes.status, 200);
   });
 });
+
+describe("Phase 2 Production JSON Fallback Protection & SQL Fail-Closed Tests", () => {
+  it("1. Production never reads or writes facetube_store.json or premium_transactions.json even when NODE_ENV=development and APP_ENV=production", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
+    const premPath = path.resolve(process.cwd(), "data/premium_transactions.json");
+    const storeBefore = fs.readFileSync(storePath, "utf-8");
+    const premBefore = fs.readFileSync(premPath, "utf-8");
+
+    const prodEnv = { APP_ENV: "production", NODE_ENV: "development" };
+    assert.equal(isProductionRuntimeEnv(prodEnv), true);
+    assert.equal(isProductionRuntimeEnv({ APP_ENV: undefined, NODE_ENV: undefined }), true);
+
+    assert.throws(() => resetStoreForTests("FT483921", 50000, prodEnv), /disabled in production/i);
+    assert.throws(() => setStoreWalletBalance("FT483921", 100, prodEnv), /disabled in production/i);
+    await assert.rejects(
+      () => getPersistentPremiumTxNumber(prodEnv),
+      /strictly disabled in production/i,
+    );
+
+    for (const [route, body] of [
+      ["auth/login", { identifier: "alex@facetube.com", password: "password123" }],
+      ["auth/register", { name: "Test", email: "new_prod@facetube.com", password: "password123" }],
+      ["payments/verify", { orderId: "ord_1", paymentId: "pay_1", signature: "sig_1" }],
+      ["payments/transactions", null],
+    ] as const) {
+      const res = await handleApiRequest(
+        new Request(`http://localhost:3000/api/${route}`, {
+          method: body ? "POST" : "GET",
+          headers: { "Content-Type": "application/json" },
+          body: body ? JSON.stringify(body) : null,
+        }),
+        prodEnv,
+        { pool: null },
+      );
+      assert.ok(res);
+      assert.ok([500, 503].includes(res.status), `Expected 500/503 on ${route}, got ${res.status}`);
+    }
+
+    assert.equal(fs.readFileSync(storePath, "utf-8"), storeBefore);
+    assert.equal(fs.readFileSync(premPath, "utf-8"), premBefore);
+  });
+
+  it("2. src/server/mysql.ts respects injected env in getDbConfig, getMysqlPool, and testDatabaseConnection", async () => {
+    const { getDbConfig, getMysqlPool, testDatabaseConnection, setMysqlPoolForTesting } =
+      await import("./mysql.ts");
+
+    const origHost = process.env["DB_HOST"];
+    const origName = process.env["DB_NAME"];
+    const origUser = process.env["DB_USER"];
+    delete process.env["DB_HOST"];
+    delete process.env["DB_NAME"];
+    delete process.env["DB_USER"];
+    setMysqlPoolForTesting(null);
+
+    try {
+      const unconfigured = getDbConfig({ APP_ENV: "production", NODE_ENV: "development" });
+      assert.equal(unconfigured.isConfigured, false);
+      assert.equal(getMysqlPool({ APP_ENV: "production" }), null);
+
+      const injected = getDbConfig({
+        DB_HOST: "10.0.0.5",
+        DB_NAME: "prod_db",
+        DB_USER: "prod_user",
+        DB_PASSWORD: "secret",
+      });
+      assert.equal(injected.isConfigured, true);
+      assert.equal(injected.host, "10.0.0.5");
+      assert.equal(injected.database, "prod_db");
+
+      const diagMissing = await testDatabaseConnection({
+        APP_ENV: "production",
+        DB_HOST: "",
+      });
+      assert.equal(diagMissing.connected, false);
+    } finally {
+      setMysqlPoolForTesting(null);
+      if (origHost !== undefined) process.env["DB_HOST"] = origHost;
+      if (origName !== undefined) process.env["DB_NAME"] = origName;
+      if (origUser !== undefined) process.env["DB_USER"] = origUser;
+    }
+  });
+
+  it("3. payments/verify in production does NOT swallow DB errors on subscriber_plans, payment_orders, uploaded_videos, UPDATE payment_orders, or INSERT INTO premium_transactions", async () => {
+    const secret = "prod_verify_fail_closed_secret";
+    const keyId = "rzp_live_testkey123";
+    const origFetch = globalThis.fetch;
+
+    const makeSig = (orderId: string, paymentId: string) =>
+      crypto.createHmac("sha256", secret).update(`${orderId}|${paymentId}`).digest("hex");
+
+    const makeProdVerifyReq = (
+      orderId: string,
+      paymentId: string,
+      purpose: "paid_subscription" | "premium_video_upload",
+      extra: Record<string, unknown> = {},
+    ) =>
+      new Request("http://localhost:3000/api/payments/verify", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer prod_user_tok",
+        },
+        body: JSON.stringify({
+          orderId,
+          paymentId,
+          signature: makeSig(orderId, paymentId),
+          userId: "FT483921",
+          purpose,
+          ...extra,
+        }),
+      });
+
+    const prodEnv = {
+      APP_ENV: "production",
+      NODE_ENV: "development",
+      RAZORPAY_KEY_ID: keyId,
+      RAZORPAY_KEY_SECRET: secret,
+    };
+
+    try {
+      const makeMockPool = (failOn: string) => {
+        let rolledBack = false;
+        let committed = false;
+        const queryHandler = async (sql: string) => {
+          if (sql.includes("FROM sessions")) {
+            return [
+              [
+                {
+                  id: "u-483921",
+                  user_id: "FT483921",
+                  name: "Alex",
+                  mobile: "",
+                  email: "alex@facetube.com",
+                  role: "user",
+                  referral_code: null,
+                  created_at: new Date().toISOString(),
+                },
+              ],
+            ];
+          }
+          if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
+          if (sql.includes("RELEASE_LOCK")) return [[{ released: 1 }]];
+          if (sql.includes(failOn)) {
+            throw new Error(`Simulated DB failure on ${failOn}`);
+          }
+          if (sql.includes("FROM subscriber_plans")) {
+            return [[{ price: 49, duration_days: 30 }]];
+          }
+          if (sql.includes("FROM users WHERE role = 'admin'")) {
+            return [[{ user_id: "FT102857" }]];
+          }
+          if (sql.includes("SELECT COUNT(*) as total FROM payment_transactions")) {
+            return [[{ total: 0 }]];
+          }
+          return [[]];
+        };
+
+        const conn = {
+          beginTransaction: async () => {},
+          commit: async () => {
+            committed = true;
+          },
+          rollback: async () => {
+            rolledBack = true;
+          },
+          release: () => {},
+          query: queryHandler,
+        };
+        return {
+          get rolledBack() {
+            return rolledBack;
+          },
+          get committed() {
+            return committed;
+          },
+          query: queryHandler,
+          getConnection: async () => conn,
+        } as any;
+      };
+
+      const setRzpAmountFetch = (expectedOrderId: string, amountPaise: number) => {
+        globalThis.fetch = (async () =>
+          new Response(
+            JSON.stringify({
+              id: "pay_any",
+              order_id: expectedOrderId,
+              status: "captured",
+              amount: amountPaise,
+              currency: "INR",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          )) as typeof fetch;
+      };
+
+      // Case A: subscriber_plans lookup failure -> 503
+      const resPlans = await handleApiRequest(
+        makeProdVerifyReq("ord_p1", "pay_p1", "paid_subscription", { planId: "member-monthly" }),
+        prodEnv,
+        { pool: makeMockPool("FROM subscriber_plans") },
+      );
+      assert.ok(resPlans);
+      assert.equal(resPlans.status, 503);
+      assert.equal((await resPlans.json()).verified, false);
+
+      // Case B: payment_orders ownership query failure -> 503
+      setRzpAmountFetch("ord_p2", 600);
+      const resPo = await handleApiRequest(
+        makeProdVerifyReq("ord_p2", "pay_p2", "premium_video_upload"),
+        prodEnv,
+        { pool: makeMockPool("FROM payment_orders") },
+      );
+      assert.ok(resPo);
+      assert.equal(resPo.status, 503);
+      assert.equal((await resPo.json()).verified, false);
+
+      // Case C: uploaded_videos ownership query failure -> 503
+      setRzpAmountFetch("ord_p3", 600);
+      const resVid = await handleApiRequest(
+        makeProdVerifyReq("ord_p3", "pay_p3", "premium_video_upload", { videoId: "vid_1" }),
+        prodEnv,
+        { pool: makeMockPool("FROM uploaded_videos WHERE id = ?") },
+      );
+      assert.ok(resVid);
+      assert.equal(resVid.status, 503);
+      assert.equal((await resVid.json()).verified, false);
+
+      // Case D: UPDATE payment_orders failure inside paid_subscription tx -> rollback + 503
+      setRzpAmountFetch("ord_p4", 4900);
+      const poolUpdPo = makeMockPool("UPDATE payment_orders");
+      const resUpdPo = await handleApiRequest(
+        makeProdVerifyReq("ord_p4", "pay_p4", "paid_subscription", { planId: "member-monthly" }),
+        prodEnv,
+        { pool: poolUpdPo },
+      );
+      assert.ok(resUpdPo);
+      assert.equal(resUpdPo.status, 503);
+      assert.equal((await resUpdPo.json()).verified, false);
+      assert.equal(poolUpdPo.rolledBack, true);
+      assert.equal(poolUpdPo.committed, false);
+
+      // Case E: INSERT INTO premium_transactions failure inside premium_video_upload tx -> rollback + 503
+      setRzpAmountFetch("ord_p5", 600);
+      const poolInsPt = makeMockPool("INSERT INTO premium_transactions");
+      const resInsPt = await handleApiRequest(
+        makeProdVerifyReq("ord_p5", "pay_p5", "premium_video_upload", { videoId: "vid_1" }),
+        prodEnv,
+        { pool: poolInsPt },
+      );
+      assert.ok(resInsPt);
+      assert.equal(resInsPt.status, 503);
+      assert.equal((await resInsPt.json()).verified, false);
+      assert.equal(poolInsPt.rolledBack, true);
+      assert.equal(poolInsPt.committed, false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});

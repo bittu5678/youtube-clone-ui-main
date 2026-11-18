@@ -473,6 +473,21 @@ export const api = {
       );
     },
 
+    getGlobalPoolSummary: async (excludeUserId?: string) => {
+      const q = excludeUserId ? `?excludeUserId=${encodeURIComponent(excludeUserId)}` : "";
+      return apiFetch<{
+        success: boolean;
+        excludedUserId: string | null;
+        poolAmount: number;
+        poolPaise: number;
+        eligibleVideoCount: number;
+        distinctCreatorCount: number;
+        estimatedEqualSharePerVideo: number;
+        totalAdEarnings: number;
+        weightingMode: "ad_earnings_weighted" | "equal_fallback";
+      }>(`/wallet/global-pool-summary.php${q}`);
+    },
+
     withdraw: async (
       data: {
         userId: string;
