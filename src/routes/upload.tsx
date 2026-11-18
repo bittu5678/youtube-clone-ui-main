@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Logo } from "@/components/videohub/Logo";
+import { OrientedVideo } from "@/components/videohub/OrientedVideo";
 import { ThemeToggle } from "@/components/videohub/ThemeToggle";
 import { BottomNav } from "@/components/videohub/BottomNav";
 import { Footer } from "@/components/videohub/Footer";
@@ -1211,8 +1212,9 @@ export function BulkVideoUploadView({
                       className="h-full w-full object-cover"
                     />
                   ) : (
-                    <video
+                    <OrientedVideo
                       src={item.previewUrl}
+                      containerClassName="relative h-full w-full overflow-hidden"
                       className="h-full w-full object-contain"
                       preload="metadata"
                     />
@@ -1763,11 +1765,12 @@ function FreeVideoUploadView({
 
         {publishedVideo?.videoUrl && (
           <div className="mx-auto max-w-md overflow-hidden rounded-2xl border border-border shadow-card bg-secondary/30 p-2">
-            <video
+            <OrientedVideo
               controls
               playsInline
               preload="metadata"
-              className="aspect-video w-full rounded-xl bg-black object-contain"
+              containerClassName="relative aspect-video w-full overflow-hidden rounded-xl bg-black"
+              className="h-full w-full object-contain"
               src={publishedVideo.videoUrl}
             />
             <div className="p-3 text-left">
@@ -1919,11 +1922,12 @@ function FreeVideoUploadView({
 
           {previewUrl ? (
             <div className="space-y-3">
-              <video
+              <OrientedVideo
                 controls
                 playsInline
                 preload="metadata"
-                className="mx-auto max-h-56 rounded-2xl bg-black object-contain border border-border shadow-sm"
+                containerClassName="relative mx-auto aspect-video max-h-56 w-full max-w-md overflow-hidden rounded-2xl bg-black border border-border shadow-sm"
+                className="h-full w-full object-contain"
                 src={previewUrl}
               />
               <div className="flex items-center justify-center gap-2 text-xs font-bold text-sky-400">
@@ -2363,11 +2367,12 @@ function PremiumVideoUploadView({
 
           {previewUrl ? (
             <div className="space-y-3">
-              <video
+              <OrientedVideo
                 controls
                 playsInline
                 preload="metadata"
-                className="mx-auto max-h-56 rounded-2xl bg-black object-contain border border-border shadow-sm"
+                containerClassName="relative mx-auto aspect-video max-h-56 w-full max-w-md overflow-hidden rounded-2xl bg-black border border-border shadow-sm"
+                className="h-full w-full object-contain"
                 src={previewUrl}
               />
               <div className="flex items-center justify-center gap-2 text-xs font-bold text-amber-400">

@@ -968,7 +968,7 @@ export async function handleAdminRecoverPremiumPayment(
           dryRun: false,
           deploymentBlocker: true,
           error:
-            'Deployment Blocker: Live premium payment recovery writes are disabled because api/payments/verify.php does not yet share the GET_LOCK("facetube_premium_tx_seq") concurrency lock. Run with dryRun=true or deploy the approved shared locking strategy in verify.php before enabling FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true.',
+            'Deployment Blocker: Live premium payment recovery writes are disabled by default. Ensure the shared GET_LOCK("facetube_premium_tx_seq") updates in verify.php/api-handler.ts are deployed and any sequence conflict is reconciled before enabling FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true.',
         },
         423,
       );
@@ -1464,7 +1464,7 @@ export async function handleAdminRecoverPremiumPayment(
           success: false,
           dryRun: true,
           deploymentBlockerNotice:
-            'Live writes remain disabled by default until verify.php shares GET_LOCK("facetube_premium_tx_seq").',
+            'Live writes remain disabled by default unless FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true is enabled with shared GET_LOCK("facetube_premium_tx_seq") protection deployed.',
           error: seqCheck.ok
             ? `Duplicate or partial recovery conflicts detected: ${allConflicts.join("; ")}`
             : seqCheck.error,
@@ -1485,7 +1485,7 @@ export async function handleAdminRecoverPremiumPayment(
           success: true,
           dryRun: true,
           deploymentBlockerNotice:
-            'Live writes remain disabled by default until verify.php shares GET_LOCK("facetube_premium_tx_seq").',
+            'Live writes remain disabled by default unless FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true is enabled with shared GET_LOCK("facetube_premium_tx_seq") protection deployed.',
           message:
             "Dry-run verification and accounting simulation succeeded. Zero database writes were executed.",
           processedCount: results.length,

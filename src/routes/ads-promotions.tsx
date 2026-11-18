@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { VideoHubLayout } from "@/components/videohub/VideoHubLayout";
+import { OrientedVideo } from "@/components/videohub/OrientedVideo";
 import { useAuth } from "@/lib/auth-context";
 import { type UploadedVideo } from "@/lib/video-service";
 import { resolveVideoThumbnail, SVG_FALLBACK_THUMBNAIL } from "@/lib/thumbnail-service";
@@ -585,14 +586,13 @@ function AdsPromotionsPage() {
               {/* Video Player Preview */}
               {videoPreviewUrl && (
                 <div className="rounded-2xl border border-border overflow-hidden bg-black relative shadow-lg">
-                  <div className="aspect-video w-full bg-black">
-                    <video
-                      src={videoPreviewUrl}
-                      controls
-                      className="w-full h-full object-contain"
-                      playsInline
-                    />
-                  </div>
+                  <OrientedVideo
+                    src={videoPreviewUrl}
+                    controls
+                    containerClassName="relative aspect-video w-full overflow-hidden bg-black"
+                    className="h-full w-full object-contain"
+                    playsInline
+                  />
                   <div className="p-3 bg-secondary/50 border-t border-border flex items-center justify-between text-xs">
                     <div className="flex items-center gap-2">
                       <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />

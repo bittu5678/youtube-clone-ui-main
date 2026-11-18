@@ -7,20 +7,16 @@
  * Default mode is dryRun = true (read-only audit & accounting simulation; zero DB writes).
  *
  * ============================================================================
- * DEPLOYMENT BLOCKER — CONCURRENCY AGAINST api/payments/verify.php
+ * DEPLOYMENT BLOCKER — CONCURRENCY & SEQUENCE RECONCILIATION SAFETY GATE
  * ============================================================================
- * This recovery endpoint acquires MySQL session lock GET_LOCK('facetube_premium_tx_seq', 15)
+ * Both api/admin/recover-premium-payment.php and api/payments/verify.php acquire
+ * the shared MySQL advisory lock GET_LOCK('facetube_premium_tx_seq', 15)
  * before allocating tx_number values for premium_video_upload transactions.
- * However, api/payments/verify.php currently does NOT acquire that shared lock
- * (it only runs `SELECT COUNT(*) ... FOR UPDATE` on payment_transactions, which
- * does not prevent concurrent tx_number collisions or out-of-order sequences
- * against an independent recovery session, nor serialize an empty table).
  *
- * Because api/payments/verify.php is frozen in this phase, live recovery writes
- * (dryRun = false) are BLOCKED BY DEFAULT (HTTP 423 Locked) unless an operator
- * explicitly sets FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true in a
- * controlled maintenance window or isolated test environment after a shared
- * locking strategy across verify.php and recovery is approved and deployed.
+ * Live recovery writes (dryRun = false) remain BLOCKED BY DEFAULT (HTTP 423 Locked)
+ * unless an operator explicitly sets FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true
+ * after deploying the locked verify.php in lockstep and reconciling any historical
+ * seeded sequence gap between payment_transactions and premium_transactions.
  * ============================================================================
  */
 
@@ -93,7 +89,7 @@ if (!$dryRun) {
             'success' => false,
             'dryRun' => false,
             'deploymentBlocker' => true,
-            'error' => 'Deployment Blocker: Live premium payment recovery writes are disabled because api/payments/verify.php does not yet share the GET_LOCK("facetube_premium_tx_seq") concurrency lock. Run with dryRun=true or deploy the approved shared locking strategy in verify.php before enabling FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true.',
+            'error' => 'Deployment Blocker: Live premium payment recovery writes are disabled by default. Ensure the shared GET_LOCK("facetube_premium_tx_seq") updates in verify.php are deployed and any sequence conflict is reconciled before enabling FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true.',
         ], 423);
     }
 }
@@ -879,7 +875,7 @@ function resolveNextPremiumTxSequence($pdo, $forUpdate) {
     $ptSeq = $stmtPtSeq ? $stmtPtSeq->fetch(PDO::FETCH_ASSOC) : ['total_tx' => 0, 'distinct_tx' => 0, 'min_tx' => 0, 'max_tx' => 0];
 
     $stmtPremSeq = $pdo->query(
-        "SELECT COUNT(*) AS total_pt_tx, COALESCE(MIN(tx_number), 0) AS min_pt_tx, COALESCE(MAX(tx_number), 0) AS max_pt_tx, COALESCE(SUM(CASE WHEN id LIKE 'ptx-seed-%' OR payment_id LIKE 'pay_seed_hist_%' THEN 1 ELSE 0 END), 0) AS seed_row_count FROM premium_transactions" . $lockSuffix
+        "SELECT COUNT(*) AS total_pt_tx, COALESCE(MIN(tx_number), 0) AS min_pt_tx, COALESCE(MAX(tx_number), 0) AS max_pt_tx, COALESCE(SUM(CASE WHEN id LIKE 'ptx-seed-%' OR payment_id LIKE 'pay\\_seed\\_hist\\_%' THEN 1 ELSE 0 END), 0) AS seed_row_count FROM premium_transactions" . $lockSuffix
     );
     $premSeq = $stmtPremSeq ? $stmtPremSeq->fetch(PDO::FETCH_ASSOC) : ['total_pt_tx' => 0, 'min_pt_tx' => 0, 'max_pt_tx' => 0, 'seed_row_count' => 0];
 
@@ -915,10 +911,10 @@ function resolveNextPremiumTxSequence($pdo, $forUpdate) {
         ];
     }
 
-    if ($maxPtTx > $maxTx) {
+    if ($maxPtTx > $maxTx || ($totalTx === 0 && $totalPtTx > 0)) {
         $seedNotice = $seedRowCount > 0
             ? "including {$seedRowCount} seeded baseline row(s) up to tx_number {$maxPtTx}"
-            : "with max tx_number {$maxPtTx}";
+            : "with max tx_number {$maxPtTx} (count={$totalPtTx})";
         return [
             'ok' => false,
             'status' => 409,
@@ -946,7 +942,7 @@ if ($dryRun) {
                 'dryRun' => true,
                 'manualReviewRequired' => true,
                 'sequenceConflict' => true,
-                'deploymentBlockerNotice' => 'Live writes remain disabled by default until verify.php shares GET_LOCK("facetube_premium_tx_seq").',
+                'deploymentBlockerNotice' => 'Live writes remain disabled by default unless FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true is enabled with shared GET_LOCK("facetube_premium_tx_seq") protection deployed.',
                 'error' => $seqRes['error'],
                 'sequenceDiagnostics' => $seqRes['diagnostics'],
             ], 409);
@@ -1011,7 +1007,7 @@ if ($dryRun) {
             jsonResponse([
                 'success' => false,
                 'dryRun' => true,
-                'deploymentBlockerNotice' => 'Live writes remain disabled by default until verify.php shares GET_LOCK("facetube_premium_tx_seq").',
+                'deploymentBlockerNotice' => 'Live writes remain disabled by default unless FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true is enabled with shared GET_LOCK("facetube_premium_tx_seq") protection deployed.',
                 'error' => 'Duplicate or partial recovery conflicts detected: ' . implode('; ', $allConflicts),
                 'results' => $results,
             ], 409);
@@ -1020,7 +1016,7 @@ if ($dryRun) {
         jsonResponse([
             'success' => true,
             'dryRun' => true,
-            'deploymentBlockerNotice' => 'Live writes remain disabled by default until verify.php shares GET_LOCK("facetube_premium_tx_seq").',
+            'deploymentBlockerNotice' => 'Live writes remain disabled by default unless FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES=true is enabled with shared GET_LOCK("facetube_premium_tx_seq") protection deployed.',
             'message' => 'Dry-run verification and accounting simulation succeeded. Zero database writes were executed.',
             'processedCount' => count($results),
             'results' => $results,

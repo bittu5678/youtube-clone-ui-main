@@ -181,7 +181,51 @@ try {
     // Keep safe false defaults if metadata query fails
 }
 
+$lockName = 'facetube_premium_tx_seq';
+$premiumLockAcquired = false;
+$prelimPurpose = trim($input['purpose'] ?? 'premium_video_upload');
 try {
+    $stmtPoPurpose = $pdo->prepare('SELECT purpose FROM payment_orders WHERE order_id = ? LIMIT 1');
+    $stmtPoPurpose->execute([$orderId]);
+    $poPurposeRow = $stmtPoPurpose->fetch();
+    if ($poPurposeRow && !empty($poPurposeRow['purpose'])) {
+        $prelimPurpose = $poPurposeRow['purpose'];
+    }
+} catch (Exception $ePoPurpose) {
+    // Keep input fallback if payment_orders table is unavailable
+}
+
+if ($prelimPurpose === 'premium_video_upload') {
+    try {
+        $stmtLock = $pdo->prepare('SELECT GET_LOCK(?, 15) AS acquired');
+        $stmtLock->execute([$lockName]);
+        $lockRow = $stmtLock->fetch(PDO::FETCH_ASSOC);
+    } catch (PDOException $eLock) {
+        error_log('[verify.php] GET_LOCK Database Exception: ' . $eLock->getMessage());
+        jsonResponse([
+            'verified' => false,
+            'paymentId' => $paymentId,
+            'orderId' => $orderId,
+            'error' => 'Database error while acquiring premium transaction sequence lock. Please retry shortly.'
+        ], 500);
+    }
+
+    if ((int)($lockRow['acquired'] ?? 0) !== 1) {
+        jsonResponse([
+            'verified' => false,
+            'paymentId' => $paymentId,
+            'orderId' => $orderId,
+            'error' => 'Could not acquire premium transaction sequence lock within timeout. Please retry verification; no payment records were written.'
+        ], 409);
+    }
+    $premiumLockAcquired = true;
+}
+
+$finalPayload = null;
+$finalStatus = 200;
+
+try {
+    do {
     $pdo->beginTransaction();
 
     // 3.1 Lock and inspect pre-checkout server order record
@@ -197,7 +241,9 @@ try {
             $isAdmin = isset($authUser['role']) && strtolower($authUser['role']) === 'admin';
             if (!$isOrderOwner && !$isAdmin) {
                 $pdo->rollBack();
-                jsonResponse(['verified' => false, 'error' => 'Unauthorized: Payment order does not belong to the authenticated user.'], 403);
+                $finalPayload = ['verified' => false, 'error' => 'Unauthorized: Payment order does not belong to the authenticated user.'];
+                $finalStatus = 403;
+                break;
             }
         }
 
@@ -206,7 +252,9 @@ try {
             $isAdmin = $authUser && isset($authUser['role']) && strtolower($authUser['role']) === 'admin';
             if (!$isAdmin) {
                 $pdo->rollBack();
-                jsonResponse(['verified' => false, 'error' => 'Unauthorized: Payment order does not belong to the requested user.'], 403);
+                $finalPayload = ['verified' => false, 'error' => 'Unauthorized: Payment order does not belong to the requested user.'];
+                $finalStatus = 403;
+                break;
             }
         }
 
@@ -249,8 +297,9 @@ try {
             if ($existingSub) {
                 $duplicateResp['subscription'] = $existingSub;
             }
-            jsonResponse($duplicateResp);
-            exit;
+            $finalPayload = $duplicateResp;
+            $finalStatus = 200;
+            break;
         }
 
         // Authoritative parameters locked from server-stored order
@@ -301,10 +350,12 @@ try {
     $expectedSubunits = (int)round($amount * 100);
     if ((int)($pData['amount'] ?? 0) !== $expectedSubunits) {
         $pdo->rollBack();
-        jsonResponse([
+        $finalPayload = [
             'verified' => false,
             'error' => "Payment amount mismatch: expected ₹{$amount}, received " . (($pData['amount'] ?? 0) / 100)
-        ], 400);
+        ];
+        $finalStatus = 400;
+        break;
     }
 
     // 3.2 Lock check for duplicate payment_id in payment_transactions
@@ -352,15 +403,34 @@ try {
         if ($existingSub) {
             $duplicateResp['subscription'] = $existingSub;
         }
-        jsonResponse($duplicateResp);
-        exit;
+        $finalPayload = $duplicateResp;
+        $finalStatus = 200;
+        break;
     }
 
     $createdSubscription = null;
     $isPremiumUpload = ($purpose === 'premium_video_upload');
 
     if ($isPremiumUpload) {
-        // 3.3 Premium Video sequence allocation under row lock (isolating counter to premium uploads only)
+        if (!$premiumLockAcquired) {
+            $stmtLockFallback = $pdo->prepare('SELECT GET_LOCK(?, 15) AS acquired');
+            $stmtLockFallback->execute([$lockName]);
+            $lockRowFallback = $stmtLockFallback->fetch(PDO::FETCH_ASSOC);
+            if ((int)($lockRowFallback['acquired'] ?? 0) !== 1) {
+                $pdo->rollBack();
+                $finalPayload = [
+                    'verified' => false,
+                    'paymentId' => $paymentId,
+                    'orderId' => $orderId,
+                    'error' => 'Could not acquire premium transaction sequence lock within timeout. Please retry verification; no payment records were written.'
+                ];
+                $finalStatus = 409;
+                break;
+            }
+            $premiumLockAcquired = true;
+        }
+
+        // 3.3 Premium Video sequence allocation under advisory + row lock (isolating counter to premium uploads only)
         $stmtCount = $pdo->query("SELECT COUNT(*) as total FROM payment_transactions WHERE purpose = 'premium_video_upload' FOR UPDATE");
         $countRow = $stmtCount->fetch();
         $txNumber = intval($countRow['total'] ?? 0) + 1;
@@ -784,7 +854,7 @@ try {
 
         $pdo->commit();
 
-        jsonResponse([
+        $finalPayload = [
             'verified' => true,
             'paymentId' => $paymentId,
             'orderId' => $orderId,
@@ -807,8 +877,9 @@ try {
                 'expiresAt' => $expiresAt,
                 'durationDays' => $durationDays,
             ],
-        ]);
-        exit;
+        ];
+        $finalStatus = 200;
+        break;
     } else {
         // -------------------------------------------------------------------------
         // ADS PROMOTION (Task 33: 7-Level Referral Commission Distribution)
@@ -1116,7 +1187,7 @@ try {
     // Commit all operations atomically
     $pdo->commit();
 
-    jsonResponse([
+    $finalPayload = [
         'verified' => true,
         'paymentId' => $paymentId,
         'orderId' => $orderId,
@@ -1138,7 +1209,9 @@ try {
             'levelPayouts' => $levelPayouts,
             'missingLevels' => $missingLevels,
         ]
-    ]);
+    ];
+    $finalStatus = 200;
+    } while (false);
 } catch (PDOException $e) {
     if ($pdo->inTransaction()) {
         $pdo->rollBack();
@@ -1189,17 +1262,45 @@ try {
             if ($existingSub) {
                 $duplicateResp['subscription'] = $existingSub;
             }
-            jsonResponse($duplicateResp);
-            exit;
+            $finalPayload = $duplicateResp;
+            $finalStatus = 200;
         }
     }
 
-    // Safe error message without exposing database tables or SQL traces
-    error_log('[verify.php] Database Exception: ' . $e->getMessage());
-    jsonResponse([
+    if ($finalPayload === null) {
+        // Safe error message without exposing database tables or SQL traces
+        error_log('[verify.php] Database Exception: ' . $e->getMessage());
+        $finalPayload = [
+            'verified' => false,
+            'paymentId' => $paymentId,
+            'orderId' => $orderId,
+            'error' => 'Payment processing failed during database recording. Transaction was safely rolled back.'
+        ];
+        $finalStatus = 500;
+    }
+} catch (Throwable $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    error_log('[verify.php] Unexpected Exception: ' . $e->getMessage());
+    $finalPayload = [
         'verified' => false,
         'paymentId' => $paymentId,
         'orderId' => $orderId,
-        'error' => 'Payment processing failed during database recording. Transaction was safely rolled back.'
-    ], 500);
+        'error' => 'Payment processing failed unexpectedly. Transaction was safely rolled back.'
+    ];
+    $finalStatus = 500;
+} finally {
+    if ($premiumLockAcquired) {
+        try {
+            $stmtRel = $pdo->prepare('DO RELEASE_LOCK(?)');
+            $stmtRel->execute([$lockName]);
+        } catch (Throwable $eRel) {
+            // Ignore cleanup failure
+        }
+    }
+}
+
+if ($finalPayload !== null) {
+    jsonResponse($finalPayload, $finalStatus);
 }

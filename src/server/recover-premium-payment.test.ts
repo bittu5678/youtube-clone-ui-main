@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,7 @@ import {
   type RecoveryAuthUser,
   type RecoveryMediaDirs,
 } from "./premium-recovery.ts";
+import { handleApiRequest } from "./api-handler.ts";
 
 interface FakeUserRow {
   id: string;
@@ -134,7 +136,10 @@ class TransactionalFakeMysqlPool {
   public lockHistory: string[] = [];
   public failOnPremiumTxInsertForPaymentId: string | null = null;
   public failOnGetLock = false;
+  public queueConcurrentLockWaiters = false;
+  public onLockAcquiredHook: ((lockName: string) => Promise<void> | void) | null = null;
   private lockHeld = false;
+  private lockWaiters: Array<() => void> = [];
   private nextPtAutoId = 100;
 
   constructor(initial: Partial<FakeDbState> = {}) {
@@ -198,11 +203,24 @@ class TransactionalFakeMysqlPool {
 
     if (sql.startsWith("SELECT GET_LOCK(")) {
       const name = String(params[0] ?? "");
-      this.lockHistory.push(`acquire:${name}`);
-      if (this.failOnGetLock || this.lockHeld) {
+      if (this.failOnGetLock) {
+        this.lockHistory.push(`timeout:${name}`);
         return [[{ acquired: 0 }], []];
       }
+      if (this.lockHeld) {
+        if (!this.queueConcurrentLockWaiters) {
+          this.lockHistory.push(`timeout:${name}`);
+          return [[{ acquired: 0 }], []];
+        }
+        await new Promise<void>((resolve) => {
+          this.lockWaiters.push(resolve);
+        });
+      }
       this.lockHeld = true;
+      this.lockHistory.push(`acquire:${name}`);
+      if (this.onLockAcquiredHook) {
+        await this.onLockAcquiredHook(name);
+      }
       return [[{ acquired: 1 }], []];
     }
 
@@ -210,6 +228,10 @@ class TransactionalFakeMysqlPool {
       const name = String(params[0] ?? "");
       this.lockHistory.push(`release:${name}`);
       this.lockHeld = false;
+      const nextWaiter = this.lockWaiters.shift();
+      if (nextWaiter) {
+        nextWaiter();
+      }
       return [[], []];
     }
 
@@ -299,6 +321,29 @@ class TransactionalFakeMysqlPool {
       return [row ? [{ ...row }] : [], []];
     }
 
+    if (sql.includes("FROM uploaded_videos WHERE id = ? LIMIT 1")) {
+      const vid = String(params[0] ?? "");
+      const row = this.state.uploaded_videos.find((v) => v.id === vid);
+      return [row ? [{ ...row }] : [], []];
+    }
+
+    if (sql.includes("FROM payment_transactions WHERE payment_id = ? FOR UPDATE")) {
+      const pid = String(params[0] ?? "");
+      const row = this.state.payment_transactions.find((t) => t.payment_id === pid);
+      return [row ? [{ ...row }] : [], []];
+    }
+
+    if (
+      sql.includes(
+        "SELECT COUNT(*) as total FROM payment_transactions WHERE purpose = 'premium_video_upload'",
+      )
+    ) {
+      const premRows = this.state.payment_transactions.filter(
+        (t) => t.purpose === "premium_video_upload",
+      );
+      return [[{ total: premRows.length }], []];
+    }
+
     if (
       sql.includes("FROM income_ledger WHERE transaction_id IN (?, ?) OR transaction_id LIKE ?")
     ) {
@@ -314,21 +359,46 @@ class TransactionalFakeMysqlPool {
       return [row ? [{ transaction_id: row.transaction_id }] : [], []];
     }
 
-    if (
-      sql.includes(
-        "SELECT COALESCE(MAX(tx_number), 0) AS max_tx, COUNT(*) AS total_tx FROM payment_transactions",
-      )
-    ) {
+    if (sql.includes("COUNT(*) AS total_tx") && sql.includes("FROM payment_transactions")) {
       const premRows = this.state.payment_transactions.filter(
         (t) => t.purpose === "premium_video_upload",
       );
-      const maxTx = premRows.reduce((m, r) => Math.max(m, r.tx_number), 0);
-      return [[{ max_tx: maxTx, total_tx: premRows.length }], []];
+      const txNums = premRows.map((r) => r.tx_number);
+      const minTx = txNums.length > 0 ? Math.min(...txNums) : 0;
+      const maxTx = txNums.length > 0 ? Math.max(...txNums) : 0;
+      const distinctTx = new Set(txNums).size;
+      return [
+        [
+          {
+            total_tx: premRows.length,
+            min_tx: minTx,
+            max_tx: maxTx,
+            distinct_tx: distinctTx,
+          },
+        ],
+        [],
+      ];
     }
 
-    if (sql.includes("SELECT COALESCE(MAX(tx_number), 0) AS max_pt_tx FROM premium_transactions")) {
-      const maxTx = this.state.premium_transactions.reduce((m, r) => Math.max(m, r.tx_number), 0);
-      return [[{ max_pt_tx: maxTx }], []];
+    if (sql.includes("COUNT(*) AS total_pt_tx") && sql.includes("FROM premium_transactions")) {
+      const premRows = this.state.premium_transactions;
+      const txNums = premRows.map((r) => r.tx_number);
+      const minPtTx = txNums.length > 0 ? Math.min(...txNums) : 0;
+      const maxPtTx = txNums.length > 0 ? Math.max(...txNums) : 0;
+      const seedRows = premRows.filter(
+        (r) => r.id.startsWith("ptx-seed-") || r.payment_id.startsWith("pay_seed_hist_"),
+      ).length;
+      return [
+        [
+          {
+            total_pt_tx: premRows.length,
+            min_pt_tx: minPtTx,
+            max_pt_tx: maxPtTx,
+            seed_rows: seedRows,
+          },
+        ],
+        [],
+      ];
     }
 
     if (
@@ -364,6 +434,11 @@ class TransactionalFakeMysqlPool {
         throw dupErr;
       }
       this.nextPtAutoId += 1;
+      const hasInlinePurpose = sql.includes("'premium_video_upload', ?,");
+      const purpose = hasInlinePurpose
+        ? "premium_video_upload"
+        : String(params[5] ?? "premium_video_upload");
+      const offset = hasInlinePurpose ? 0 : 1;
       this.state.payment_transactions.push({
         id: this.nextPtAutoId,
         order_id: params[0] ? String(params[0]) : null,
@@ -371,14 +446,14 @@ class TransactionalFakeMysqlPool {
         user_id: String(params[2] ?? ""),
         user_name: String(params[3] ?? ""),
         video_id: params[4] ? String(params[4]) : null,
-        purpose: "premium_video_upload",
-        amount: Number(params[5] ?? 6),
-        tx_number: Number(params[6] ?? 0),
-        is_special: Number(params[7] ?? 0),
-        special_tag: String(params[8] ?? "NORMAL_PREMIUM"),
-        referral_commission: Number(params[9] ?? 0),
-        admin_allocation: Number(params[10] ?? 0),
-        global_pool_allocation: Number(params[11] ?? 0),
+        purpose,
+        amount: Number(params[5 + offset] ?? 6),
+        tx_number: Number(params[6 + offset] ?? 0),
+        is_special: Number(params[7 + offset] ?? 0),
+        special_tag: String(params[8 + offset] ?? "NORMAL_PREMIUM"),
+        referral_commission: Number(params[9 + offset] ?? 0),
+        admin_allocation: Number(params[10 + offset] ?? 0),
+        global_pool_allocation: Number(params[11 + offset] ?? 0),
       });
       return [{ affectedRows: 1 }, []];
     }
@@ -552,6 +627,20 @@ class TransactionalFakeMysqlPool {
         created_at: new Date().toISOString(),
       });
       return [{ affectedRows: 1 }, []];
+    }
+
+    if (sql.startsWith("UPDATE uploaded_videos SET payment_status = 'paid'")) {
+      this.writeQueryCount += 1;
+      const paymentId = String(params[0] ?? "");
+      const amount = Number(params[1] ?? 6);
+      const id = String(params[2] ?? "");
+      const row = this.state.uploaded_videos.find((v) => v.id === id);
+      if (row) {
+        row.payment_status = "paid";
+        row.payment_id = paymentId;
+        row.payment_amount = amount;
+      }
+      return [{ affectedRows: row ? 1 : 0 }, []];
     }
 
     if (sql.startsWith("UPDATE payment_orders SET status = 'paid'")) {
@@ -857,10 +946,13 @@ describe("Premium Payment Recovery Endpoint — PHP Structural & Node Functional
     }
   });
 
-  describe("PHP endpoint structural invariants & verify.php freeze", () => {
+  describe("PHP & Node endpoint structural lock and sequence invariants", () => {
     const phpRecoveryPath = path.resolve(process.cwd(), "api/admin/recover-premium-payment.php");
     const phpVerifyPath = path.resolve(process.cwd(), "api/payments/verify.php");
+    const nodeApiHandlerPath = path.resolve(process.cwd(), "src/server/api-handler.ts");
     const phpRecoveryCode = fs.readFileSync(phpRecoveryPath, "utf-8");
+    const phpVerifyCode = fs.readFileSync(phpVerifyPath, "utf-8");
+    const nodeApiHandlerCode = fs.readFileSync(nodeApiHandlerPath, "utf-8");
 
     it("Enforces POST-only, admin-only auth, dryRun=true default, and HTTP 423 deployment blocker", () => {
       assert.ok(fs.existsSync(phpRecoveryPath), "api/admin/recover-premium-payment.php must exist");
@@ -875,6 +967,8 @@ describe("Premium Payment Recovery Endpoint — PHP Structural & Node Functional
       assert.ok(phpRecoveryCode.includes("FACETUBE_ENABLE_PREMIUM_RECOVERY_LIVE_WRITES"));
       assert.ok(phpRecoveryCode.includes("423"));
       assert.ok(phpRecoveryCode.includes("return true;"), "parseDryRunFlag must default to true");
+      assert.ok(phpRecoveryCode.includes("pay\\\\_seed\\\\_hist\\\\_%"));
+      assert.ok(phpRecoveryCode.includes("($totalTx === 0 && $totalPtTx > 0)"));
     });
 
     it("Acquires GET_LOCK('facetube_premium_tx_seq', 15), releases it in finally before jsonResponse, and does NOT swallow premium_transactions failures", () => {
@@ -895,9 +989,24 @@ describe("Premium Payment Recovery Endpoint — PHP Structural & Node Functional
       assert.ok(!phpRecoveryCode.includes("premium_transactions.json"));
     });
 
-    it("Keeps api/payments/verify.php completely free of recovery lock changes (frozen in this phase)", () => {
-      const verifyCode = fs.readFileSync(phpVerifyPath, "utf-8");
-      assert.ok(!verifyCode.includes("facetube_premium_tx_seq"));
+    it("Acquires shared GET_LOCK('facetube_premium_tx_seq', 15) in both api/payments/verify.php and src/server/api-handler.ts and releases it safely in finally", () => {
+      assert.ok(phpVerifyCode.includes("facetube_premium_tx_seq"));
+      assert.ok(phpVerifyCode.includes("GET_LOCK(?, 15)"));
+      assert.ok(phpVerifyCode.includes("DO RELEASE_LOCK(?)"));
+      assert.ok(phpVerifyCode.includes("} finally {"));
+      // Ensure lock is acquired before COUNT(*) sequence calculation and jsonResponse runs after finally
+      const lockIdx = phpVerifyCode.indexOf("SELECT GET_LOCK(?, 15)");
+      const countIdx = phpVerifyCode.indexOf(
+        "SELECT COUNT(*) as total FROM payment_transactions WHERE purpose = 'premium_video_upload' FOR UPDATE",
+      );
+      const finallyIdx = phpVerifyCode.indexOf("} finally {");
+      const finalJsonIdx = phpVerifyCode.lastIndexOf("jsonResponse($finalPayload, $finalStatus)");
+      assert.ok(lockIdx !== -1 && countIdx !== -1 && lockIdx < countIdx);
+      assert.ok(finallyIdx !== -1 && finalJsonIdx !== -1 && finallyIdx < finalJsonIdx);
+
+      assert.ok(nodeApiHandlerCode.includes("facetube_premium_tx_seq"));
+      assert.ok(nodeApiHandlerCode.includes("SELECT GET_LOCK(?, 15) AS acquired"));
+      assert.ok(nodeApiHandlerCode.includes("DO RELEASE_LOCK(?)"));
     });
   });
 
@@ -1500,5 +1609,440 @@ describe("Premium Payment Recovery Endpoint — PHP Structural & Node Functional
     );
     assert.equal(partialRes.status, 409);
     assert.equal(partialPool.state.payment_transactions.length, 0);
+  });
+
+  function buildVerifyRequest(params: {
+    orderId: string;
+    paymentId: string;
+    userId: string;
+    videoId: string;
+    secret: string;
+    purpose?: string;
+  }): Request {
+    const sig = crypto
+      .createHmac("sha256", params.secret)
+      .update(`${params.orderId}|${params.paymentId}`)
+      .digest("hex");
+    return new Request("http://localhost:3000/api/payments/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        orderId: params.orderId,
+        paymentId: params.paymentId,
+        signature: sig,
+        userId: params.userId,
+        userName: "Khushnuma khatoon",
+        videoId: params.videoId,
+        purpose: params.purpose ?? "premium_video_upload",
+        amount: 6,
+      }),
+    });
+  }
+
+  it("Acquires and safely releases shared lock in Node /api/payments/verify across success, duplicate, and failure paths", async () => {
+    const secret = "test_verify_lock_secret";
+    const verifyEnv = {
+      RAZORPAY_KEY_SECRET: secret,
+      RAZORPAY_SKIP_REMOTE_CHECK: "1",
+    };
+    const pool = new TransactionalFakeMysqlPool({
+      users: createBaseUsers("FT483921"),
+      uploaded_videos: [
+        ...createBaseEligibleVideos(),
+        {
+          id: LONG_ITEM.videoId,
+          user_id: "FT308128",
+          creator_name: "Khushnuma khatoon",
+          title: LONG_ITEM.title,
+          description: LONG_ITEM.description,
+          video_url: "https://api.facetube.online/uploads/videos/" + LONG_ITEM.videoFilename,
+          thumbnail_url:
+            "https://api.facetube.online/uploads/images/" + LONG_ITEM.thumbnailFilename,
+          video_type: "premium",
+          content_type: "long",
+          category: LONG_ITEM.category,
+          duration: LONG_ITEM.duration,
+          views: 0,
+          likes: 0,
+          payment_status: "pending",
+          payment_id: null,
+          payment_amount: 0,
+          is_promoted: 0,
+          ad_earnings: 0,
+          is_blocked: 0,
+          created_at: "2026-04-02 00:00:00",
+        },
+      ],
+    });
+
+    // 1. Success path acquires & releases facetube_premium_tx_seq
+    const okRes = await handleApiRequest(
+      buildVerifyRequest({
+        orderId: LONG_ITEM.orderId,
+        paymentId: LONG_ITEM.paymentId,
+        userId: "FT308128",
+        videoId: LONG_ITEM.videoId,
+        secret,
+      }),
+      verifyEnv,
+      { pool: pool as unknown as Pool },
+    );
+    assert.ok(okRes !== null);
+    assert.equal(okRes.status, 200);
+    const okJson = (await okRes.json()) as Record<string, unknown>;
+    assert.equal(okJson["verified"], true);
+    assert.equal(okJson["txNumber"], 1);
+    assert.deepEqual(pool.lockHistory, [
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+    ]);
+
+    // 2. Idempotent duplicate path still releases lock cleanly in finally
+    const dupRes = await handleApiRequest(
+      buildVerifyRequest({
+        orderId: LONG_ITEM.orderId,
+        paymentId: LONG_ITEM.paymentId,
+        userId: "FT308128",
+        videoId: LONG_ITEM.videoId,
+        secret,
+      }),
+      verifyEnv,
+      { pool: pool as unknown as Pool },
+    );
+    assert.ok(dupRes !== null);
+    assert.equal(dupRes.status, 200);
+    const dupJson = (await dupRes.json()) as Record<string, unknown>;
+    assert.equal(dupJson["duplicate"], true);
+    assert.deepEqual(pool.lockHistory, [
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+    ]);
+
+    // 3. Failure path inside transaction still rolls back & releases lock in finally
+    pool.failOnPremiumTxInsertForPaymentId = "pay_fail_mid_tx";
+    const origQuery = pool.getConnection.bind(pool);
+    pool.getConnection = async () => {
+      const conn = await origQuery();
+      const origConnQuery = conn.query.bind(conn);
+      conn.query = (async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("INSERT INTO income_ledger")) {
+          throw new Error("Simulated ledger failure");
+        }
+        return origConnQuery(sql, params);
+      }) as typeof conn.query;
+      return conn;
+    };
+
+    const failRes = await handleApiRequest(
+      buildVerifyRequest({
+        orderId: SHORT_ITEM.orderId,
+        paymentId: SHORT_ITEM.paymentId,
+        userId: "FT308128",
+        videoId: SHORT_ITEM.videoId,
+        secret,
+      }),
+      verifyEnv,
+      { pool: pool as unknown as Pool },
+    );
+    assert.ok(failRes !== null);
+    assert.equal(failRes.status, 500);
+    assert.equal(pool.state.payment_transactions.length, 1);
+    assert.deepEqual(pool.lockHistory.slice(-2), [
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+    ]);
+  });
+
+  it("Fails safely with HTTP 409 and ZERO writes when GET_LOCK times out in recovery or Node payments/verify", async () => {
+    const secret = "test_timeout_secret";
+    const pool = new TransactionalFakeMysqlPool({
+      users: createBaseUsers("FT483921"),
+      uploaded_videos: createBaseEligibleVideos(),
+    });
+    pool.failOnGetLock = true;
+
+    const recoveryRes = await handleAdminRecoverPremiumPayment(
+      buildRequest({ dryRun: false, items: [LONG_ITEM] }),
+      {
+        pool: pool as unknown as Pool,
+        env: makeEnv(true),
+        mediaDirs,
+        fetchImpl: createRazorpayFetchMock(),
+        getAuthUser: async () => ADMIN_USER,
+      },
+    );
+    assert.equal(recoveryRes.status, 409);
+    const recoveryJson = (await recoveryRes.json()) as Record<string, unknown>;
+    assert.equal(recoveryJson["success"], false);
+    assert.equal(pool.beginCount, 0);
+    assert.equal(pool.writeQueryCount, 0);
+    assert.equal(pool.state.payment_transactions.length, 0);
+    assert.equal(pool.state.premium_transactions.length, 0);
+
+    const verifyRes = await handleApiRequest(
+      buildVerifyRequest({
+        orderId: SHORT_ITEM.orderId,
+        paymentId: SHORT_ITEM.paymentId,
+        userId: "FT308128",
+        videoId: SHORT_ITEM.videoId,
+        secret,
+      }),
+      { RAZORPAY_KEY_SECRET: secret, RAZORPAY_SKIP_REMOTE_CHECK: "1" },
+      { pool: pool as unknown as Pool },
+    );
+    assert.ok(verifyRes !== null);
+    assert.equal(verifyRes.status, 409);
+    const verifyJson = (await verifyRes.json()) as Record<string, unknown>;
+    assert.equal(verifyJson["verified"], false);
+    assert.match(String(verifyJson["error"] ?? ""), /timeout|lock/i);
+    assert.equal(pool.beginCount, 0);
+    assert.equal(pool.writeQueryCount, 0);
+    assert.equal(pool.state.payment_transactions.length, 0);
+  });
+
+  it("Protects concurrent /api/payments/verify and recovery requests using shared lock facetube_premium_tx_seq", async () => {
+    const secret = "test_concurrency_secret";
+    const verifyEnv = {
+      RAZORPAY_KEY_SECRET: secret,
+      RAZORPAY_SKIP_REMOTE_CHECK: "1",
+    };
+
+    // Scenario A: Active verification holds lock -> concurrent recovery times out safely with zero collision
+    const poolTimeout = new TransactionalFakeMysqlPool({
+      users: createBaseUsers("FT483921"),
+      uploaded_videos: createBaseEligibleVideos(),
+    });
+    let concurrentRecoveryDuringVerify: Promise<Response> | null = null;
+    let triggeredOnce = false;
+    poolTimeout.onLockAcquiredHook = async () => {
+      if (!triggeredOnce) {
+        triggeredOnce = true;
+        concurrentRecoveryDuringVerify = handleAdminRecoverPremiumPayment(
+          buildRequest({ dryRun: false, items: [SHORT_ITEM] }),
+          {
+            pool: poolTimeout as unknown as Pool,
+            env: makeEnv(true),
+            mediaDirs,
+            fetchImpl: createRazorpayFetchMock(),
+            getAuthUser: async () => ADMIN_USER,
+          },
+        );
+      }
+    };
+
+    const verifyWinnerRes = await handleApiRequest(
+      buildVerifyRequest({
+        orderId: LONG_ITEM.orderId,
+        paymentId: LONG_ITEM.paymentId,
+        userId: "FT308128",
+        videoId: LONG_ITEM.videoId,
+        secret,
+      }),
+      verifyEnv,
+      { pool: poolTimeout as unknown as Pool },
+    );
+    assert.ok(verifyWinnerRes !== null);
+    assert.equal(verifyWinnerRes.status, 200);
+    const pendingConcurrentRecovery =
+      concurrentRecoveryDuringVerify as unknown as Promise<Response> | null;
+    assert.ok(pendingConcurrentRecovery !== null);
+    const concurrentRecoveryRes = await pendingConcurrentRecovery;
+    assert.equal(concurrentRecoveryRes.status, 409);
+    assert.equal(poolTimeout.state.payment_transactions.length, 1);
+    assert.equal(poolTimeout.state.payment_transactions[0]!.payment_id, LONG_ITEM.paymentId);
+    assert.equal(poolTimeout.state.payment_transactions[0]!.tx_number, 1);
+    assert.deepEqual(poolTimeout.lockHistory, [
+      "acquire:facetube_premium_tx_seq",
+      "timeout:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+    ]);
+
+    // Scenario B: Queued serialization between recovery and verify allocates strictly sequential tx_numbers (1 then 2)
+    const poolQueued = new TransactionalFakeMysqlPool({
+      users: createBaseUsers("FT483921"),
+      uploaded_videos: createBaseEligibleVideos(),
+    });
+    poolQueued.queueConcurrentLockWaiters = true;
+
+    const pVerify = handleApiRequest(
+      buildVerifyRequest({
+        orderId: SHORT_ITEM.orderId,
+        paymentId: SHORT_ITEM.paymentId,
+        userId: "FT308128",
+        videoId: SHORT_ITEM.videoId,
+        secret,
+      }),
+      verifyEnv,
+      { pool: poolQueued as unknown as Pool },
+    );
+    const pRecover = handleAdminRecoverPremiumPayment(
+      buildRequest({ dryRun: false, items: [LONG_ITEM] }),
+      {
+        pool: poolQueued as unknown as Pool,
+        env: makeEnv(true),
+        mediaDirs,
+        fetchImpl: createRazorpayFetchMock(),
+        getAuthUser: async () => ADMIN_USER,
+      },
+    );
+
+    const [vRes, rRes] = await Promise.all([pVerify, pRecover]);
+    assert.ok(vRes !== null);
+    assert.equal(vRes.status, 200);
+    assert.equal(rRes.status, 200);
+    assert.equal(poolQueued.state.payment_transactions.length, 2);
+    assert.equal(poolQueued.state.premium_transactions.length, 2);
+    const txNums = poolQueued.state.payment_transactions
+      .map((t) => t.tx_number)
+      .sort((a, b) => a - b);
+    assert.deepEqual(txNums, [1, 2]);
+    assert.deepEqual(poolQueued.lockHistory, [
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+    ]);
+  });
+
+  it("Fails closed with HTTP 409 on seeded premium_transactions conflict (rows 1..10 without payment_transactions) and performs ZERO writes", async () => {
+    const seededPremRows: FakePremiumTxRow[] = Array.from({ length: 10 }, (_, i) => ({
+      id: `ptx-seed-${String(i + 1).padStart(3, "0")}`,
+      tx_number: i + 1,
+      payment_id: `pay_seed_hist_${1001 + i}`,
+      order_id: `order_seed_hist_${1001 + i}`,
+      video_id: `vid_seed_${i + 1}`,
+      user_id: i % 2 === 0 ? "FT900431" : "FT483921",
+      referrer_id: i % 2 === 0 ? "FT483921" : "FT102857",
+      amount: 6,
+      transaction_type: "premium_upload",
+      is_special: 0,
+      special_tag: "NORMAL_PREMIUM",
+      referral_commission: 1,
+      admin_allocation: 1,
+      global_pool_allocation: 3,
+    }));
+
+    // Seeded premium_transactions rows 1..10 with empty payment_transactions
+    const poolSeededOnly = new TransactionalFakeMysqlPool({
+      users: createBaseUsers("FT483921"),
+      uploaded_videos: createBaseEligibleVideos(),
+      premium_transactions: seededPremRows,
+      payment_transactions: [],
+    });
+
+    // Dry-run fails closed with HTTP 409 and zero writes
+    const drySeedRes = await handleAdminRecoverPremiumPayment(
+      buildRequest({ dryRun: true, items: [LONG_ITEM, SHORT_ITEM] }),
+      {
+        pool: poolSeededOnly as unknown as Pool,
+        env: makeEnv(false),
+        mediaDirs,
+        fetchImpl: createRazorpayFetchMock(),
+        getAuthUser: async () => ADMIN_USER,
+      },
+    );
+    assert.equal(drySeedRes.status, 409);
+    const drySeedJson = (await drySeedRes.json()) as Record<string, unknown>;
+    assert.equal(drySeedJson["success"], false);
+    assert.equal(drySeedJson["manualReviewRequired"], true);
+    assert.equal(drySeedJson["sequenceConflict"], true);
+    assert.match(String(drySeedJson["error"] ?? ""), /Refusing to silently jump to tx_number 11/i);
+    const diag = drySeedJson["sequenceDiagnostics"] as Record<string, unknown>;
+    assert.equal(diag["premiumSeedRowsCount"], 10);
+    assert.equal(diag["verifyPhpExpectedNextTx"], 1);
+    assert.equal(poolSeededOnly.writeQueryCount, 0);
+    assert.equal(poolSeededOnly.state.premium_transactions.length, 10);
+
+    // Live mode also fails closed with HTTP 409, zero writes, seeded rows preserved untouched, and lock released
+    const liveSeedRes = await handleAdminRecoverPremiumPayment(
+      buildRequest({ dryRun: false, items: [LONG_ITEM, SHORT_ITEM] }),
+      {
+        pool: poolSeededOnly as unknown as Pool,
+        env: makeEnv(true),
+        mediaDirs,
+        fetchImpl: createRazorpayFetchMock(),
+        getAuthUser: async () => ADMIN_USER,
+      },
+    );
+    assert.equal(liveSeedRes.status, 409);
+    const liveSeedJson = (await liveSeedRes.json()) as Record<string, unknown>;
+    assert.equal(liveSeedJson["success"], false);
+    assert.equal(liveSeedJson["manualReviewRequired"], true);
+    assert.equal(liveSeedJson["sequenceConflict"], true);
+    assert.equal(poolSeededOnly.writeQueryCount, 0);
+    assert.equal(poolSeededOnly.rollbackCount, 1);
+    assert.equal(poolSeededOnly.commitCount, 0);
+    assert.equal(poolSeededOnly.state.payment_transactions.length, 0);
+    assert.equal(poolSeededOnly.state.premium_transactions.length, 10);
+    assert.equal(poolSeededOnly.state.uploaded_videos.length, 2);
+    assert.equal(poolSeededOnly.state.income_ledger.length, 0);
+    assert.equal(poolSeededOnly.state.wallet_balances.length, 0);
+    assert.deepEqual(poolSeededOnly.lockHistory, [
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+    ]);
+
+    // Non-contiguous payment_transactions (e.g., tx_number 1 and 3) also fails closed with ZERO writes
+    const poolNonContig = new TransactionalFakeMysqlPool({
+      users: createBaseUsers("FT483921"),
+      uploaded_videos: createBaseEligibleVideos(),
+      payment_transactions: [
+        {
+          id: 1,
+          order_id: "o_1",
+          payment_id: "p_1",
+          user_id: "FT483921",
+          user_name: "Alex",
+          video_id: "v_1",
+          purpose: "premium_video_upload",
+          amount: 6,
+          tx_number: 1,
+          is_special: 0,
+          special_tag: "NORMAL_PREMIUM",
+          referral_commission: 0,
+          admin_allocation: 3,
+          global_pool_allocation: 3,
+        },
+        {
+          id: 2,
+          order_id: "o_3",
+          payment_id: "p_3",
+          user_id: "FT483921",
+          user_name: "Alex",
+          video_id: "v_3",
+          purpose: "premium_video_upload",
+          amount: 6,
+          tx_number: 3,
+          is_special: 0,
+          special_tag: "NORMAL_PREMIUM",
+          referral_commission: 0,
+          admin_allocation: 3,
+          global_pool_allocation: 3,
+        },
+      ],
+    });
+
+    const nonContigRes = await handleAdminRecoverPremiumPayment(
+      buildRequest({ dryRun: false, items: [LONG_ITEM] }),
+      {
+        pool: poolNonContig as unknown as Pool,
+        env: makeEnv(true),
+        mediaDirs,
+        fetchImpl: createRazorpayFetchMock(),
+        getAuthUser: async () => ADMIN_USER,
+      },
+    );
+    assert.equal(nonContigRes.status, 409);
+    const nonContigJson = (await nonContigRes.json()) as Record<string, unknown>;
+    assert.equal(nonContigJson["sequenceConflict"], true);
+    assert.equal(poolNonContig.writeQueryCount, 0);
+    assert.equal(poolNonContig.state.payment_transactions.length, 2);
+    assert.equal(poolNonContig.state.uploaded_videos.length, 2);
+    assert.deepEqual(poolNonContig.lockHistory, [
+      "acquire:facetube_premium_tx_seq",
+      "release:facetube_premium_tx_seq",
+    ]);
   });
 });

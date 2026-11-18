@@ -4,6 +4,10 @@
  */
 
 import { resolveMediaUrl } from "./media-url";
+import {
+  computeVideoOrientationCorrection,
+  readVideoOrientationFromBlob,
+} from "./video-orientation";
 
 export const CATEGORY_THUMBNAILS: Record<string, string> = {
   Cartoon:
@@ -109,6 +113,7 @@ export async function captureVideoThumbnail(file: File): Promise<string> {
 
   return new Promise((resolve) => {
     try {
+      const orientationPromise = readVideoOrientationFromBlob(file).catch(() => null);
       const video = document.createElement("video");
       const url = URL.createObjectURL(file);
       video.preload = "auto";
@@ -134,17 +139,46 @@ export async function captureVideoThumbnail(file: File): Promise<string> {
         video.currentTime = seekTime;
       };
 
-      video.onseeked = () => {
+      video.onseeked = async () => {
         try {
+          const metadata = await orientationPromise;
+          if (settled) return;
+
+          const rawWidth = video.videoWidth || 640;
+          const rawHeight = video.videoHeight || 360;
+          const correction = computeVideoOrientationCorrection({
+            metadata,
+            videoWidth: rawWidth,
+            videoHeight: rawHeight,
+          });
+          const needsRotate = correction.rotation === 90 || correction.rotation === 270;
+          const displayWidth = needsRotate ? rawHeight : rawWidth;
+          const displayHeight = needsRotate ? rawWidth : rawHeight;
+
           const canvas = document.createElement("canvas");
-          const width = video.videoWidth || 640;
-          const height = video.videoHeight || 360;
           // Target max width 640 for crisp thumbnail without exceeding payload limits
-          canvas.width = Math.min(width, 640);
-          canvas.height = Math.round((canvas.width * (height || 9)) / (width || 16));
+          canvas.width = Math.min(displayWidth, 640);
+          canvas.height = Math.round((canvas.width * (displayHeight || 9)) / (displayWidth || 16));
           const ctx = canvas.getContext("2d");
           if (ctx) {
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            if (needsRotate) {
+              ctx.save();
+              ctx.translate(canvas.width / 2, canvas.height / 2);
+              ctx.rotate((correction.rotation * Math.PI) / 180);
+              if (correction.mirrored) {
+                ctx.scale(-1, 1);
+              }
+              ctx.drawImage(
+                video,
+                -canvas.height / 2,
+                -canvas.width / 2,
+                canvas.height,
+                canvas.width,
+              );
+              ctx.restore();
+            } else {
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            }
             const dataUrl = canvas.toDataURL("image/jpeg", 0.72);
             clearTimeout(timer);
             finish(dataUrl);

@@ -26,6 +26,8 @@ import { BottomNav } from "@/components/videohub/BottomNav";
 import { SHORTS_LIST, type ShortItem } from "@/data/shorts";
 import { useAuth } from "@/lib/auth-context";
 import { fetchUploadedVideos, isShortVideo } from "@/lib/video-service";
+import { resolveMediaUrl } from "@/lib/media-url";
+import { useVideoOrientation } from "@/lib/video-orientation";
 import { api } from "@/lib/api";
 
 export interface ShortsSearch {
@@ -169,6 +171,9 @@ function ShortsPage() {
   const [isZoomInteracting, setIsZoomInteracting] = useState(false);
 
   const cardRef = useRef<HTMLDivElement | null>(null);
+  const activeVideoSrc = resolveMediaUrl(activeShort.videoUrl) || undefined;
+  const { videoStyle: shortVideoStyle, handleLoadedMetadata: handleShortLoadedMetadata } =
+    useVideoOrientation(activeVideoSrc, cardRef, "cover");
   const lastTouchPos = useRef<{ x: number; y: number } | null>(null);
   const pinchStartDist = useRef<number | null>(null);
   const pinchStartScale = useRef<number>(1);
@@ -535,14 +540,16 @@ function ShortsPage() {
                 }}
                 className="h-full w-full relative"
               >
-                {activeShort.videoUrl ? (
+                {activeVideoSrc ? (
                   <video
-                    src={activeShort.videoUrl}
+                    src={activeVideoSrc}
                     poster={activeShort.thumb}
                     autoPlay={isPlaying}
                     muted={isMuted}
                     loop
                     playsInline
+                    onLoadedMetadata={(e) => handleShortLoadedMetadata(e.currentTarget)}
+                    style={shortVideoStyle}
                     className="h-full w-full object-cover pointer-events-none"
                   />
                 ) : (

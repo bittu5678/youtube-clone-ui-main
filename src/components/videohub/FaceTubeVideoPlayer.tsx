@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import { resolveMediaUrl } from "@/lib/media-url";
+import { useVideoOrientation } from "@/lib/video-orientation";
 
 interface FaceTubeVideoPlayerProps {
   src?: string | undefined;
@@ -70,6 +71,11 @@ export function FaceTubeVideoPlayer({
 
   const cleanSrc = resolveMediaUrl(src);
   const cleanPoster = resolveMediaUrl(poster);
+  const { videoStyle, handleLoadedMetadata } = useVideoOrientation(
+    cleanSrc || undefined,
+    containerRef,
+    "contain",
+  );
 
   // Reset states when source URL changes
   useEffect(() => {
@@ -357,6 +363,7 @@ export function FaceTubeVideoPlayer({
           setHasError(false);
         }}
         onLoadedMetadata={(e) => {
+          handleLoadedMetadata(e.currentTarget);
           const d = e.currentTarget.duration;
           if (!isNaN(d) && d > 0) {
             setDuration(d);
@@ -410,6 +417,7 @@ export function FaceTubeVideoPlayer({
           setErrorMessage(msg);
         }}
         className="h-full w-full object-contain bg-black cursor-pointer"
+        style={videoStyle}
         src={cleanSrc}
       >
         <source src={cleanSrc} type={mimeType} />

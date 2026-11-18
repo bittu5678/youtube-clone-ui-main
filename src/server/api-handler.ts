@@ -14,6 +14,7 @@ import {
   ADS_REFERRAL_RATES,
   evaluateAdsDistribution,
   resolveUplineSponsors,
+  
   type AdsUplineSponsor,
   calculateWeightedPoolPayouts,
   executeRazorpayRefund,
@@ -1598,6 +1599,7 @@ export function calculateDownlineLevelsTs(
 export async function handleApiRequest(
   request: Request,
   env?: Record<string, string | undefined>,
+  deps?: { pool?: Pool | null },
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const pathname = url.pathname;
@@ -1762,7 +1764,7 @@ export async function handleApiRequest(
   if (route === "payments/verify" || route === "payment/verify") {
     if (method === "POST") {
       try {
-        const pool = getMysqlPool();
+        const pool = deps?.pool !== undefined ? deps.pool : getMysqlPool();
         const payload = await request.json();
         const orderId = String(payload.orderId || payload.order_id || "").trim();
         const paymentId = String(payload.paymentId || payload.payment_id || "").trim();
@@ -2162,9 +2164,48 @@ export async function handleApiRequest(
 
         // 5. ATOMIC RECORDING & DEDUPLICATION (MySQL or Fallback Store)
         if (pool) {
+          const PREMIUM_TX_SEQ_LOCK_NAME = "facetube_premium_tx_seq";
+          const isPremiumUploadPurpose = purpose === "premium_video_upload";
           const conn = await pool.getConnection();
+          let premiumLockAcquired = false;
+          let inTx = false;
           try {
+            if (isPremiumUploadPurpose) {
+              let acquired = 0;
+              try {
+                const [lockRows]: any = await conn.query("SELECT GET_LOCK(?, 15) AS acquired", [
+                  PREMIUM_TX_SEQ_LOCK_NAME,
+                ]);
+                acquired = Number(lockRows?.[0]?.acquired ?? 0);
+              } catch (_lockErr) {
+                return jsonResponse(
+                  {
+                    verified: false,
+                    paymentId,
+                    orderId,
+                    error:
+                      "Database error while acquiring premium transaction sequence lock. Please retry shortly.",
+                  },
+                  500,
+                );
+              }
+              if (acquired !== 1) {
+                return jsonResponse(
+                  {
+                    verified: false,
+                    paymentId,
+                    orderId,
+                    error:
+                      "Could not acquire premium transaction sequence lock within timeout. Please retry verification; no payment records were written.",
+                  },
+                  409,
+                );
+              }
+              premiumLockAcquired = true;
+            }
+
             await conn.beginTransaction();
+            inTx = true;
 
             // Check duplicate under row lock
             const [existingRows]: any = await conn.query(
@@ -2173,6 +2214,7 @@ export async function handleApiRequest(
             );
             if (existingRows && existingRows.length > 0) {
               await conn.rollback();
+              inTx = false;
               const existingTx = existingRows[0];
               if (existingTx.purpose === "paid_subscription") {
                 let existingSub: any = null;
@@ -2266,6 +2308,7 @@ export async function handleApiRequest(
               }
 
               await conn.commit();
+              inTx = false;
 
               return jsonResponse({
                 verified: true,
@@ -2716,6 +2759,7 @@ export async function handleApiRequest(
             }
 
             await conn.commit();
+            inTx = false;
 
             return jsonResponse({
               verified: true,
@@ -2746,7 +2790,14 @@ export async function handleApiRequest(
               },
             });
           } catch (txErr: any) {
-            await conn.rollback();
+            if (inTx) {
+              try {
+                await conn.rollback();
+              } catch {
+                // Ignore secondary rollback failure
+              }
+              inTx = false;
+            }
             if (txErr.code === "ER_DUP_ENTRY" || String(txErr).includes("uniq_pt_payment_id")) {
               return jsonResponse({
                 verified: true,
@@ -2759,6 +2810,13 @@ export async function handleApiRequest(
             }
             throw txErr;
           } finally {
+            if (premiumLockAcquired) {
+              try {
+                await conn.query("DO RELEASE_LOCK(?)", [PREMIUM_TX_SEQ_LOCK_NAME]);
+              } catch {
+                // Ignore lock release failure during cleanup
+              }
+            }
             conn.release();
           }
         } else {
