@@ -29,7 +29,13 @@ import {
 } from "./api-handler";
 import { isPromotionActive, getVideoBadgeLabels } from "../lib/video-service";
 import { api } from "../lib/api";
-import { processWithdrawal, getUserWallet, saveStoredLedger } from "../lib/ledger-service";
+import {
+  processWithdrawal,
+  getUserWallet,
+  saveStoredLedger,
+  getUserLedger,
+  getGlobalPoolSummary,
+} from "../lib/ledger-service";
 
 beforeEach(() => {
   resetStoreForTests();
@@ -3860,6 +3866,659 @@ describe("Phase 2 Production JSON Fallback Protection & SQL Fail-Closed Tests", 
       assert.equal(poolInsPt.committed, false);
     } finally {
       globalThis.fetch = origFetch;
+    }
+  });
+});
+
+describe("Global Income Pool Phase A: Per-Video Eligibility & Authoritative Server Summary", () => {
+  it("1. Counts 5 eligible videos from 1 distinct creator as eligibleVideoCount=5 and distinctCreatorCount=1 across evaluatePremiumDistribution & verifyServerPayment (including idempotent duplicates)", async () => {
+    resetPersistentPremiumState();
+    const secret = "phase_a_verify_secret_12345";
+    const keyId = "rzp_test_phase_a";
+    const origFetch = globalThis.fetch;
+
+    const eligiblePool = [
+      { userId: "CR_5X", videoId: "vid_1", adEarnings: 0 },
+      { userId: "CR_5X", videoId: "vid_2", adEarnings: 0 },
+      { userId: "CR_5X", videoId: "vid_3", adEarnings: 0 },
+      { userId: "CR_5X", videoId: "vid_4", adEarnings: 0 },
+      { userId: "CR_5X", videoId: "vid_5", adEarnings: 0 },
+      // Uploader's own videos must be strictly excluded
+      { userId: "FT_UP1", videoId: "vid_own_1", adEarnings: 10 },
+    ];
+
+    // 1a. Pure evaluation helper check (1 creator with 5 eligible videos)
+    const eligibleVideosOnly = eligiblePool.slice(0, 5);
+    const evalNormal = evaluatePremiumDistribution(1, "FT_REF1", 5, eligibleVideosOnly);
+    assert.equal(evalNormal.eligibleVideoCount, 5);
+    assert.equal(evalNormal.eligibleMembersCount, 5);
+    assert.equal(evalNormal.distinctCreatorCount, 1);
+    assert.equal(evalNormal.directReferralAmount, 1.0);
+    assert.equal(evalNormal.adminAmount, 1.0);
+    assert.equal(evalNormal.globalPoolAmount, 3.0);
+    assert.equal(evalNormal.weightedPayouts?.length, 5);
+    assert.equal(evalNormal.perMemberShare, 0.6);
+
+    const evalSpecial = evaluatePremiumDistribution(11, "FT_REF1", 5, eligibleVideosOnly);
+    assert.equal(evalSpecial.isSpecial, true);
+    assert.equal(evalSpecial.eligibleVideoCount, 0);
+    assert.equal(evalSpecial.distinctCreatorCount, 0);
+    assert.equal(evalSpecial.globalPoolAmount, 0);
+    assert.equal(evalSpecial.adminAmount, 4.0);
+    assert.equal(evalSpecial.directReferralAmount, 1.0);
+
+    // 1b. verifyServerPayment primary + idempotent duplicate check
+    const orderId = "order_phase_a_5v";
+    const paymentId = "pay_phase_a_5v";
+    const signature = crypto
+      .createHmac("sha256", secret)
+      .update(`${orderId}|${paymentId}`)
+      .digest("hex");
+
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          id: paymentId,
+          order_id: orderId,
+          status: "captured",
+          amount: 600,
+          currency: "INR",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as typeof fetch;
+
+    try {
+      const env = { RAZORPAY_KEY_ID: keyId, RAZORPAY_KEY_SECRET: secret };
+      const first = await verifyServerPayment(
+        {
+          orderId,
+          paymentId,
+          signature,
+          userId: "FT_UP1",
+          userName: "Uploader One",
+          videoId: "vid_new_1",
+          purpose: "premium_video_upload",
+          referrerUserId: "FT_REF1",
+        },
+        eligiblePool,
+        "FT_REF1",
+        env,
+      );
+
+      assert.equal(first.verified, true);
+      assert.equal(first.distribution?.eligibleVideoCount, 5);
+      assert.equal(first.distribution?.eligibleMembersCount, 5);
+      assert.equal(first.distribution?.distinctCreatorCount, 1);
+      assert.equal(first.distribution?.globalPoolAmount, 3.0);
+      assert.equal(first.distribution?.adminAmount, 1.0);
+      assert.equal(first.distribution?.directReferralAmount, 1.0);
+      assert.equal(first.distribution?.creatorPayouts?.length, 5);
+
+      const dup = await verifyServerPayment(
+        {
+          orderId,
+          paymentId,
+          signature,
+          userId: "FT_UP1",
+          userName: "Uploader One",
+          videoId: "vid_new_1",
+          purpose: "premium_video_upload",
+          referrerUserId: "FT_REF1",
+        },
+        eligiblePool,
+        "FT_REF1",
+        env,
+      );
+
+      assert.equal(dup.verified, true);
+      assert.equal(dup.duplicate, true);
+      assert.equal(dup.distribution?.eligibleVideoCount, 5);
+      assert.equal(dup.distribution?.eligibleMembersCount, 5);
+      assert.equal(dup.distribution?.distinctCreatorCount, 1);
+      assert.equal(dup.distribution?.globalPoolAmount, 3.0);
+      assert.equal(dup.distribution?.perMemberShare, 0.6);
+    } finally {
+      globalThis.fetch = origFetch;
+      resetPersistentPremiumState();
+    }
+  });
+
+  it("2. /api/wallet/global-pool-summary & MySQL /api/payments/verify report 5 eligible videos for 1 creator without altering payout amounts", async () => {
+    const secret = "phase_a_mysql_secret_123";
+    const keyId = "rzp_test_phase_a_mysql";
+    const origFetch = globalThis.fetch;
+
+    const orderId = "order_mysql_5v";
+    const paymentId = "pay_mysql_5v";
+    const signature = crypto
+      .createHmac("sha256", secret)
+      .update(`${orderId}|${paymentId}`)
+      .digest("hex");
+
+    const queryHandler = async (sql: string) => {
+      if (sql.includes("FROM sessions")) {
+        return [
+          [
+            {
+              id: "u-up1",
+              user_id: "FT_UP1",
+              name: "Uploader One",
+              mobile: "",
+              email: "up1@facetube.com",
+              role: "user",
+              referral_code: "FT_REF1",
+              created_at: new Date().toISOString(),
+            },
+          ],
+        ];
+      }
+      if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
+      if (sql.includes("RELEASE_LOCK")) return [[{ released: 1 }]];
+      if (sql.includes("COUNT(*) AS eligible_video_count")) {
+        return [[{ eligible_video_count: 5, distinct_creator_count: 1, total_ad_earnings: 0 }]];
+      }
+      if (sql.includes("FROM payment_orders")) {
+        return [[{ order_id: orderId, user_id: "FT_UP1", purpose: "premium_video_upload" }]];
+      }
+      if (sql.includes("FROM uploaded_videos WHERE id = ?")) {
+        return [[]];
+      }
+      if (sql.includes("FROM payment_transactions WHERE payment_id = ?")) {
+        return [[]];
+      }
+      if (sql.includes("FROM users WHERE role = 'admin'")) {
+        return [[{ user_id: "FT102857" }]];
+      }
+      if (sql.includes("SELECT COUNT(*) as total FROM payment_transactions")) {
+        return [[{ total: 0 }]];
+      }
+      if (sql.includes("SELECT id, user_id, referral_code FROM users")) {
+        return [[{ id: "u-up1", user_id: "FT_UP1", referral_code: "FT_REF1" }]];
+      }
+      if (sql.includes("FROM users") && sql.includes("UPPER(referral_code)")) {
+        return [[{ user_id: "FT_REF1" }]];
+      }
+      if (sql.includes("SELECT id AS video_id, user_id")) {
+        return [
+          [
+            { video_id: "vid_1", user_id: "CR_5X", ad_earnings: 0 },
+            { video_id: "vid_2", user_id: "CR_5X", ad_earnings: 0 },
+            { video_id: "vid_3", user_id: "CR_5X", ad_earnings: 0 },
+            { video_id: "vid_4", user_id: "CR_5X", ad_earnings: 0 },
+            { video_id: "vid_5", user_id: "CR_5X", ad_earnings: 0 },
+          ],
+        ];
+      }
+      return [[]];
+    };
+
+    const mockConn = {
+      beginTransaction: async () => {},
+      commit: async () => {},
+      rollback: async () => {},
+      release: () => {},
+      query: queryHandler,
+    };
+    const mockPool = {
+      query: queryHandler,
+      getConnection: async () => mockConn,
+    } as any;
+
+    const env = {
+      APP_ENV: "production",
+      NODE_ENV: "development",
+      RAZORPAY_KEY_ID: keyId,
+      RAZORPAY_KEY_SECRET: secret,
+    };
+
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          id: paymentId,
+          order_id: orderId,
+          status: "captured",
+          amount: 600,
+          currency: "INR",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as typeof fetch;
+
+    try {
+      const summaryRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/global-pool-summary?excludeUserId=FT_UP1", {
+          method: "GET",
+          headers: { Authorization: "Bearer tok_up1" },
+        }),
+        env,
+        { pool: mockPool },
+      );
+      assert.ok(summaryRes);
+      assert.equal(summaryRes.status, 200);
+      const summaryJson = await summaryRes.json();
+      assert.equal(summaryJson.success, true);
+      assert.equal(summaryJson.eligibleVideoCount, 5);
+      assert.equal(summaryJson.distinctCreatorCount, 1);
+      assert.equal(summaryJson.estimatedEqualSharePerVideo, 0.6);
+
+      const verifyRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/payments/verify", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer tok_up1",
+          },
+          body: JSON.stringify({
+            orderId,
+            paymentId,
+            signature,
+            userId: "FT_UP1",
+            userName: "Uploader One",
+            purpose: "premium_video_upload",
+          }),
+        }),
+        env,
+        { pool: mockPool },
+      );
+      assert.ok(verifyRes);
+      assert.equal(verifyRes.status, 200);
+      const verifyJson = await verifyRes.json();
+      assert.equal(verifyJson.verified, true);
+      assert.equal(verifyJson.distribution.eligibleVideoCount, 5);
+      assert.equal(verifyJson.distribution.eligibleMembersCount, 5);
+      assert.equal(verifyJson.distribution.distinctCreatorCount, 1);
+      assert.equal(verifyJson.distribution.globalPoolAmount, 3.0);
+      assert.equal(verifyJson.distribution.adminAmount, 1.0);
+      assert.equal(verifyJson.distribution.directReferralAmount, 1.0);
+      assert.equal(verifyJson.distribution.perMemberShare, 0.6);
+      assert.equal(verifyJson.distribution.creatorPayouts.length, 5);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("3. getGlobalPoolSummary uses server response without localStorage fallback and getUserLedger respects empty server transactions", async () => {
+    const origFetch = globalThis.fetch;
+
+    saveStoredLedger([
+      {
+        id: "stale-local-1",
+        transactionId: "TX_LOCAL_STALE",
+        userId: "FT483921",
+        incomeType: "global_income",
+        amount: 0.6,
+        status: "settled",
+        description: "Stale cache entry",
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+
+    try {
+      // Server returns authoritative 5 videos / 1 creator summary
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/wallet/global-pool-summary")) {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              excludedUserId: "FT483921",
+              poolAmount: 3.0,
+              poolPaise: 300,
+              eligibleVideoCount: 5,
+              distinctCreatorCount: 1,
+              estimatedEqualSharePerVideo: 0.6,
+              totalAdEarnings: 0,
+              weightingMode: "equal_fallback",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify({ success: true, transactions: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as typeof fetch;
+
+      const summary = await getGlobalPoolSummary("FT483921");
+      assert.equal(summary.eligibleVideoCount, 5);
+      assert.equal(summary.distinctCreatorCount, 1);
+      assert.equal(summary.estimatedEqualSharePerVideo, 0.6);
+      assert.equal(summary.isStale, false);
+      assert.equal(summary.error, undefined);
+
+      // Server returning [] must return [] rather than leaking stale localStorage transactions
+      const emptyLedger = await getUserLedger("FT483921");
+      assert.deepEqual(emptyLedger, []);
+
+      // On server failure, getGlobalPoolSummary reports unavailable error and zero counts (never reads localStorage)
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ success: false, error: "Database unavailable" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        })) as typeof fetch;
+
+      const failedSummary = await getGlobalPoolSummary("FT483921");
+      assert.equal(failedSummary.eligibleVideoCount, 0);
+      assert.equal(failedSummary.distinctCreatorCount, 0);
+      assert.equal(failedSummary.estimatedEqualSharePerVideo, 0);
+      assert.equal(failedSummary.isStale, true);
+      assert.ok(failedSummary.error);
+    } finally {
+      globalThis.fetch = origFetch;
+      saveStoredLedger([]);
+    }
+  });
+
+  it("4. Covers the 5 targeted Phase A review fixes (empty creatorEarnings metadata, duplicate snapshot metadata, MySQL duplicate parity, summary auth policy, and non-prod OR filter)", async () => {
+    resetPersistentPremiumState();
+    const secret = "phase_a_fixes_secret_999";
+    const keyId = "rzp_test_phase_a_fixes";
+    const origFetch = globalThis.fetch;
+
+    // A. evaluatePremiumDistribution with explicit creatorEarnings=[] and eligibleCreatorsCount=5
+    const evalEmptyArray = evaluatePremiumDistribution(1, "FT_REF1", 5, []);
+    assert.equal(evalEmptyArray.globalPoolAmount, 3.0);
+    assert.equal(evalEmptyArray.adminAmount, 1.0);
+    assert.equal(evalEmptyArray.directReferralAmount, 1.0);
+    assert.equal(evalEmptyArray.eligibleVideoCount, 5);
+    assert.equal(evalEmptyArray.eligibleMembersCount, 5);
+    assert.equal(evalEmptyArray.distinctCreatorCount, 5);
+    assert.equal(evalEmptyArray.perMemberShare, 0.6);
+
+    // B. verifyServerPayment duplicate preserves snapshot counts even when retry passes []
+    const orderId = "order_snap_1";
+    const paymentId = "pay_snap_1";
+    const sig = crypto.createHmac("sha256", secret).update(`${orderId}|${paymentId}`).digest("hex");
+
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          id: paymentId,
+          order_id: orderId,
+          status: "captured",
+          amount: 600,
+          currency: "INR",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as typeof fetch;
+
+    try {
+      const env = { RAZORPAY_KEY_ID: keyId, RAZORPAY_KEY_SECRET: secret };
+      await verifyServerPayment(
+        {
+          orderId,
+          paymentId,
+          signature: sig,
+          userId: "FT_UP1",
+          purpose: "premium_video_upload",
+          referrerUserId: "FT_REF1",
+        },
+        [
+          { userId: "CR_5X", videoId: "v1", adEarnings: 0 },
+          { userId: "CR_5X", videoId: "v2", adEarnings: 0 },
+          { userId: "CR_5X", videoId: "v3", adEarnings: 0 },
+          { userId: "CR_5X", videoId: "v4", adEarnings: 0 },
+          { userId: "CR_5X", videoId: "v5", adEarnings: 0 },
+        ],
+        "FT_REF1",
+        env,
+      );
+
+      // Duplicate retry without passing eligible pool preserves original 5 videos / 1 creator metadata
+      const dupRetry = await verifyServerPayment(
+        {
+          orderId,
+          paymentId,
+          signature: sig,
+          userId: "FT_UP1",
+          purpose: "premium_video_upload",
+          referrerUserId: "FT_REF1",
+        },
+        [],
+        "FT_REF1",
+        env,
+      );
+      assert.equal(dupRetry.duplicate, true);
+      assert.equal(dupRetry.distribution?.eligibleVideoCount, 5);
+      assert.equal(dupRetry.distribution?.eligibleMembersCount, 5);
+      assert.equal(dupRetry.distribution?.distinctCreatorCount, 1);
+      assert.equal(dupRetry.distribution?.perMemberShare, 0.6);
+
+      // C. global-pool-summary enforces standard wallet session auth (401 unauth, 403 cross-user, 200 self)
+      const mockQuery = async (sql: string) => {
+        if (sql.includes("FROM sessions")) {
+          return [
+            [
+              {
+                id: "u-up1",
+                user_id: "FT_UP1",
+                name: "Uploader One",
+                mobile: "",
+                email: "up1@facetube.com",
+                role: "user",
+                referral_code: "FT_REF1",
+                created_at: new Date().toISOString(),
+              },
+            ],
+          ];
+        }
+        if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
+        if (sql.includes("RELEASE_LOCK")) return [[{ released: 1 }]];
+        if (sql.includes("FROM payment_orders")) {
+          return [[{ order_id: orderId, user_id: "FT_UP1", purpose: "premium_video_upload" }]];
+        }
+        if (sql.includes("FROM uploaded_videos WHERE id = ?")) {
+          return [[]];
+        }
+        if (sql.includes("FROM payment_transactions WHERE payment_id = ? FOR UPDATE")) {
+          return [
+            [
+              {
+                payment_id: paymentId,
+                order_id: orderId,
+                user_id: "FT_UP1",
+                amount: 6,
+                purpose: "premium_video_upload",
+                tx_number: 2,
+                is_special: 0,
+                special_tag: "NORMAL_PREMIUM",
+                referral_commission: 1,
+                admin_allocation: 1,
+                global_pool_allocation: 3,
+              },
+            ],
+          ];
+        }
+        if (sql.includes("FROM income_ledger") && sql.includes("global_income")) {
+          return [
+            [
+              { user_id: "CR_5X", amount: 0.6 },
+              { user_id: "CR_5X", amount: 0.6 },
+              { user_id: "CR_5X", amount: 0.6 },
+              { user_id: "CR_5X", amount: 0.6 },
+              { user_id: "CR_5X", amount: 0.6 },
+            ],
+          ];
+        }
+        if (sql.includes("COUNT(*) AS eligible_video_count")) {
+          return [[{ eligible_video_count: 5, distinct_creator_count: 1, total_ad_earnings: 0 }]];
+        }
+        return [[]];
+      };
+      const mockPool = {
+        query: mockQuery,
+        getConnection: async () => ({
+          beginTransaction: async () => {},
+          commit: async () => {},
+          rollback: async () => {},
+          release: () => {},
+          query: mockQuery,
+        }),
+      } as any;
+      const prodEnv = {
+        APP_ENV: "production",
+        NODE_ENV: "development",
+        RAZORPAY_KEY_ID: keyId,
+        RAZORPAY_KEY_SECRET: secret,
+      };
+
+      const unauthSummary = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/global-pool-summary?excludeUserId=FT_UP1"),
+        prodEnv,
+        { pool: mockPool },
+      );
+      assert.equal(unauthSummary?.status, 401);
+
+      const crossUserSummary = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/global-pool-summary?excludeUserId=FT102857", {
+          headers: { Authorization: "Bearer tok_up1" },
+        }),
+        prodEnv,
+        { pool: mockPool },
+      );
+      assert.equal(crossUserSummary?.status, 403);
+
+      const selfSummary = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/global-pool-summary", {
+          headers: { Authorization: "Bearer tok_up1" },
+        }),
+        prodEnv,
+        { pool: mockPool },
+      );
+      assert.equal(selfSummary?.status, 200);
+      const selfJson = await selfSummary?.json();
+      assert.equal(selfJson.eligibleVideoCount, 5);
+      assert.equal(selfJson.distinctCreatorCount, 1);
+
+      // D. MySQL duplicate verify returns consistent distribution metadata
+      const dupMysqlRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/payments/verify", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer tok_up1",
+          },
+          body: JSON.stringify({
+            orderId,
+            paymentId,
+            signature: sig,
+            userId: "FT_UP1",
+            purpose: "premium_video_upload",
+          }),
+        }),
+        prodEnv,
+        { pool: mockPool },
+      );
+      assert.equal(dupMysqlRes?.status, 200);
+      const dupMysqlJson = await dupMysqlRes?.json();
+      assert.equal(dupMysqlJson.duplicate, true);
+      assert.equal(dupMysqlJson.distribution.eligibleVideoCount, 5);
+      assert.equal(dupMysqlJson.distribution.eligibleMembersCount, 5);
+      assert.equal(dupMysqlJson.distribution.distinctCreatorCount, 1);
+      assert.equal(dupMysqlJson.distribution.perMemberShare, 0.6);
+      assert.equal(dupMysqlJson.distribution.globalPoolAmount, 3);
+
+      // E. Non-production store video eligibility OR filter (video_type === "premium" || payment_status === "paid")
+      const nonProdEnv = {
+        NODE_ENV: "test",
+        RAZORPAY_KEY_ID: keyId,
+        RAZORPAY_KEY_SECRET: secret,
+        RAZORPAY_SKIP_REMOTE_CHECK: "true",
+      };
+      // Consume special tx #11 if sequence was just reset, so baseline & after are normal (#12, #13)
+      const warmOrder = "order_nonprod_warm";
+      const warmPay = "pay_nonprod_warm";
+      const warmSig = crypto
+        .createHmac("sha256", secret)
+        .update(`${warmOrder}|${warmPay}`)
+        .digest("hex");
+      await handleApiRequest(
+        new Request("http://localhost:3000/api/payments/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            orderId: warmOrder,
+            paymentId: warmPay,
+            signature: warmSig,
+            userId: "FT483921",
+            purpose: "premium_video_upload",
+          }),
+        }),
+        nonProdEnv,
+        { pool: null },
+      );
+
+      const baseOrder = "order_nonprod_base";
+      const basePay = "pay_nonprod_base";
+      const baseSig = crypto
+        .createHmac("sha256", secret)
+        .update(`${baseOrder}|${basePay}`)
+        .digest("hex");
+      const baseRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/payments/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            orderId: baseOrder,
+            paymentId: basePay,
+            signature: baseSig,
+            userId: "FT483921",
+            purpose: "premium_video_upload",
+          }),
+        }),
+        nonProdEnv,
+        { pool: null },
+      );
+      assert.equal(baseRes?.status, 200);
+      const baseJson = await baseRes?.json();
+      assert.equal(baseJson.isSpecialTransaction, false);
+      const baselineCount = Number(baseJson?.distribution?.eligibleVideoCount || 0);
+
+      // Add a video matching ONLY payment_status === "paid" (with video_type === "free")
+      const orVidRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/videos/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: `vid-or-filter-${Date.now()}`,
+            userId: "FT_OR_CREATOR",
+            title: "Paid Free-Type Eligibility Check",
+            videoUrl: "/uploads/or-check.mp4",
+            video_type: "free",
+            payment_status: "paid",
+          }),
+        }),
+        nonProdEnv,
+        { pool: null },
+      );
+      assert.equal(orVidRes?.status, 201);
+
+      const afterOrder = "order_nonprod_after";
+      const afterPay = "pay_nonprod_after";
+      const afterSig = crypto
+        .createHmac("sha256", secret)
+        .update(`${afterOrder}|${afterPay}`)
+        .digest("hex");
+      const afterRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/payments/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            orderId: afterOrder,
+            paymentId: afterPay,
+            signature: afterSig,
+            userId: "FT483921",
+            purpose: "premium_video_upload",
+          }),
+        }),
+        nonProdEnv,
+        { pool: null },
+      );
+      assert.equal(afterRes?.status, 200);
+      const afterJson = await afterRes?.json();
+      assert.equal(afterJson.distribution.eligibleVideoCount, baselineCount + 1);
+    } finally {
+      globalThis.fetch = origFetch;
+      resetPersistentPremiumState();
     }
   });
 });

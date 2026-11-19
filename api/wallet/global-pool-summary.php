@@ -20,17 +20,13 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 
 $pdo = getDatabaseConnection();
 
-$excludeUserId = trim(
+$requestedExcludeId = trim(
     $_GET['excludeUserId'] ??
     ($_GET['exclude_user_id'] ?? ($_GET['userId'] ?? ($_GET['user_id'] ?? '')))
 );
 
-if ($excludeUserId === '') {
-    $authUser = getAuthUser($pdo);
-    if ($authUser && !empty($authUser['user_id'])) {
-        $excludeUserId = trim((string)$authUser['user_id']);
-    }
-}
+// Enforce same session authentication policy as all other /api/wallet/* endpoints
+list($authUser, $excludeUserId) = requireAuthUser($pdo, $requestedExcludeId ?: null);
 
 $hasAdEarningsCol = false;
 $hasIsBlockedCol = false;

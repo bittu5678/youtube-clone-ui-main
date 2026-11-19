@@ -400,8 +400,57 @@ try {
             'duplicate' => true,
             'message' => 'Payment already verified and credited previously (idempotent duplicate).'
         ];
-        if ($existingSub) {
-            $duplicateResp['subscription'] = $existingSub;
+        if ($existingTx['purpose'] === 'paid_subscription') {
+            if ($existingSub) {
+                $duplicateResp['subscription'] = $existingSub;
+            }
+        } else {
+            $isDupPremium = ($existingTx['purpose'] === 'premium_video_upload');
+            $isDupSpec = (bool)$existingTx['is_special'];
+            $dupGlobalPoolAmt = floatval($existingTx['global_pool_allocation'] ?? 0);
+            $dupEligibleVideoCount = 0;
+            $dupDistinctCreatorCount = 0;
+            $dupPerMemberShare = 0.0;
+
+            if ($isDupPremium && !$isDupSpec && $dupGlobalPoolAmt > 0) {
+                try {
+                    $stmtDupGlb = $pdo->prepare('
+                        SELECT user_id, amount
+                        FROM income_ledger
+                        WHERE transaction_id LIKE ? AND income_type = "global_income"
+                        ORDER BY created_at ASC, id ASC
+                    ');
+                    $stmtDupGlb->execute(['TX_GLB_' . $existingTx['payment_id'] . '_%']);
+                    $glbRows = $stmtDupGlb->fetchAll(PDO::FETCH_ASSOC);
+                    if (!empty($glbRows)) {
+                        $dupEligibleVideoCount = count($glbRows);
+                        $distinctDupCreators = [];
+                        foreach ($glbRows as $gr) {
+                            $gUid = strtoupper(trim((string)($gr['user_id'] ?? '')));
+                            if ($gUid !== '') {
+                                $distinctDupCreators[$gUid] = true;
+                            }
+                        }
+                        $dupDistinctCreatorCount = count($distinctDupCreators);
+                        $dupPerMemberShare = floatval($glbRows[0]['amount'] ?? 0);
+                    }
+                } catch (Exception $eDupGlb) {
+                    // Preserve idempotent 200 duplicate response
+                }
+            }
+
+            $dupReferralAmt = floatval($existingTx['referral_commission'] ?? 0);
+            $duplicateResp['distribution'] = [
+                'directReferralAmount' => $dupReferralAmt,
+                'referrerId' => $existingTx['user_id'],
+                'adminAmount' => floatval($existingTx['admin_allocation'] ?? 0),
+                'globalPoolAmount' => $dupGlobalPoolAmt,
+                'eligibleMembersCount' => $dupEligibleVideoCount,
+                'eligibleVideoCount' => $dupEligibleVideoCount,
+                'distinctCreatorCount' => $dupDistinctCreatorCount,
+                'perMemberShare' => $dupPerMemberShare,
+                'totalReferralAmount' => $dupReferralAmt,
+            ];
         }
         $finalPayload = $duplicateResp;
         $finalStatus = 200;
@@ -1270,8 +1319,57 @@ try {
                 'duplicate' => true,
                 'message' => 'Concurrent duplicate detected and resolved safely without double crediting.'
             ];
-            if ($existingSub) {
-                $duplicateResp['subscription'] = $existingSub;
+            if ($existingTx['purpose'] === 'paid_subscription') {
+                if ($existingSub) {
+                    $duplicateResp['subscription'] = $existingSub;
+                }
+            } else {
+                $isDupPremium = ($existingTx['purpose'] === 'premium_video_upload');
+                $isDupSpec = (bool)$existingTx['is_special'];
+                $dupGlobalPoolAmt = floatval($existingTx['global_pool_allocation'] ?? 0);
+                $dupEligibleVideoCount = 0;
+                $dupDistinctCreatorCount = 0;
+                $dupPerMemberShare = 0.0;
+
+                if ($isDupPremium && !$isDupSpec && $dupGlobalPoolAmt > 0) {
+                    try {
+                        $stmtDupGlb = $pdo->prepare('
+                            SELECT user_id, amount
+                            FROM income_ledger
+                            WHERE transaction_id LIKE ? AND income_type = "global_income"
+                            ORDER BY created_at ASC, id ASC
+                        ');
+                        $stmtDupGlb->execute(['TX_GLB_' . $existingTx['payment_id'] . '_%']);
+                        $glbRows = $stmtDupGlb->fetchAll(PDO::FETCH_ASSOC);
+                        if (!empty($glbRows)) {
+                            $dupEligibleVideoCount = count($glbRows);
+                            $distinctDupCreators = [];
+                            foreach ($glbRows as $gr) {
+                                $gUid = strtoupper(trim((string)($gr['user_id'] ?? '')));
+                                if ($gUid !== '') {
+                                    $distinctDupCreators[$gUid] = true;
+                                }
+                            }
+                            $dupDistinctCreatorCount = count($distinctDupCreators);
+                            $dupPerMemberShare = floatval($glbRows[0]['amount'] ?? 0);
+                        }
+                    } catch (Exception $eDupGlb) {
+                        // Preserve idempotent 200 duplicate response
+                    }
+                }
+
+                $dupReferralAmt = floatval($existingTx['referral_commission'] ?? 0);
+                $duplicateResp['distribution'] = [
+                    'directReferralAmount' => $dupReferralAmt,
+                    'referrerId' => $existingTx['user_id'],
+                    'adminAmount' => floatval($existingTx['admin_allocation'] ?? 0),
+                    'globalPoolAmount' => $dupGlobalPoolAmt,
+                    'eligibleMembersCount' => $dupEligibleVideoCount,
+                    'eligibleVideoCount' => $dupEligibleVideoCount,
+                    'distinctCreatorCount' => $dupDistinctCreatorCount,
+                    'perMemberShare' => $dupPerMemberShare,
+                    'totalReferralAmount' => $dupReferralAmt,
+                ];
             }
             $finalPayload = $duplicateResp;
             $finalStatus = 200;

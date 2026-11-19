@@ -344,6 +344,8 @@ export function evaluatePremiumDistribution(
   taxAndFees: number;
   totalAmount: number;
   eligibleMembersCount: number;
+  eligibleVideoCount?: number;
+  distinctCreatorCount?: number;
   perMemberShare: number;
   weightedPayouts?: Array<{
     userId: string;
@@ -400,6 +402,20 @@ export function evaluatePremiumDistribution(
     }
   }
 
+  const hasCreatorEarnings = Boolean(creatorEarnings && creatorEarnings.length > 0);
+  const reportedEligibleCount = isSpecial
+    ? 0
+    : hasCreatorEarnings
+      ? creatorEarnings!.length
+      : Math.max(0, eligibleCreatorsCount);
+  const reportedDistinctCreators = isSpecial
+    ? 0
+    : hasCreatorEarnings
+      ? new Set(
+          creatorEarnings!.map((c) => c.userId.trim().toUpperCase()).filter((u) => u.length > 0),
+        ).size
+      : Math.max(0, eligibleCreatorsCount);
+
   const result: {
     txNumber: number;
     isSpecial: boolean;
@@ -410,6 +426,8 @@ export function evaluatePremiumDistribution(
     taxAndFees: number;
     totalAmount: number;
     eligibleMembersCount: number;
+    eligibleVideoCount: number;
+    distinctCreatorCount: number;
     perMemberShare: number;
     weightedPayouts?: Array<{
       userId: string;
@@ -426,11 +444,9 @@ export function evaluatePremiumDistribution(
     globalPoolAmount,
     taxAndFees: PRICING_CONFIG.PREMIUM_VIDEO.TAX_AND_FEES, // ₹1.00
     totalAmount: PRICING_CONFIG.PREMIUM_VIDEO.TOTAL_PRICE, // ₹6.00
-    eligibleMembersCount: isSpecial
-      ? 0
-      : creatorEarnings
-        ? creatorEarnings.length
-        : eligibleCreatorsCount,
+    eligibleMembersCount: reportedEligibleCount,
+    eligibleVideoCount: reportedEligibleCount,
+    distinctCreatorCount: reportedDistinctCreators,
     perMemberShare,
   };
 
@@ -456,6 +472,9 @@ export interface PersistentPremiumTxRecord {
   referralCommission: number;
   adminAllocation: number;
   globalPoolAllocation: number;
+  eligibleVideoCount?: number;
+  distinctCreatorCount?: number;
+  perMemberShare?: number;
   createdAt: string;
 }
 
@@ -1236,6 +1255,39 @@ export async function verifyServerPayment(
     };
   }
 
+  // Helper: normalize eligible videos / creators (per-video granularity, excluding current uploader)
+  const normalizeEligiblePoolItems = () => {
+    const uploaderNorm = req.userId.trim().toUpperCase();
+    const eligibleItems: Array<{ userId: string; videoId?: string; adEarnings: number }> = [];
+    const seenCreatorKeys = new Set<string>();
+    for (const item of eligiblePremiumCreatorIds) {
+      if (typeof item === "string") {
+        const norm = item.trim().toUpperCase();
+        if (norm.length > 0 && norm !== uploaderNorm && !seenCreatorKeys.has(norm)) {
+          seenCreatorKeys.add(norm);
+          eligibleItems.push({ userId: norm, adEarnings: 0 });
+        }
+      } else if (item && typeof item === "object") {
+        const norm = String(item.userId || "")
+          .trim()
+          .toUpperCase();
+        const cleanVideoId = typeof item.videoId === "string" ? item.videoId.trim() : "";
+        const key = cleanVideoId ? `${norm}:${cleanVideoId}` : norm;
+        if (norm.length > 0 && norm !== uploaderNorm && !seenCreatorKeys.has(key)) {
+          seenCreatorKeys.add(key);
+          eligibleItems.push({
+            userId: norm,
+            ...(cleanVideoId ? { videoId: cleanVideoId } : {}),
+            adEarnings: Math.max(0, Number(item.adEarnings) || 0),
+          });
+        }
+      }
+    }
+    const eligibleCount = eligibleItems.length;
+    const distinctCreatorCount = new Set(eligibleItems.map((item) => item.userId)).size;
+    return { eligibleItems, eligibleCount, distinctCreatorCount };
+  };
+
   // Atomic critical section for sequence allocation & duplicate prevention
   return withLock(async () => {
     const state = loadPersistentState(env);
@@ -1274,9 +1326,22 @@ export async function verifyServerPayment(
         existingTx.transactionType === "ads_promotion" ||
         req.purpose === "ads_promotion";
       const isSpec = isAds ? false : existingTx.isSpecial;
-      const eligibleCount = Math.max(1, eligiblePremiumCreatorIds.length);
+      const hasSnapshotCounts = typeof existingTx.eligibleVideoCount === "number";
+      const fallbackPool = hasSnapshotCounts ? null : normalizeEligiblePoolItems();
+      const rawEligibleCount = hasSnapshotCounts
+        ? Math.max(0, existingTx.eligibleVideoCount ?? 0)
+        : fallbackPool!.eligibleCount;
+      const rawDistinctCreators = hasSnapshotCounts
+        ? Math.max(0, existingTx.distinctCreatorCount ?? 0)
+        : fallbackPool!.distinctCreatorCount;
+      const reportedEligibleCount = isSpec || isAds ? 0 : rawEligibleCount;
+      const reportedDistinctCreators = isSpec || isAds ? 0 : rawDistinctCreators;
       const perMemberShare =
-        isSpec || isAds ? 0 : Number((existingTx.globalPoolAllocation / eligibleCount).toFixed(4));
+        reportedEligibleCount === 0
+          ? 0
+          : typeof existingTx.perMemberShare === "number"
+            ? existingTx.perMemberShare
+            : Number((existingTx.globalPoolAllocation / reportedEligibleCount).toFixed(4));
 
       return {
         verified: true,
@@ -1292,8 +1357,9 @@ export async function verifyServerPayment(
           referrerId: existingTx.referrerId,
           adminAmount: existingTx.adminAllocation,
           globalPoolAmount: existingTx.globalPoolAllocation,
-          eligibleMembersCount: isSpec || isAds ? 0 : eligibleCount,
-          eligibleVideoCount: isSpec || isAds ? 0 : eligibleCount,
+          eligibleMembersCount: reportedEligibleCount,
+          eligibleVideoCount: reportedEligibleCount,
+          distinctCreatorCount: reportedDistinctCreators,
           perMemberShare,
           totalReferralAmount: existingTx.referralCommission,
         },
@@ -1324,33 +1390,7 @@ export async function verifyServerPayment(
       const unallocatedReferrerPaise = hasValidReferrer ? 0 : 100;
 
       // Filter eligible previous videos / creators: strictly exclude current uploader and deduplicate
-      const uploaderNorm = req.userId.trim().toUpperCase();
-      const eligibleItems: Array<{ userId: string; videoId?: string; adEarnings: number }> = [];
-      const seenCreatorKeys = new Set<string>();
-      for (const item of eligiblePremiumCreatorIds) {
-        if (typeof item === "string") {
-          const norm = item.trim().toUpperCase();
-          if (norm.length > 0 && norm !== uploaderNorm && !seenCreatorKeys.has(norm)) {
-            seenCreatorKeys.add(norm);
-            eligibleItems.push({ userId: norm, adEarnings: 0 });
-          }
-        } else if (item && typeof item === "object") {
-          const norm = String(item.userId || "")
-            .trim()
-            .toUpperCase();
-          const key = item.videoId ? `${norm}:${item.videoId}` : norm;
-          if (norm.length > 0 && norm !== uploaderNorm && !seenCreatorKeys.has(key)) {
-            seenCreatorKeys.add(key);
-            eligibleItems.push({
-              userId: norm,
-              ...(item.videoId ? { videoId: item.videoId } : {}),
-              adEarnings: Math.max(0, Number(item.adEarnings) || 0),
-            });
-          }
-        }
-      }
-      const eligibleCount = eligibleItems.length;
-      const distinctCreatorCount = new Set(eligibleItems.map((item) => item.userId)).size;
+      const { eligibleItems, eligibleCount, distinctCreatorCount } = normalizeEligiblePoolItems();
 
       let adminAllocation = 0.0;
       let globalPoolAllocation = 0.0;
@@ -1413,6 +1453,9 @@ export async function verifyServerPayment(
         referralCommission,
         adminAllocation,
         globalPoolAllocation,
+        eligibleVideoCount: isSpecial ? 0 : eligibleCount,
+        distinctCreatorCount: isSpecial ? 0 : distinctCreatorCount,
+        perMemberShare,
         createdAt: new Date().toISOString(),
       };
 

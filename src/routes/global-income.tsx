@@ -6,7 +6,8 @@ import { useAuth } from "@/lib/auth-context";
 import {
   getUserLedger,
   getUserWallet,
-  getEligibleGlobalIncomeUsers,
+  getGlobalPoolSummary,
+  type GlobalPoolSummary,
   type LedgerTransaction,
   type UserWallet,
 } from "@/lib/ledger-service";
@@ -26,24 +27,53 @@ export const Route = createFileRoute("/global-income")({
 });
 
 function GlobalIncomePage() {
-  const { profile, dbUser, user } = useAuth();
-  const userId = profile?.user_id || dbUser?.user_id || user?.email?.split("@")[0] || "FT483921";
+  const { profile, dbUser, user, isLoading: authLoading } = useAuth();
+  const userId = (
+    profile?.user_id ||
+    dbUser?.user_id ||
+    user?.user_id ||
+    user?.user_metadata?.user_id ||
+    ""
+  ).trim();
 
   const [wallet, setWallet] = useState<UserWallet | null>(null);
   const [globalTransactions, setGlobalTransactions] = useState<LedgerTransaction[]>([]);
-  const [eligibleCreators, setEligibleCreators] = useState<string[]>([]);
+  const [poolSummary, setPoolSummary] = useState<GlobalPoolSummary | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    Promise.all([
-      getUserWallet(userId),
-      getUserLedger(userId),
-      getEligibleGlobalIncomeUsers(),
-    ]).then(([w, ledger, eligible]) => {
-      setWallet(w);
-      setGlobalTransactions(ledger.filter((t) => t.incomeType === "global_income"));
-      setEligibleCreators(eligible);
-    });
-  }, [userId]);
+    if (authLoading) {
+      setLoading(true);
+      return;
+    }
+
+    if (!userId) {
+      setWallet(null);
+      setGlobalTransactions([]);
+      setPoolSummary(null);
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+    Promise.all([getUserWallet(userId), getUserLedger(userId), getGlobalPoolSummary(userId)])
+      .then(([w, ledger, summary]) => {
+        if (cancelled) return;
+        setWallet(w);
+        setGlobalTransactions(ledger.filter((t) => t.incomeType === "global_income"));
+        setPoolSummary(summary);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, userId]);
 
   return (
     <VideoHubLayout>
@@ -64,8 +94,8 @@ function GlobalIncomePage() {
                 </span>
               </div>
               <p className="text-sm text-muted-foreground">
-                Automated platform revenue share distributed equally among all eligible Premium
-                Video creators
+                Automated platform revenue share distributed per eligible Premium Video from the
+                ₹3.00 Global Pool
               </p>
             </div>
           </div>
@@ -123,31 +153,68 @@ function GlobalIncomePage() {
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Your Global Income</span>
             <p className="text-2xl font-black text-cyan-400">
-              {wallet ? `₹${wallet.globalIncome.toFixed(2)}` : "₹2,450.00"}
+              {loading ? "…" : !userId ? "—" : `₹${(wallet?.globalIncome ?? 0).toFixed(2)}`}
             </p>
             <p className="text-[11px] text-emerald-400 font-semibold flex items-center gap-1">
-              <TrendingUp className="h-3 w-3" /> Eligible creator share
+              <TrendingUp className="h-3 w-3" />{" "}
+              {!loading && !userId
+                ? "Sign in required"
+                : wallet?.isStale
+                  ? "Cached server balance"
+                  : "Eligible video share"}
             </p>
           </div>
 
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
-            <span className="text-xs text-muted-foreground font-medium">Eligible Creators</span>
-            <p className="text-2xl font-black text-foreground">{eligibleCreators.length}</p>
-            <p className="text-[11px] text-muted-foreground">Sponsor uploaders only</p>
+            <span className="text-xs text-muted-foreground font-medium">Eligible Videos</span>
+            <p className="text-2xl font-black text-foreground">
+              {loading
+                ? "…"
+                : poolSummary && !poolSummary.error
+                  ? poolSummary.eligibleVideoCount
+                  : "—"}
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              {!loading && !userId
+                ? "Sign in to view pool"
+                : poolSummary?.error
+                  ? "Server summary unavailable"
+                  : poolSummary
+                    ? `${poolSummary.distinctCreatorCount} creator${poolSummary.distinctCreatorCount === 1 ? "" : "s"} · Sponsor uploads`
+                    : "Sponsor uploads only"}
+            </p>
           </div>
 
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Share Per Video</span>
             <p className="text-2xl font-black text-foreground">
-              ₹{(3.0 / Math.max(1, eligibleCreators.length)).toFixed(2)}
+              {loading
+                ? "…"
+                : poolSummary && !poolSummary.error
+                  ? `₹${poolSummary.estimatedEqualSharePerVideo.toFixed(2)}`
+                  : "—"}
             </p>
-            <p className="text-[11px] text-muted-foreground">Divided equally per video</p>
+            <p className="text-[11px] text-muted-foreground">
+              {!loading && !userId
+                ? "Sign in required"
+                : poolSummary?.error
+                  ? "Live pool data required"
+                  : poolSummary?.weightingMode === "ad_earnings_weighted"
+                    ? "Weighted by Ad Earnings (equal est.)"
+                    : "Equal floor share per video"}
+            </p>
           </div>
 
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Distribution Status</span>
             <p className="text-2xl font-black text-emerald-400">Automated</p>
-            <p className="text-[11px] text-muted-foreground">Server ledger synced</p>
+            <p className="text-[11px] text-muted-foreground">
+              {!loading && !userId
+                ? "Awaiting sign-in"
+                : poolSummary?.error
+                  ? "Awaiting server sync"
+                  : "Server ledger synced"}
+            </p>
           </div>
         </div>
 
@@ -208,8 +275,9 @@ function GlobalIncomePage() {
                 ) : (
                   <tr>
                     <td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">
-                      No global income distributions found for this account. Distributions occur
-                      automatically when users upload Sponsor Videos.
+                      {!loading && !userId
+                        ? "Please sign in to view your Global Income balance, eligible video count, and ledger entries."
+                        : "No global income distributions found for this account. Distributions occur automatically when users upload Sponsor Videos."}
                     </td>
                   </tr>
                 )}

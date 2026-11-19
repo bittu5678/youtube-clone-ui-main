@@ -443,4 +443,158 @@ describe("Task 2: Promotion Success Confirmation & Duplicate Notification Preven
     );
     assert.match(adsPromotionsTsx, /notifiedPromoIdsRef/);
   });
+
+  it("6. initiatePremiumVideoPayment does NOT perform a second client-side Global Pool distribution after server verification", async () => {
+    const origFetch = globalThis.fetch;
+    const origWindow = (globalThis as any).window;
+    const origLocalStorage = (globalThis as any).localStorage;
+    const storage = createMemoryStorage();
+    // Seed existing premium video in localStorage that old client-side code would try to pay out
+    storage.setItem(
+      "facetube_uploaded_videos",
+      JSON.stringify([
+        {
+          id: "vid-existing-other",
+          userId: "CR_OTHER",
+          title: "Existing Video",
+          videoType: "premium",
+          paymentStatus: "paid",
+        },
+      ]),
+    );
+    (globalThis as any).localStorage = storage;
+
+    let capturedOptions: any = null;
+    (globalThis as any).window = {
+      location: { hostname: "localhost" },
+      Razorpay: class MockRazorpay {
+        constructor(opts: any) {
+          capturedOptions = opts;
+        }
+        open() {
+          void capturedOptions.handler({
+            razorpay_payment_id: "pay_no_double_1",
+            razorpay_order_id: "order_no_double_1",
+            razorpay_signature: "sig_no_double_1",
+          });
+        }
+      },
+    };
+
+    const apiCalls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      apiCalls.push(url);
+      if (url.includes("/payments/create-order.php")) {
+        return new Response(
+          JSON.stringify({
+            orderId: "order_no_double_1",
+            amount: 6,
+            amountInSubunits: 600,
+            currency: "INR",
+            keyId: "rzp_test_key",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/payments/verify.php")) {
+        return new Response(
+          JSON.stringify({
+            verified: true,
+            paymentId: "pay_no_double_1",
+            orderId: "order_no_double_1",
+            txNumber: 2,
+            isSpecialTransaction: false,
+            specialTag: "NORMAL_PREMIUM",
+            distribution: {
+              adminAmount: 1,
+              globalPoolAmount: 3,
+              eligibleVideoCount: 1,
+              distinctCreatorCount: 1,
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/videos/create.php")) {
+        return new Response(JSON.stringify({ success: true, video: { id: "vid-no-double" } }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/wallet/balance.php")) {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            wallet: {
+              user_id: "FT483921",
+              balance: 0,
+              total_earned: 0,
+              total_withdrawn: 0,
+              referral_income: 0,
+              global_income: 0,
+              adsense_income: 0,
+              affiliate_income: 0,
+              updated_at: "2026-01-01T00:00:00.000Z",
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/wallet/transactions.php")) {
+        return new Response(JSON.stringify({ success: true, transactions: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      let paymentResult: unknown = null;
+      await new Promise<void>((resolve, reject) => {
+        void initiatePremiumVideoPayment({
+          uploaderUserId: "FT483921",
+          uploaderName: "Test Creator",
+          videoId: "vid-no-double",
+          videoTitle: "No Double Payout Test",
+          videoUrl: "https://cdn.example.com/test.mp4",
+          contentType: "long",
+          onSuccess: (res) => {
+            paymentResult = res;
+            resolve();
+          },
+          onFailure: (err) => reject(new Error(err)),
+        });
+      });
+
+      assert.equal(paymentResult, "pay_no_double_1");
+      assert.equal(
+        apiCalls.some((u) => u.includes("/ledger/distribute")),
+        false,
+      );
+      assert.equal(
+        apiCalls.some((u) => u.includes("/wallet/balance.php")),
+        true,
+      );
+      assert.equal(
+        apiCalls.some((u) => u.includes("/wallet/transactions.php")),
+        true,
+      );
+
+      const localLedger = JSON.parse(storage.getItem("facetube_income_ledger_v3") || "[]");
+      assert.equal(localLedger.length, 0);
+
+      const localWallets = JSON.parse(storage.getItem("facetube_user_wallets_v3") || "{}");
+      assert.equal(localWallets["CR_OTHER"], undefined);
+      assert.equal(localWallets["FT102857"], undefined);
+    } finally {
+      globalThis.fetch = origFetch;
+      (globalThis as any).window = origWindow;
+      (globalThis as any).localStorage = origLocalStorage;
+    }
+  });
 });

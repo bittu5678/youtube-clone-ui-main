@@ -1,5 +1,5 @@
 import { api } from "./api";
-import { distributePremiumVideoIncome, getUserWallet } from "./ledger-service";
+import { getUserLedger, getUserWallet } from "./ledger-service";
 import {
   recordNewVideoUpload,
   markVideoPromoted,
@@ -196,7 +196,7 @@ export async function initiatePremiumVideoPayment(
         }
 
         // 3. Save uploaded video with verified paid status
-        const newVideo = await recordNewVideoUpload({
+        await recordNewVideoUpload({
           id: effectiveVideoId,
           userId: effectiveUserId,
           creatorName: effectiveUserName,
@@ -213,26 +213,11 @@ export async function initiatePremiumVideoPayment(
           paymentAmount: 6,
         });
 
-        // 4. Update local ledger cache if not a duplicate
-        const isDuplicate =
-          "duplicate" in res ? Boolean((res as { duplicate?: boolean })["duplicate"]) : false;
-        if (!isDuplicate) {
-          await distributePremiumVideoIncome({
-            uploaderUserId: effectiveUserId,
-            uploaderName: effectiveUserName,
-            videoId: newVideo.id || effectiveVideoId,
-            paymentId,
-            directReferrerId: params.directReferrerId ?? null,
-            ...(res.txNumber !== undefined && { txNumber: res.txNumber }),
-            ...(res.isSpecialTransaction !== undefined && {
-              isSpecialTransaction: res.isSpecialTransaction,
-            }),
-            ...(res.specialTag !== undefined && { specialTag: res.specialTag }),
-            ...(res.distribution?.adminAmount !== undefined && {
-              adminAmount: res.distribution.adminAmount,
-            }),
-          });
-        }
+        // 4. Refresh authoritative server wallet & ledger state (never run a second client-side distribution)
+        await Promise.all([
+          getUserWallet(effectiveUserId).catch(() => undefined),
+          getUserLedger(effectiveUserId).catch(() => undefined),
+        ]);
 
         params.onSuccess(paymentId);
       } catch (err: any) {

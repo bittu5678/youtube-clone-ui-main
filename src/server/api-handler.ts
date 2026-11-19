@@ -2470,6 +2470,42 @@ export async function handleApiRequest(
                     "Payment already verified and credited previously (idempotent duplicate).",
                 });
               }
+
+              const isDupPremium = existingTx.purpose === "premium_video_upload";
+              const isDupSpec = Boolean(existingTx.is_special);
+              const dupGlobalPoolAmt = Number(existingTx.global_pool_allocation) || 0;
+              let dupEligibleVideoCount = 0;
+              let dupDistinctCreatorCount = 0;
+              let dupPerMemberShare = 0;
+
+              if (isDupPremium && !isDupSpec && dupGlobalPoolAmt > 0) {
+                try {
+                  const [glbRows]: any = await conn.query(
+                    `SELECT user_id, amount
+                     FROM income_ledger
+                     WHERE transaction_id LIKE ? AND income_type = 'global_income'
+                     ORDER BY created_at ASC, id ASC`,
+                    [`TX_GLB_${existingTx.payment_id}_%`],
+                  );
+                  if (Array.isArray(glbRows) && glbRows.length > 0) {
+                    dupEligibleVideoCount = glbRows.length;
+                    dupDistinctCreatorCount = new Set(
+                      glbRows
+                        .map((r: any) =>
+                          String(r.user_id || "")
+                            .trim()
+                            .toUpperCase(),
+                        )
+                        .filter((uid: string) => uid.length > 0),
+                    ).size;
+                    dupPerMemberShare = Number(glbRows[0]?.amount) || 0;
+                  }
+                } catch {
+                  // Preserve idempotent 200 duplicate response if ledger metadata query is unavailable
+                }
+              }
+
+              const dupReferralAmt = Number(existingTx.referral_commission) || 0;
               return jsonResponse({
                 verified: true,
                 paymentId: existingTx.payment_id,
@@ -2477,13 +2513,18 @@ export async function handleApiRequest(
                 amount: Number(existingTx.amount),
                 purpose: existingTx.purpose,
                 txNumber: Number(existingTx.tx_number),
-                isSpecialTransaction: Boolean(existingTx.is_special),
+                isSpecialTransaction: isDupSpec,
                 specialTag: existingTx.special_tag,
                 distribution: {
-                  directReferralAmount: Number(existingTx.referral_commission),
+                  directReferralAmount: dupReferralAmt,
                   referrerId: existingTx.user_id,
-                  adminAmount: Number(existingTx.admin_allocation),
-                  globalPoolAmount: Number(existingTx.global_pool_allocation),
+                  adminAmount: Number(existingTx.admin_allocation) || 0,
+                  globalPoolAmount: dupGlobalPoolAmt,
+                  eligibleMembersCount: dupEligibleVideoCount,
+                  eligibleVideoCount: dupEligibleVideoCount,
+                  distinctCreatorCount: dupDistinctCreatorCount,
+                  perMemberShare: dupPerMemberShare,
+                  totalReferralAmount: dupReferralAmt,
                 },
                 duplicate: true,
                 message: "Payment already verified and credited previously (idempotent duplicate).",
@@ -3023,6 +3064,92 @@ export async function handleApiRequest(
               inTx = false;
             }
             if (txErr.code === "ER_DUP_ENTRY" || String(txErr).includes("uniq_pt_payment_id")) {
+              try {
+                const [existingRaceRows]: any = await conn.query(
+                  `SELECT * FROM payment_transactions WHERE payment_id = ? LIMIT 1`,
+                  [paymentId],
+                );
+                const existingTx = existingRaceRows?.[0];
+                if (existingTx) {
+                  if (existingTx.purpose === "paid_subscription") {
+                    return jsonResponse({
+                      verified: true,
+                      paymentId: existingTx.payment_id,
+                      orderId: existingTx.order_id,
+                      amount: Number(existingTx.amount),
+                      purpose: "paid_subscription",
+                      txNumber: 0,
+                      isSpecialTransaction: false,
+                      specialTag: "PAID_SUBSCRIPTION",
+                      duplicate: true,
+                      message:
+                        "Payment already verified and credited previously (idempotent duplicate).",
+                    });
+                  }
+
+                  const isDupPremium = existingTx.purpose === "premium_video_upload";
+                  const isDupSpec = Boolean(existingTx.is_special);
+                  const dupGlobalPoolAmt = Number(existingTx.global_pool_allocation) || 0;
+                  let dupEligibleVideoCount = 0;
+                  let dupDistinctCreatorCount = 0;
+                  let dupPerMemberShare = 0;
+
+                  if (isDupPremium && !isDupSpec && dupGlobalPoolAmt > 0) {
+                    try {
+                      const [glbRows]: any = await conn.query(
+                        `SELECT user_id, amount
+                         FROM income_ledger
+                         WHERE transaction_id LIKE ? AND income_type = 'global_income'
+                         ORDER BY created_at ASC, id ASC`,
+                        [`TX_GLB_${existingTx.payment_id}_%`],
+                      );
+                      if (Array.isArray(glbRows) && glbRows.length > 0) {
+                        dupEligibleVideoCount = glbRows.length;
+                        dupDistinctCreatorCount = new Set(
+                          glbRows
+                            .map((r: any) =>
+                              String(r.user_id || "")
+                                .trim()
+                                .toUpperCase(),
+                            )
+                            .filter((uid: string) => uid.length > 0),
+                        ).size;
+                        dupPerMemberShare = Number(glbRows[0]?.amount) || 0;
+                      }
+                    } catch {
+                      // Preserve idempotent duplicate response
+                    }
+                  }
+
+                  const dupReferralAmt = Number(existingTx.referral_commission) || 0;
+                  return jsonResponse({
+                    verified: true,
+                    paymentId: existingTx.payment_id,
+                    orderId: existingTx.order_id,
+                    amount: Number(existingTx.amount),
+                    purpose: existingTx.purpose,
+                    txNumber: Number(existingTx.tx_number),
+                    isSpecialTransaction: isDupSpec,
+                    specialTag: existingTx.special_tag,
+                    distribution: {
+                      directReferralAmount: dupReferralAmt,
+                      referrerId: existingTx.user_id,
+                      adminAmount: Number(existingTx.admin_allocation) || 0,
+                      globalPoolAmount: dupGlobalPoolAmt,
+                      eligibleMembersCount: dupEligibleVideoCount,
+                      eligibleVideoCount: dupEligibleVideoCount,
+                      distinctCreatorCount: dupDistinctCreatorCount,
+                      perMemberShare: dupPerMemberShare,
+                      totalReferralAmount: dupReferralAmt,
+                    },
+                    duplicate: true,
+                    message:
+                      "Payment already verified and credited previously (idempotent duplicate).",
+                  });
+                }
+              } catch {
+                // Fall back to minimal duplicate response if lookup fails
+              }
               return jsonResponse({
                 verified: true,
                 paymentId,
@@ -3083,8 +3210,7 @@ export async function handleApiRequest(
           const storeEligibleVideos = (store.videos || [])
             .filter(
               (v) =>
-                v.video_type === "premium" &&
-                v.payment_status === "paid" &&
+                (v.video_type === "premium" || v.payment_status === "paid") &&
                 v.user_id.toUpperCase() !== uploaderId &&
                 !v.is_blocked,
             )
@@ -6104,7 +6230,29 @@ export async function handleApiRequest(
 
   if (route === "wallet/global-pool-summary") {
     if (method === "GET") {
+      const qExcludeUserId = (
+        url.searchParams.get("excludeUserId") ||
+        url.searchParams.get("exclude_user_id") ||
+        url.searchParams.get("userId") ||
+        url.searchParams.get("user_id") ||
+        ""
+      ).trim();
+
       const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+        request,
+        store,
+        pool,
+        env,
+      );
+      if (earlyResponse) {
+        return earlyResponse;
+      }
+      const auth = requireAuth(authUser, qExcludeUserId || null);
+      if (!auth.success) {
+        return auth.response;
+      }
+
       if (isProd && !pool) {
         return jsonResponse(
           {
@@ -6116,22 +6264,7 @@ export async function handleApiRequest(
         );
       }
 
-      let excludeUserId = (
-        url.searchParams.get("excludeUserId") ||
-        url.searchParams.get("exclude_user_id") ||
-        url.searchParams.get("userId") ||
-        url.searchParams.get("user_id") ||
-        ""
-      ).trim();
-
-      if (!excludeUserId) {
-        const authUser = await getAuthUserFromRequest(request, store, pool, env);
-        if (authUser?.user_id) {
-          excludeUserId = authUser.user_id.trim();
-        }
-      }
-
-      const normExclude = excludeUserId ? excludeUserId.toUpperCase() : "";
+      const normExclude = auth.effectiveUserId.trim().toUpperCase();
       const poolPaise = 300;
 
       if (pool) {
@@ -6190,12 +6323,19 @@ export async function handleApiRequest(
         (v) =>
           (v.video_type === "premium" || v.payment_status === "paid") &&
           !v.is_blocked &&
-          (!normExclude || String(v.user_id || "").trim().toUpperCase() !== normExclude),
+          (!normExclude ||
+            String(v.user_id || "")
+              .trim()
+              .toUpperCase() !== normExclude),
       );
       const eligibleVideoCount = eligibleVideos.length;
       const distinctCreatorCount = new Set(
         eligibleVideos
-          .map((v) => String(v.user_id || "").trim().toUpperCase())
+          .map((v) =>
+            String(v.user_id || "")
+              .trim()
+              .toUpperCase(),
+          )
           .filter((uid) => uid.length > 0),
       ).size;
       const totalAdEarnings =
