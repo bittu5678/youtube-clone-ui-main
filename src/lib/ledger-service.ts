@@ -235,36 +235,117 @@ export async function getUserLedger(userId?: string): Promise<LedgerTransaction[
 }
 
 export interface GlobalPoolSummary {
+  userId?: string | null;
   excludedUserId: string | null;
   poolAmount: number;
   poolPaise: number;
   eligibleVideoCount: number;
+  platformEligibleVideoCount?: number;
   distinctCreatorCount: number;
-  estimatedEqualSharePerVideo: number;
+  platformDistinctCreatorCount?: number;
+  estimatedEqualSharePerVideo: number | null;
   totalAdEarnings: number;
+  platformTotalAdEarnings?: number;
+  userEligibleVideoCount?: number | null;
+  userTotalAdEarnings?: number | null;
   weightingMode: "ad_earnings_weighted" | "equal_fallback";
   isStale?: boolean | undefined;
   error?: string | undefined;
 }
 
 /**
+ * Canonical ₹6.00 Sponsor Video allocation rules matching backend verification logic.
+ */
+export const SPONSOR_ALLOCATION_RULES = {
+  totalAmount: 6.0,
+  gstAndPgAmount: 1.0,
+  normalWithReferrer: {
+    directReferral: 1.0,
+    admin: 1.0,
+    gstAndPg: 1.0,
+    globalPool: 3.0,
+    total: 6.0,
+  },
+  normalWithoutReferrer: {
+    directReferral: 0.0,
+    admin: 2.0,
+    gstAndPg: 1.0,
+    globalPool: 3.0,
+    total: 6.0,
+  },
+  specialTransactions: {
+    sequencePattern: "#11, #21, #31...",
+    globalPool: 0.0,
+    gstAndPg: 1.0,
+    withReferrer: {
+      directReferral: 1.0,
+      admin: 4.0,
+      gstAndPg: 1.0,
+      globalPool: 0.0,
+      total: 6.0,
+    },
+    withoutReferrer: {
+      directReferral: 0.0,
+      admin: 5.0,
+      gstAndPg: 1.0,
+      globalPool: 0.0,
+      total: 6.0,
+    },
+  },
+} as const;
+
+/**
  * Fetches the authoritative Global Income Pool summary from the backend server.
  * Does NOT compute or fall back to localStorage video eligibility calculations.
  */
-export async function getGlobalPoolSummary(excludeUserId?: string): Promise<GlobalPoolSummary> {
-  const normExclude = excludeUserId?.trim().toUpperCase() || undefined;
+export async function getGlobalPoolSummary(userId?: string): Promise<GlobalPoolSummary> {
+  const normUserId = userId?.trim().toUpperCase() || undefined;
   try {
-    const res = await api.wallet.getGlobalPoolSummary(normExclude);
+    const res = await api.wallet.getGlobalPoolSummary(normUserId);
     if (res && res.success) {
+      const platformEligibleVideoCount = Math.max(
+        0,
+        Number(res.platformEligibleVideoCount ?? res.eligibleVideoCount) || 0,
+      );
+      const platformDistinctCreatorCount = Math.max(
+        0,
+        Number(res.platformDistinctCreatorCount ?? res.distinctCreatorCount) || 0,
+      );
+      const platformTotalAdEarnings = Math.max(
+        0,
+        Number(res.platformTotalAdEarnings ?? res.totalAdEarnings) || 0,
+      );
+      const weightingMode = res.weightingMode || "equal_fallback";
+      const estimatedEqualSharePerVideo =
+        weightingMode === "ad_earnings_weighted" ||
+        res.estimatedEqualSharePerVideo === null ||
+        res.estimatedEqualSharePerVideo === undefined
+          ? null
+          : Math.max(0, Number(res.estimatedEqualSharePerVideo) || 0);
+      const userEligibleVideoCount =
+        res.userEligibleVideoCount !== undefined && res.userEligibleVideoCount !== null
+          ? Math.max(0, Number(res.userEligibleVideoCount) || 0)
+          : null;
+      const userTotalAdEarnings =
+        res.userTotalAdEarnings !== undefined && res.userTotalAdEarnings !== null
+          ? Math.max(0, Number(res.userTotalAdEarnings) || 0)
+          : null;
+
       return {
-        excludedUserId: res.excludedUserId ?? normExclude ?? null,
+        userId: res.userId ?? normUserId ?? null,
+        excludedUserId: res.excludedUserId ?? null,
         poolAmount: Number(res.poolAmount ?? 3.0),
         poolPaise: Number(res.poolPaise ?? 300),
-        eligibleVideoCount: Math.max(0, Number(res.eligibleVideoCount) || 0),
-        distinctCreatorCount: Math.max(0, Number(res.distinctCreatorCount) || 0),
-        estimatedEqualSharePerVideo: Math.max(0, Number(res.estimatedEqualSharePerVideo) || 0),
-        totalAdEarnings: Math.max(0, Number(res.totalAdEarnings) || 0),
-        weightingMode: res.weightingMode || "equal_fallback",
+        eligibleVideoCount: platformEligibleVideoCount,
+        platformEligibleVideoCount,
+        distinctCreatorCount: platformDistinctCreatorCount,
+        platformDistinctCreatorCount,
+        estimatedEqualSharePerVideo,
+        totalAdEarnings: platformTotalAdEarnings,
+        platformTotalAdEarnings,
+        userEligibleVideoCount,
+        userTotalAdEarnings,
+        weightingMode,
         isStale: false,
       };
     }
@@ -274,13 +355,19 @@ export async function getGlobalPoolSummary(excludeUserId?: string): Promise<Glob
       err instanceof Error ? err.message : "Failed to fetch global pool summary from server.";
     console.warn("getGlobalPoolSummary: failed to fetch live pool summary from server:", err);
     return {
-      excludedUserId: normExclude ?? null,
+      userId: normUserId ?? null,
+      excludedUserId: null,
       poolAmount: 3.0,
       poolPaise: 300,
       eligibleVideoCount: 0,
+      platformEligibleVideoCount: 0,
       distinctCreatorCount: 0,
+      platformDistinctCreatorCount: 0,
       estimatedEqualSharePerVideo: 0,
       totalAdEarnings: 0,
+      platformTotalAdEarnings: 0,
+      userEligibleVideoCount: null,
+      userTotalAdEarnings: null,
       weightingMode: "equal_fallback",
       isStale: true,
       error: msg,
@@ -394,8 +481,16 @@ export interface GlobalIncomeDisplayState {
   globalIncomeCaption: string;
   eligibleVideosValue: string | number;
   eligibleVideosCaption: string;
+  platformCreatorsValue: string | number;
+  platformAdEarningsValue: string;
+  userEligibleVideosValue: string | number;
+  userEligibleVideosCaption: string;
+  userAdEarningsValue: string;
+  userAdEarningsCaption: string;
   sharePerVideoValue: string;
   sharePerVideoCaption: string;
+  weightingModeLabel: string;
+  weightingModeDescription: string;
   distributionStatusCaption: string;
   ledgerHeaderSubtitle: string;
   visibleTransactions: LedgerTransaction[];
@@ -433,6 +528,25 @@ export function deriveGlobalIncomeDisplayState(params: {
     hasUser && !loading && (!walletAvailable || !poolAvailable || !ledgerAvailable),
   );
 
+  const platformEligibleVideos =
+    poolAvailable && poolSummary
+      ? Math.max(
+          0,
+          Number(poolSummary.platformEligibleVideoCount ?? poolSummary.eligibleVideoCount) || 0,
+        )
+      : 0;
+  const platformDistinctCreators =
+    poolAvailable && poolSummary
+      ? Math.max(
+          0,
+          Number(poolSummary.platformDistinctCreatorCount ?? poolSummary.distinctCreatorCount) || 0,
+        )
+      : 0;
+  const platformAdEarnings =
+    poolAvailable && poolSummary
+      ? Math.max(0, Number(poolSummary.platformTotalAdEarnings ?? poolSummary.totalAdEarnings) || 0)
+      : 0;
+
   const globalIncomeValue = loading
     ? "…"
     : walletAvailable && wallet
@@ -449,7 +563,7 @@ export function deriveGlobalIncomeDisplayState(params: {
   const eligibleVideosValue = loading
     ? "…"
     : poolAvailable && poolSummary
-      ? poolSummary.eligibleVideoCount
+      ? platformEligibleVideos
       : "—";
 
   const eligibleVideosCaption =
@@ -458,23 +572,107 @@ export function deriveGlobalIncomeDisplayState(params: {
       : !loading && !poolAvailable
         ? "Server summary unavailable"
         : poolSummary
-          ? `${poolSummary.distinctCreatorCount} creator${poolSummary.distinctCreatorCount === 1 ? "" : "s"} · Sponsor uploads`
+          ? `${platformDistinctCreators} creator${platformDistinctCreators === 1 ? "" : "s"} · Sponsor uploads`
           : "Sponsor uploads only";
+
+  const platformCreatorsValue = loading
+    ? "…"
+    : poolAvailable && poolSummary
+      ? platformDistinctCreators
+      : "—";
+
+  const platformAdEarningsValue = loading
+    ? "…"
+    : poolAvailable && poolSummary
+      ? `₹${platformAdEarnings.toFixed(2)}`
+      : "—";
+
+  const hasUserVideoCount =
+    poolAvailable &&
+    poolSummary &&
+    typeof poolSummary.userEligibleVideoCount === "number" &&
+    Number.isFinite(poolSummary.userEligibleVideoCount);
+
+  const userEligibleVideosValue = loading
+    ? "…"
+    : hasUserVideoCount
+      ? Math.max(0, Number(poolSummary!.userEligibleVideoCount))
+      : "—";
+
+  const userEligibleVideosCaption =
+    !loading && !hasUser
+      ? "Sign in required"
+      : !loading && !poolAvailable
+        ? "Server summary unavailable"
+        : !loading && !hasUserVideoCount
+          ? "User video count unavailable"
+          : Number(poolSummary?.userEligibleVideoCount) === 0
+            ? "No eligible Sponsor videos yet"
+            : "Your Sponsor videos in pool";
+
+  const hasUserAdEarnings =
+    poolAvailable &&
+    poolSummary &&
+    typeof poolSummary.userTotalAdEarnings === "number" &&
+    Number.isFinite(poolSummary.userTotalAdEarnings);
+
+  const userAdEarningsValue = loading
+    ? "…"
+    : hasUserAdEarnings
+      ? `₹${Math.max(0, Number(poolSummary!.userTotalAdEarnings)).toFixed(2)}`
+      : "—";
+
+  const userAdEarningsCaption =
+    !loading && !hasUser
+      ? "Sign in required"
+      : !loading && !poolAvailable
+        ? "Server summary unavailable"
+        : !loading && !hasUserAdEarnings
+          ? "User ad earnings unavailable"
+          : "Your eligible Sponsor ad earnings";
+
+  const isWeightedMode = poolAvailable && poolSummary?.weightingMode === "ad_earnings_weighted";
 
   const sharePerVideoValue = loading
     ? "…"
-    : poolAvailable && poolSummary
-      ? `₹${poolSummary.estimatedEqualSharePerVideo.toFixed(2)}`
-      : "—";
+    : !poolAvailable || !poolSummary
+      ? "—"
+      : isWeightedMode
+        ? "Ad-Weighted"
+        : poolSummary.estimatedEqualSharePerVideo !== null &&
+            poolSummary.estimatedEqualSharePerVideo !== undefined &&
+            Number.isFinite(poolSummary.estimatedEqualSharePerVideo)
+          ? `₹${Number(poolSummary.estimatedEqualSharePerVideo).toFixed(2)}`
+          : "—";
 
   const sharePerVideoCaption =
     !loading && !hasUser
       ? "Sign in required"
       : !loading && !poolAvailable
         ? "Live pool data required"
-        : poolSummary?.weightingMode === "ad_earnings_weighted"
-          ? "Weighted by Ad Earnings (equal est.)"
-          : "Equal floor share per video";
+        : isWeightedMode
+          ? "Weighted by eligible video ad earnings"
+          : "Equal allocation (total ad earnings are ₹0.00)";
+
+  const weightingModeLabel = loading
+    ? "…"
+    : !hasUser
+      ? "Sign in required"
+      : !poolAvailable || !poolSummary
+        ? "Unavailable"
+        : isWeightedMode
+          ? "Ad Earnings Weighted"
+          : "Equal Fallback (₹0 Ad Earnings)";
+
+  const weightingModeDescription = loading
+    ? "Loading live weighting mode from server…"
+    : !hasUser
+      ? "Sign in to view the active Global Pool allocation weighting mode."
+      : !poolAvailable || !poolSummary
+        ? "Server summary unavailable. Live pool data is required to confirm weighting mode."
+        : isWeightedMode
+          ? "Allocation is weighted proportionally using eligible Sponsor video ad earnings (no equal per-video split is applied)."
+          : "Equal per-video allocation is currently used because total eligible Sponsor video ad earnings are ₹0.00.";
 
   const distributionStatusCaption =
     !loading && !hasUser
@@ -505,8 +703,16 @@ export function deriveGlobalIncomeDisplayState(params: {
     globalIncomeCaption,
     eligibleVideosValue,
     eligibleVideosCaption,
+    platformCreatorsValue,
+    platformAdEarningsValue,
+    userEligibleVideosValue,
+    userEligibleVideosCaption,
+    userAdEarningsValue,
+    userAdEarningsCaption,
     sharePerVideoValue,
     sharePerVideoCaption,
+    weightingModeLabel,
+    weightingModeDescription,
     distributionStatusCaption,
     ledgerHeaderSubtitle,
     visibleTransactions: !loading && ledgerAvailable ? liveGlobalTransactions : [],

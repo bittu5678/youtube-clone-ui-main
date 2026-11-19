@@ -4,11 +4,12 @@
  * GET /api/wallet/global-pool-summary.php
  *
  * Read-only authoritative summary of eligible videos for the ₹3.00 Global Income Pool.
- * Uses identical eligibility rules as api/payments/verify.php:
+ * Uses identical video eligibility predicates as api/payments/verify.php:
  * - premium or paid videos: (video_type = 'premium' OR payment_status = 'paid')
  * - exclude blocked videos: (is_blocked = 0 OR is_blocked IS NULL)
- * - exclude the current uploader/viewer when excludeUserId/userId is specified
- * - counts eligible video rows independently (not distinct creators)
+ * - reports platform-wide aggregate counts (including the authenticated user's own eligible videos)
+ *   separately from the authenticated user's own eligible-video counts and ad earnings
+ * - never exposes other creators' individual videos or earnings
  */
 
 require_once __DIR__ . '/../config/database.php';
@@ -20,13 +21,14 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 
 $pdo = getDatabaseConnection();
 
-$requestedExcludeId = trim(
-    $_GET['excludeUserId'] ??
-    ($_GET['exclude_user_id'] ?? ($_GET['userId'] ?? ($_GET['user_id'] ?? '')))
+$requestedUserId = trim(
+    $_GET['userId'] ??
+    ($_GET['user_id'] ?? ($_GET['excludeUserId'] ?? ($_GET['exclude_user_id'] ?? '')))
 );
 
 // Enforce same session authentication policy as all other /api/wallet/* endpoints
-list($authUser, $excludeUserId) = requireAuthUser($pdo, $requestedExcludeId ?: null);
+list($authUser, $effectiveUserId) = requireAuthUser($pdo, $requestedUserId ?: null);
+$normalizedUserId = strtoupper(trim((string)$effectiveUserId));
 
 $hasAdEarningsCol = false;
 $hasIsBlockedCol = false;
@@ -54,53 +56,59 @@ try {
 
 try {
     $whereClauses = ["(video_type = 'premium' OR payment_status = 'paid')"];
-    $params = [];
 
     if ($hasIsBlockedCol) {
         $whereClauses[] = '(is_blocked = 0 OR is_blocked IS NULL)';
     }
 
-    if ($excludeUserId !== '') {
-        $whereClauses[] = 'UPPER(user_id) != UPPER(?)';
-        $params[] = $excludeUserId;
-    }
-
     $whereSql = implode(' AND ', $whereClauses);
-    $adEarningsSumExpr = $hasAdEarningsCol
-        ? 'COALESCE(SUM(GREATEST(0, COALESCE(ad_earnings, 0))), 0)'
+    $adEarningsExpr = $hasAdEarningsCol
+        ? 'GREATEST(0, COALESCE(ad_earnings, 0))'
         : '0';
 
     $sql = "
         SELECT
             COUNT(*) AS eligible_video_count,
             COUNT(DISTINCT UPPER(TRIM(user_id))) AS distinct_creator_count,
-            {$adEarningsSumExpr} AS total_ad_earnings
+            COALESCE(SUM({$adEarningsExpr}), 0) AS total_ad_earnings,
+            COALESCE(SUM(CASE WHEN UPPER(user_id) = UPPER(?) THEN 1 ELSE 0 END), 0) AS user_eligible_video_count,
+            COALESCE(SUM(CASE WHEN UPPER(user_id) = UPPER(?) THEN {$adEarningsExpr} ELSE 0 END), 0) AS user_total_ad_earnings
         FROM uploaded_videos
         WHERE {$whereSql}
     ";
 
     $stmt = $pdo->prepare($sql);
-    $stmt->execute($params);
+    $stmt->execute([$normalizedUserId, $normalizedUserId]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
-    $eligibleVideoCount = max(0, intval($row['eligible_video_count'] ?? 0));
-    $distinctCreatorCount = max(0, intval($row['distinct_creator_count'] ?? 0));
-    $totalAdEarnings = round(floatval($row['total_ad_earnings'] ?? 0), 2);
+    $platformEligibleVideoCount = max(0, intval($row['eligible_video_count'] ?? 0));
+    $platformDistinctCreatorCount = max(0, intval($row['distinct_creator_count'] ?? 0));
+    $platformTotalAdEarnings = round(floatval($row['total_ad_earnings'] ?? 0), 2);
+    $userEligibleVideoCount = max(0, intval($row['user_eligible_video_count'] ?? 0));
+    $userTotalAdEarnings = round(floatval($row['user_total_ad_earnings'] ?? 0), 2);
+
     $poolPaise = 300;
-    $estimatedEqualSharePerVideo = $eligibleVideoCount > 0
-        ? intdiv($poolPaise, $eligibleVideoCount) / 100
-        : 0.0;
+    $weightingMode = $platformTotalAdEarnings > 0 ? 'ad_earnings_weighted' : 'equal_fallback';
+    $estimatedEqualSharePerVideo = $weightingMode === 'equal_fallback'
+        ? ($platformEligibleVideoCount > 0 ? intdiv($poolPaise, $platformEligibleVideoCount) / 100 : 0.0)
+        : null;
 
     jsonResponse([
         'success' => true,
-        'excludedUserId' => $excludeUserId !== '' ? strtoupper($excludeUserId) : null,
+        'userId' => $normalizedUserId !== '' ? $normalizedUserId : null,
+        'excludedUserId' => null,
         'poolAmount' => 3.0,
         'poolPaise' => $poolPaise,
-        'eligibleVideoCount' => $eligibleVideoCount,
-        'distinctCreatorCount' => $distinctCreatorCount,
+        'eligibleVideoCount' => $platformEligibleVideoCount,
+        'platformEligibleVideoCount' => $platformEligibleVideoCount,
+        'distinctCreatorCount' => $platformDistinctCreatorCount,
+        'platformDistinctCreatorCount' => $platformDistinctCreatorCount,
+        'totalAdEarnings' => $platformTotalAdEarnings,
+        'platformTotalAdEarnings' => $platformTotalAdEarnings,
+        'userEligibleVideoCount' => $userEligibleVideoCount,
+        'userTotalAdEarnings' => $userTotalAdEarnings,
         'estimatedEqualSharePerVideo' => $estimatedEqualSharePerVideo,
-        'totalAdEarnings' => $totalAdEarnings,
-        'weightingMode' => $totalAdEarnings > 0 ? 'ad_earnings_weighted' : 'equal_fallback',
+        'weightingMode' => $weightingMode,
     ]);
 } catch (PDOException $e) {
     error_log('[global-pool-summary.php] Database error: ' . $e->getMessage());

@@ -1614,4 +1614,702 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
       }
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 14. Phase 1 Hardening: Key Length, Redirect URI, Binding Header, DB Expiry, Disconnect & PHP Parity
+  // --------------------------------------------------------------------------
+  describe("14. Phase 1 Hardening: Key Length, Redirect URI, Binding Header, DB Expiry, Disconnect & PHP Parity", () => {
+    function buildMockAdminPool(options?: {
+      onStateInsert?: (sql: string, params: any[]) => void;
+      onStateUpdate?: (sql: string, params: any[]) => void;
+      onCredUpdate?: (sql: string, params: any[]) => void;
+      activeCredRows?: any[];
+      role?: string;
+    }) {
+      const insertedStates: Map<string, any> = new Map();
+      const role = options?.role ?? "admin";
+      return {
+        insertedStates,
+        pool: {
+          query: async (sql: string, params: any[] = []) => {
+            if (sql.includes("FROM sessions")) {
+              return [
+                [
+                  {
+                    id: adminUserId,
+                    user_id: adminUserId,
+                    name: "Admin",
+                    mobile: "",
+                    email: "admin@facetube.com",
+                    role,
+                    referral_code: null,
+                    created_at: new Date().toISOString(),
+                  },
+                ],
+              ];
+            }
+            if (sql.includes("INSERT INTO admob_oauth_states")) {
+              options?.onStateInsert?.(sql, params);
+              const [nonce, userId, sessionHash, adminSessionHash, stateHash] = params;
+              insertedStates.set(nonce, {
+                nonce,
+                user_id: userId,
+                session_hash: sessionHash,
+                admin_session_hash: adminSessionHash,
+                state_hash: stateHash,
+                is_consumed: 0,
+              });
+              return [{ affectedRows: 1 }];
+            }
+            if (sql.includes("FROM admob_oauth_states st")) {
+              const [nonce, stateHash, userId, sessionHash] = params;
+              const rec = insertedStates.get(nonce);
+              if (
+                rec &&
+                rec.state_hash === stateHash &&
+                rec.user_id === userId &&
+                rec.session_hash === sessionHash &&
+                rec.is_consumed === 0
+              ) {
+                return [
+                  [
+                    {
+                      admin_session_hash: rec.admin_session_hash,
+                      id: adminUserId,
+                      user_id: adminUserId,
+                      role,
+                    },
+                  ],
+                ];
+              }
+              return [[]];
+            }
+            if (sql.includes("UPDATE admob_oauth_states st")) {
+              options?.onStateUpdate?.(sql, params);
+              const [nonce, stateHash, userId, sessionHash, adminSessionHash] = params;
+              const rec = insertedStates.get(nonce);
+              if (
+                rec &&
+                rec.state_hash === stateHash &&
+                rec.user_id === userId &&
+                rec.session_hash === sessionHash &&
+                rec.admin_session_hash === adminSessionHash &&
+                rec.is_consumed === 0
+              ) {
+                rec.is_consumed = 1;
+                return [{ affectedRows: 1 }];
+              }
+              return [{ affectedRows: 0 }];
+            }
+            if (sql.includes("FROM admob_oauth_credentials")) {
+              return [options?.activeCredRows ?? []];
+            }
+            if (sql.includes("UPDATE admob_oauth_credentials")) {
+              options?.onCredUpdate?.(sql, params);
+              return [{ affectedRows: (options?.activeCredRows ?? []).length || 1 }];
+            }
+            if (sql.includes("INSERT INTO admob_oauth_credentials")) {
+              return [{ affectedRows: 1 }];
+            }
+            return [[]];
+          },
+        } as any,
+      };
+    }
+
+    it("rejects X-Admob-Binding and X-Admob-Binding-Secret fallback in production while permitting non-production fallback", async () => {
+      const prodEnv = {
+        APP_ENV: "production",
+        NODE_ENV: "production",
+        ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+        ADMOB_OAUTH_CLIENT_ID: "prod-client-id",
+        ADMOB_OAUTH_CLIENT_SECRET: "prod-client-secret",
+        ADMOB_OAUTH_REDIRECT_URI: "https://facetube.online/api/admin/admob/oauth-callback",
+      };
+
+      const { pool } = buildMockAdminPool();
+      const urlRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/admin/admob/auth-url", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${adminSessionToken}` },
+        }),
+        prodEnv,
+        { pool },
+      );
+      assert.ok(urlRes && urlRes.status === 200);
+      const urlData = (await urlRes.json()) as any;
+      const state = new URL(urlData.auth_url).searchParams.get("state") || "";
+      const setCookie = urlRes.headers.get("Set-Cookie") || "";
+      const bindingVal = decodeURIComponent(
+        (setCookie.match(/facetube_admob_oauth_binding=([^;]+)/) || [])[1] || "",
+      );
+      assert.ok(bindingVal.length >= 32, "Binding cookie value must exist");
+
+      for (const headerName of ["X-Admob-Binding", "X-Admob-Binding-Secret"]) {
+        const cbRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              [headerName]: bindingVal,
+              Authorization: `Bearer ${adminSessionToken}`,
+            },
+            body: JSON.stringify({ code: "auth-code-prod", state }),
+          }),
+          prodEnv,
+          { pool },
+        );
+        assert.ok(cbRes);
+        assert.equal(
+          cbRes.status,
+          403,
+          `${headerName} fallback without HttpOnly cookie must be rejected in production`,
+        );
+        const cbData = (await cbRes.json()) as any;
+        assert.equal(cbData.success, false);
+        assert.match(String(cbData.error), /binding header fallback is disabled in production/i);
+      }
+
+      // Non-production explicit development mode allows X-Admob-Binding fallback
+      const devEnv = {
+        APP_ENV: "development",
+        NODE_ENV: "development",
+        ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+        ADMOB_OAUTH_CLIENT_ID: "dev-client-id",
+        ADMOB_OAUTH_CLIENT_SECRET: "dev-client-secret",
+        ADMOB_OAUTH_REDIRECT_URI: "https://facetube.online/api/admin/admob/oauth-callback",
+      };
+      const devUrlRes = await callApi(
+        new Request("http://localhost:3000/api/admin/admob/auth-url", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${adminSessionToken}` },
+        }),
+        devEnv,
+      );
+      assert.equal(devUrlRes.status, 200);
+      const devUrlData = (await devUrlRes.json()) as any;
+      const devState = new URL(devUrlData.auth_url).searchParams.get("state") || "";
+      const devBinding = decodeURIComponent(
+        ((devUrlRes.headers.get("Set-Cookie") || "").match(
+          /facetube_admob_oauth_binding=([^;]+)/,
+        ) || [])[1] || "",
+      );
+      const devCbRes = await callApi(
+        new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Admob-Binding": devBinding,
+            Authorization: `Bearer ${adminSessionToken}`,
+          },
+          body: JSON.stringify({
+            code: `test_mock_code_dev_header_${crypto.randomBytes(4).toString("hex")}`,
+            state: devState,
+          }),
+        }),
+        devEnv,
+      );
+      assert.equal(devCbRes.status, 200);
+      const devCbData = (await devCbRes.json()) as any;
+      assert.equal(devCbData.success, true);
+    });
+
+    it("fails closed in production when ADMOB_ENCRYPTION_KEY is missing or < 32 bytes without exposing the key", async () => {
+      const { pool } = buildMockAdminPool();
+      const shortKey = "short-key-16byte";
+      assert.ok(Buffer.byteLength(shortKey, "utf8") < 32);
+
+      for (const badKey of ["", shortKey]) {
+        const prodEnv = {
+          APP_ENV: "production",
+          NODE_ENV: "production",
+          ADMOB_ENCRYPTION_KEY: badKey,
+          ADMOB_OAUTH_CLIENT_ID: "prod-client-id",
+          ADMOB_OAUTH_CLIENT_SECRET: "prod-client-secret",
+          ADMOB_OAUTH_REDIRECT_URI: "https://facetube.online/api/admin/admob/oauth-callback",
+        };
+
+        const authUrlRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/auth-url", {
+            method: "GET",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+          prodEnv,
+          { pool },
+        );
+        assert.ok(authUrlRes);
+        assert.equal(authUrlRes.status, 500);
+        const authText = await authUrlRes.text();
+        assert.equal(JSON.parse(authText).success, false);
+        assert.equal(authText.includes(shortKey), false);
+
+        const cbRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code: "code-123", state: "malformed.state" }),
+          }),
+          prodEnv,
+          { pool },
+        );
+        assert.ok(cbRes);
+        assert.equal(cbRes.status, 500);
+        const cbText = await cbRes.text();
+        assert.equal(JSON.parse(cbText).success, false);
+        assert.equal(cbText.includes(shortKey), false);
+      }
+    });
+
+    it("uses MySQL DATE_ADD(NOW(), INTERVAL 10 MINUTE) for OAuth state expiry and verifies state expiry on callback", async () => {
+      let capturedInsertSql = "";
+      let capturedInsertParams: any[] = [];
+      let capturedUpdateSql = "";
+
+      const { pool } = buildMockAdminPool({
+        onStateInsert: (sql, params) => {
+          capturedInsertSql = sql;
+          capturedInsertParams = params;
+        },
+        onStateUpdate: (sql) => {
+          capturedUpdateSql = sql;
+        },
+      });
+
+      const prodEnv = {
+        APP_ENV: "production",
+        NODE_ENV: "production",
+        ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+        ADMOB_OAUTH_CLIENT_ID: "prod-client-id",
+        ADMOB_OAUTH_CLIENT_SECRET: "prod-client-secret",
+        ADMOB_OAUTH_REDIRECT_URI: "https://facetube.online/api/admin/admob/oauth-callback",
+      };
+
+      const urlRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/admin/admob/auth-url", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${adminSessionToken}` },
+        }),
+        prodEnv,
+        { pool },
+      );
+      assert.ok(urlRes && urlRes.status === 200);
+      assert.match(capturedInsertSql, /DATE_ADD\(\s*NOW\(\)\s*,\s*INTERVAL\s+10\s+MINUTE\s*\)/i);
+      assert.equal(capturedInsertParams.length, 5);
+
+      const urlData = (await urlRes.json()) as any;
+      const state = new URL(urlData.auth_url).searchParams.get("state") || "";
+      const cookie =
+        (urlRes.headers.get("Set-Cookie") || "").match(/facetube_admob_oauth_binding=[^;]+/)?.[0] ||
+        "";
+
+      const origFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = (async (input: string | URL | Request) => {
+          const target = typeof input === "string" ? input : input.toString();
+          if (target.startsWith("https://oauth2.googleapis.com/token")) {
+            return new Response(
+              JSON.stringify({
+                access_token: "ya29.prod-token",
+                refresh_token: "1//prod-refresh-token",
+                expires_in: 3600,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          if (target.startsWith("https://admob.googleapis.com/v1/accounts")) {
+            return new Response(
+              JSON.stringify({
+                account: [
+                  {
+                    name: "accounts/pub-1234567890123456",
+                    title: "FaceTube Prod",
+                    currencyCode: "INR",
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          throw new Error(`Unexpected fetch URL: ${target}`);
+        }) as typeof fetch;
+
+        const cbRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: cookie,
+              Authorization: `Bearer ${adminSessionToken}`,
+            },
+            body: JSON.stringify({ code: "4/real_prod_code", state }),
+          }),
+          prodEnv,
+          { pool },
+        );
+        assert.ok(cbRes);
+        assert.equal(cbRes.status, 200);
+        assert.match(capturedUpdateSql, /st\.expires_at\s*>\s*NOW\(\)/i);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it("rejects missing or untrusted ADMOB_OAUTH_REDIRECT_URI and missing client credentials in production without calling Google", async () => {
+      const { pool } = buildMockAdminPool();
+      const untrustedUris = [
+        "",
+        "http://facetube.online/api/admin/admob/oauth-callback",
+        "https://evil.example.com/api/admin/admob/oauth-callback",
+        "http://localhost:3000/api/admin/admob/oauth-callback",
+        "https://facetube.online/api/other-path",
+      ];
+
+      const origFetch = globalThis.fetch;
+      let fetchCalled = false;
+      globalThis.fetch = (async () => {
+        fetchCalled = true;
+        throw new Error("Google OAuth endpoint must not be called for invalid config");
+      }) as typeof fetch;
+
+      try {
+        for (const badUri of untrustedUris) {
+          const prodEnv = {
+            APP_ENV: "production",
+            NODE_ENV: "production",
+            ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+            ADMOB_OAUTH_CLIENT_ID: "prod-client-id",
+            ADMOB_OAUTH_CLIENT_SECRET: "prod-client-secret",
+            ADMOB_OAUTH_REDIRECT_URI: badUri,
+          };
+
+          const urlRes = await handleApiRequest(
+            new Request("http://localhost:3000/api/admin/admob/auth-url", {
+              method: "GET",
+              headers: { Authorization: `Bearer ${adminSessionToken}` },
+            }),
+            prodEnv,
+            { pool },
+          );
+          assert.ok(urlRes);
+          assert.equal(urlRes.status, 500, `auth-url must reject untrusted URI "${badUri}"`);
+
+          const cbPostRes = await handleApiRequest(
+            new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ code: "abc", state: "xyz.sig" }),
+            }),
+            prodEnv,
+            { pool },
+          );
+          assert.ok(cbPostRes);
+          assert.equal(
+            cbPostRes.status,
+            500,
+            `callback POST must reject untrusted URI "${badUri}"`,
+          );
+
+          const cbGetRes = await handleApiRequest(
+            new Request(
+              "http://localhost:3000/api/admin/admob/oauth-callback?code=abc&state=xyz.sig",
+              {
+                method: "GET",
+              },
+            ),
+            prodEnv,
+            { pool },
+          );
+          assert.ok(cbGetRes);
+          assert.equal(cbGetRes.status, 302);
+          assert.match(cbGetRes.headers.get("Location") || "", /admob_error=invalid_redirect_uri/);
+        }
+
+        // Valid state + missing ADMOB_OAUTH_CLIENT_SECRET must fail with 500 before calling Google
+        const validEnvForAuthUrl = {
+          APP_ENV: "production",
+          NODE_ENV: "production",
+          ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+          ADMOB_OAUTH_CLIENT_ID: "prod-client-id",
+          ADMOB_OAUTH_CLIENT_SECRET: "prod-client-secret",
+          ADMOB_OAUTH_REDIRECT_URI: "https://facetube.online/api/admin/admob/oauth-callback",
+        };
+        const urlRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/auth-url", {
+            method: "GET",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+          validEnvForAuthUrl,
+          { pool },
+        );
+        assert.ok(urlRes && urlRes.status === 200);
+        const urlData = (await urlRes.json()) as any;
+        const state = new URL(urlData.auth_url).searchParams.get("state") || "";
+        const cookie =
+          (urlRes.headers.get("Set-Cookie") || "").match(
+            /facetube_admob_oauth_binding=[^;]+/,
+          )?.[0] || "";
+
+        const missingSecretEnv = {
+          ...validEnvForAuthUrl,
+          ADMOB_OAUTH_CLIENT_SECRET: "",
+        };
+        const cbMissingSecret = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/oauth-callback", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: cookie,
+              Authorization: `Bearer ${adminSessionToken}`,
+            },
+            body: JSON.stringify({ code: "4/auth_code", state }),
+          }),
+          missingSecretEnv,
+          { pool },
+        );
+        assert.ok(cbMissingSecret);
+        assert.equal(cbMissingSecret.status, 500);
+        assert.equal(fetchCalled, false);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it("enforces case-insensitive admin role matching across AdMob endpoints", async () => {
+      const { pool } = buildMockAdminPool({ role: "Admin" });
+      const prodEnv = {
+        APP_ENV: "production",
+        NODE_ENV: "production",
+        ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+        ADMOB_OAUTH_CLIENT_ID: "prod-client-id",
+        ADMOB_OAUTH_CLIENT_SECRET: "prod-client-secret",
+        ADMOB_OAUTH_REDIRECT_URI: "https://facetube.online/api/admin/admob/oauth-callback",
+      };
+
+      const urlRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/admin/admob/auth-url", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${adminSessionToken}` },
+        }),
+        prodEnv,
+        { pool },
+      );
+      assert.ok(urlRes && urlRes.status === 200);
+
+      const statusRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/admin/admob/status", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${adminSessionToken}` },
+        }),
+        prodEnv,
+        { pool },
+      );
+      assert.ok(statusRes && statusRes.status === 200);
+
+      const disconnectRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/admin/admob/disconnect", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${adminSessionToken}` },
+        }),
+        prodEnv,
+        { pool },
+      );
+      assert.ok(disconnectRes && disconnectRes.status === 200);
+    });
+
+    it("reports accurate google_revoked status on disconnect across success, upstream failure, and missing/wrong key, while deactivating all active rows", async () => {
+      const encryptToken = (plaintext: string, secretKey: string) => {
+        const key = crypto.createHash("sha256").update(secretKey).digest();
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+        let ciphertext = cipher.update(plaintext, "utf8", "hex");
+        ciphertext += cipher.final("hex");
+        const tag = cipher.getAuthTag().toString("hex");
+        return { ciphertext, iv: iv.toString("hex"), tag };
+      };
+
+      const enc1 = encryptToken("1//real_refresh_token_one", testEncryptionKey);
+      const enc2 = encryptToken("1//real_refresh_token_two", testEncryptionKey);
+      const twoActiveRows = [
+        {
+          id: 1,
+          publisher_id: "pub-1111111111111111",
+          encrypted_refresh_token: enc1.ciphertext,
+          refresh_token_iv: enc1.iv,
+          refresh_token_tag: enc1.tag,
+        },
+        {
+          id: 2,
+          publisher_id: "pub-2222222222222222",
+          encrypted_refresh_token: enc2.ciphertext,
+          refresh_token_iv: enc2.iv,
+          refresh_token_tag: enc2.tag,
+        },
+      ];
+
+      const prodEnv = {
+        APP_ENV: "production",
+        NODE_ENV: "production",
+        ADMOB_ENCRYPTION_KEY: testEncryptionKey,
+        ADMOB_OAUTH_CLIENT_ID: "prod-client-id",
+        ADMOB_OAUTH_CLIENT_SECRET: "prod-client-secret",
+        ADMOB_OAUTH_REDIRECT_URI: "https://facetube.online/api/admin/admob/oauth-callback",
+      };
+
+      const origFetch = globalThis.fetch;
+      try {
+        // Case A: Google /revoke returns HTTP 200 -> google_revoked: true, deactivates all rows
+        let updateSql = "";
+        let revokeCalls = 0;
+        globalThis.fetch = (async (input: string | URL | Request) => {
+          const target = typeof input === "string" ? input : input.toString();
+          if (target === "https://oauth2.googleapis.com/revoke") {
+            revokeCalls += 1;
+            return new Response("", { status: 200 });
+          }
+          throw new Error(`Unexpected fetch URL: ${target}`);
+        }) as typeof fetch;
+
+        const { pool: poolOk } = buildMockAdminPool({
+          activeCredRows: twoActiveRows,
+          onCredUpdate: (sql) => {
+            updateSql = sql;
+          },
+        });
+        const okRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/disconnect", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+          prodEnv,
+          { pool: poolOk },
+        );
+        assert.ok(okRes && okRes.status === 200);
+        const okData = (await okRes.json()) as any;
+        assert.equal(okData.success, true);
+        assert.equal(okData.connected, false);
+        assert.equal(okData.google_revoked, true);
+        assert.equal(okData.revocation_status, "revoked");
+        assert.equal(revokeCalls, 2);
+        assert.match(updateSql, /WHERE is_active = 1/i);
+        assert.equal(/LIMIT 1/i.test(updateSql), false);
+
+        // Case B: Google /revoke returns HTTP 400 -> google_revoked: false + warning, still deactivates local DB
+        let deactivatedOnUpstreamFail = false;
+        globalThis.fetch = (async () =>
+          new Response("invalid_token", { status: 400 })) as typeof fetch;
+        const { pool: poolFail } = buildMockAdminPool({
+          activeCredRows: [twoActiveRows[0]],
+          onCredUpdate: () => {
+            deactivatedOnUpstreamFail = true;
+          },
+        });
+        const failRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/disconnect", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+          prodEnv,
+          { pool: poolFail },
+        );
+        assert.ok(failRes && failRes.status === 200);
+        const failData = (await failRes.json()) as any;
+        assert.equal(failData.success, true);
+        assert.equal(failData.connected, false);
+        assert.equal(failData.google_revoked, false);
+        assert.equal(failData.revocation_status, "upstream_revocation_failed");
+        assert.ok(failData.warning);
+        assert.equal(deactivatedOnUpstreamFail, true);
+
+        // Case C: Missing encryption key -> google_revoked: false (never claims Google revocation succeeded)
+        let fetchCalledWithoutKey = false;
+        globalThis.fetch = (async () => {
+          fetchCalledWithoutKey = true;
+          return new Response("", { status: 200 });
+        }) as typeof fetch;
+        const { pool: poolNoKey } = buildMockAdminPool({ activeCredRows: [twoActiveRows[0]] });
+        const noKeyRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/disconnect", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+          { ...prodEnv, ADMOB_ENCRYPTION_KEY: "" },
+          { pool: poolNoKey },
+        );
+        assert.ok(noKeyRes && noKeyRes.status === 200);
+        const noKeyData = (await noKeyRes.json()) as any;
+        assert.equal(noKeyData.google_revoked, false);
+        assert.equal(noKeyData.revocation_status, "missing_encryption_key");
+        assert.equal(fetchCalledWithoutKey, false);
+
+        // Case D: Wrong 32+ byte encryption key -> google_revoked: false (decryption_failed)
+        const { pool: poolWrongKey } = buildMockAdminPool({ activeCredRows: [twoActiveRows[0]] });
+        const wrongKeyRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/admin/admob/disconnect", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${adminSessionToken}` },
+          }),
+          {
+            ...prodEnv,
+            ADMOB_ENCRYPTION_KEY: "completely-wrong-encryption-key-over-32-bytes-long",
+          },
+          { pool: poolWrongKey },
+        );
+        assert.ok(wrongKeyRes && wrongKeyRes.status === 200);
+        const wrongKeyData = (await wrongKeyRes.json()) as any;
+        assert.equal(wrongKeyData.google_revoked, false);
+        assert.equal(wrongKeyData.revocation_status, "decryption_failed");
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it("maintains static PHP endpoint security parity across api/admin/admob/*.php", () => {
+      const admobPhpDir = path.resolve(process.cwd(), "api/admin/admob");
+      const cryptoPhp = fs.readFileSync(path.join(admobPhpDir, "admob-crypto.php"), "utf8");
+      const authUrlPhp = fs.readFileSync(path.join(admobPhpDir, "auth-url.php"), "utf8");
+      const callbackPhp = fs.readFileSync(path.join(admobPhpDir, "oauth-callback.php"), "utf8");
+      const statusPhp = fs.readFileSync(path.join(admobPhpDir, "status.php"), "utf8");
+      const disconnectPhp = fs.readFileSync(path.join(admobPhpDir, "disconnect.php"), "utf8");
+
+      // Crypto & config parity
+      assert.match(cryptoPhp, /strlen\(\$envKey\)\s*<\s*32/);
+      assert.equal(cryptoPhp.includes("getApiBaseUrl"), false);
+      assert.match(cryptoPhp, /function\s+validateAdmobRedirectUri/);
+      assert.match(cryptoPhp, /function\s+requireAdmobAdminAuth/);
+      assert.match(cryptoPhp, /503/);
+
+      // auth-url parity
+      assert.match(authUrlPhp, /DATE_ADD\(\s*NOW\(\)\s*,\s*INTERVAL\s+10\s+MINUTE\s*\)/i);
+      assert.match(authUrlPhp, /requireAdmobAdminAuth\s*\(/);
+
+      // oauth-callback parity
+      assert.match(callbackPhp, /in_array\(\$requestMethod,\s*\['GET',\s*'POST'\],\s*true\)/);
+      assert.match(callbackPhp, /405/);
+      assert.match(
+        callbackPhp,
+        /\$isProduction\s*&&\s*empty\(\$cookieSecret\)\s*&&\s*!empty\(\$rawTestHeader\)/,
+      );
+      assert.match(
+        callbackPhp,
+        /!\$config\['isConfigured'\]\s*\|\|\s*!\$config\['redirectUriValid'\]/,
+      );
+      assert.match(
+        callbackPhp,
+        /try\s*\{[\s\S]*admob_oauth_credentials[\s\S]*catch\s*\(PDOException/,
+      );
+
+      // status parity
+      assert.match(statusPhp, /requireAdmobAdminAuth\s*\(/);
+      assert.match(statusPhp, /catch\s*\(PDOException[\s\S]*\$isProduction\s*\?\s*503\s*:\s*500/);
+
+      // disconnect parity
+      assert.match(disconnectPhp, /'google_revoked'\s*=>\s*\$googleRevoked/);
+      assert.match(disconnectPhp, /WHERE is_active = 1/);
+      assert.equal(
+        /jsonResponse\(\s*\[[^\]]*\$e->getMessage\(\)/s.test(disconnectPhp),
+        false,
+        "PHP disconnect must never expose $e->getMessage() in JSON responses",
+      );
+    });
+  });
 });

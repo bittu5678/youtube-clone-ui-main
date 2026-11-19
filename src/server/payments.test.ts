@@ -1,6 +1,9 @@
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   verifyServerPayment,
   verifyPayment,
@@ -17,6 +20,10 @@ import {
   parseStrictBooleanFlag,
   isProductionRuntimeEnv,
   isFailClosedProductionEnv,
+  setTestPersistentDataDir,
+  getPersistentDataDir,
+  getPersistentStateFile,
+  getExplicitTestDataDir,
 } from "./payments";
 import {
   handleApiRequest,
@@ -26,6 +33,7 @@ import {
   buildMaskedBeneficiaryDetails,
   setStoreWalletBalance,
   resetStoreForTests,
+  resetInMemoryStore,
 } from "./api-handler";
 import { isPromotionActive, getVideoBadgeLabels } from "../lib/video-service";
 import { api } from "../lib/api";
@@ -36,6 +44,23 @@ import {
   getUserLedger,
   getGlobalPoolSummary,
 } from "../lib/ledger-service";
+
+let paymentTestDataDir = "";
+
+before(() => {
+  paymentTestDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-payments-test-"));
+  setTestPersistentDataDir(paymentTestDataDir);
+  resetInMemoryStore();
+});
+
+after(() => {
+  setTestPersistentDataDir(null);
+  resetInMemoryStore();
+  if (paymentTestDataDir) {
+    fs.rmSync(paymentTestDataDir, { recursive: true, force: true });
+    paymentTestDataDir = "";
+  }
+});
 
 beforeEach(() => {
   resetStoreForTests();
@@ -4518,7 +4543,146 @@ describe("Global Income Pool Phase A: Per-Video Eligibility & Authoritative Serv
       assert.equal(afterJson.distribution.eligibleVideoCount, baselineCount + 1);
     } finally {
       globalThis.fetch = origFetch;
-      resetPersistentPremiumState();
+      await resetPersistentPremiumState();
     }
+  });
+});
+
+describe("Protected Production JSON Isolation Regression Tests", () => {
+  const sha256File = (filePath: string): string =>
+    crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+
+  it("1. Payment test setup, verification, API requests, and teardown write only to isolated temp dir and never modify protected data/*.json", async () => {
+    const protectedStorePath = path.resolve(process.cwd(), "data", "facetube_store.json");
+    const protectedPremPath = path.resolve(process.cwd(), "data", "premium_transactions.json");
+
+    const storeHashBefore = sha256File(protectedStorePath);
+    const premHashBefore = sha256File(protectedPremPath);
+
+    assert.ok(paymentTestDataDir);
+    assert.notEqual(path.resolve(getPersistentDataDir()), path.resolve(process.cwd(), "data"));
+    assert.equal(getPersistentDataDir(), path.resolve(paymentTestDataDir));
+    assert.equal(
+      getPersistentStateFile(),
+      path.join(path.resolve(paymentTestDataDir), "premium_transactions.json"),
+    );
+
+    resetStoreForTests("FT483921", 50000);
+    setStoreWalletBalance("FT483921", 75000);
+    await resetPersistentPremiumState(0, [], []);
+
+    const secret = "test_isolation_secret_123456";
+    const orderId = `order_iso_${Date.now()}`;
+    const paymentId = `pay_iso_${Date.now()}`;
+    const signature = crypto
+      .createHmac("sha256", secret)
+      .update(`${orderId}|${paymentId}`)
+      .digest("hex");
+
+    const verifyResult = await verifyServerPayment(
+      {
+        orderId,
+        paymentId,
+        signature,
+        userId: "FT483921",
+        purpose: "premium_video_upload",
+      },
+      ["FT483921"],
+      "FT102857",
+      {
+        APP_ENV: "test",
+        NODE_ENV: "test",
+        RAZORPAY_KEY_SECRET: secret,
+        RAZORPAY_SKIP_REMOTE_CHECK: "true",
+      },
+    );
+    assert.equal(verifyResult.verified, true);
+
+    const apiOrderId = `order_iso_api_${Date.now()}`;
+    const apiPaymentId = `pay_iso_api_${Date.now()}`;
+    const apiSignature = crypto
+      .createHmac("sha256", secret)
+      .update(`${apiOrderId}|${apiPaymentId}`)
+      .digest("hex");
+
+    const apiRes = await handleApiRequest(
+      new Request("http://localhost:3000/api/payments/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          orderId: apiOrderId,
+          paymentId: apiPaymentId,
+          signature: apiSignature,
+          userId: "FT483921",
+          purpose: "premium_video_upload",
+        }),
+      }),
+      {
+        APP_ENV: "test",
+        NODE_ENV: "test",
+        RAZORPAY_KEY_SECRET: secret,
+        RAZORPAY_SKIP_REMOTE_CHECK: "true",
+      },
+      { pool: null },
+    );
+    assert.equal(apiRes?.status, 200);
+
+    // Teardown reset also stays inside isolated test directory
+    await resetPersistentPremiumState(0, [], []);
+    resetStoreForTests();
+
+    assert.ok(fs.existsSync(path.join(paymentTestDataDir, "facetube_store.json")));
+    assert.ok(fs.existsSync(path.join(paymentTestDataDir, "premium_transactions.json")));
+
+    assert.equal(sha256File(protectedStorePath), storeHashBefore);
+    assert.equal(sha256File(protectedPremPath), premHashBefore);
+  });
+
+  it("2. Auto-isolates premium state without override, blocks unisolated store helpers in test mode, rejects protected data/ dir, and ignores overrides in production", async () => {
+    const protectedDataDir = path.resolve(process.cwd(), "data");
+    const protectedStorePath = path.join(protectedDataDir, "facetube_store.json");
+    const protectedPremPath = path.join(protectedDataDir, "premium_transactions.json");
+
+    const storeHashBefore = sha256File(protectedStorePath);
+    const premHashBefore = sha256File(protectedPremPath);
+
+    assert.throws(
+      () => setTestPersistentDataDir(protectedDataDir),
+      /must not target protected data\//i,
+    );
+
+    const prodEnv = { APP_ENV: "production", NODE_ENV: "production" };
+    assert.equal(getExplicitTestDataDir(prodEnv), null);
+    assert.equal(getPersistentDataDir(prodEnv), protectedDataDir);
+    assert.equal(getPersistentStateFile(prodEnv), protectedPremPath);
+    await assert.rejects(
+      () => getPersistentPremiumTxNumber(prodEnv),
+      /strictly disabled in production/i,
+    );
+
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    try {
+      const testEnv = { APP_ENV: "test", NODE_ENV: "test" };
+      const autoDir = getPersistentDataDir(testEnv);
+      assert.notEqual(path.resolve(autoDir), protectedDataDir);
+      assert.ok(path.resolve(autoDir).startsWith(path.resolve(os.tmpdir())));
+
+      await resetPersistentPremiumState(0, [], [], [], testEnv);
+      assert.throws(
+        () => resetStoreForTests("FT483921", 50000, testEnv),
+        /requires an isolated test directory/i,
+      );
+      assert.throws(
+        () => setStoreWalletBalance("FT483921", 100, testEnv),
+        /requires an isolated test directory/i,
+      );
+    } finally {
+      setTestPersistentDataDir(paymentTestDataDir);
+      resetInMemoryStore();
+    }
+
+    assert.equal(sha256File(protectedStorePath), storeHashBefore);
+    assert.equal(sha256File(protectedPremPath), premHashBefore);
   });
 });

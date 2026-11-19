@@ -1,10 +1,14 @@
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { handleApiRequest } from "./api-handler";
-import { resetPersistentPremiumState } from "./payments";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { handleApiRequest, resetInMemoryStore } from "./api-handler";
+import { resetPersistentPremiumState, setTestPersistentDataDir } from "./payments";
 
 describe("Task 2 - Phase 2E: Admin Subscription Management Tests", () => {
+  let testDataDir = "";
   const secret = "test_razorpay_secret_admin_sub_123456";
   const keyId = "rzp_test_admin_sub_key_123456";
   const testEnv = {
@@ -23,6 +27,10 @@ describe("Task 2 - Phase 2E: Admin Subscription Management Tests", () => {
   let expiredSubId = "";
 
   before(async () => {
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-admin-sub-test-"));
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
+
     // 1. Reset state
     await resetPersistentPremiumState(10, [], []);
 
@@ -352,5 +360,14 @@ describe("Task 2 - Phase 2E: Admin Subscription Management Tests", () => {
       assert.equal(data.success, false);
       assert.match(data.error, /subscription (record )?not found/i);
     });
+  });
+
+  after(() => {
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+      testDataDir = "";
+    }
   });
 });

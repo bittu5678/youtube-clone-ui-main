@@ -473,17 +473,23 @@ export const api = {
       );
     },
 
-    getGlobalPoolSummary: async (excludeUserId?: string) => {
-      const q = excludeUserId ? `?excludeUserId=${encodeURIComponent(excludeUserId)}` : "";
+    getGlobalPoolSummary: async (userId?: string) => {
+      const q = userId ? `?userId=${encodeURIComponent(userId)}` : "";
       return apiFetch<{
         success: boolean;
+        userId?: string | null;
         excludedUserId: string | null;
         poolAmount: number;
         poolPaise: number;
         eligibleVideoCount: number;
+        platformEligibleVideoCount?: number;
         distinctCreatorCount: number;
-        estimatedEqualSharePerVideo: number;
+        platformDistinctCreatorCount?: number;
         totalAdEarnings: number;
+        platformTotalAdEarnings?: number;
+        userEligibleVideoCount?: number | null;
+        userTotalAdEarnings?: number | null;
+        estimatedEqualSharePerVideo: number | null;
         weightingMode: "ad_earnings_weighted" | "equal_fallback";
       }>(`/wallet/global-pool-summary.php${q}`);
     },

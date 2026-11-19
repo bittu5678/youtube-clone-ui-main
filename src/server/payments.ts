@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 /**
@@ -528,8 +529,83 @@ interface PersistentPremiumState {
 }
 
 // Persistent Storage Configuration
-const DATA_DIR = path.resolve(process.cwd(), "data");
-const STATE_FILE = path.join(DATA_DIR, "premium_transactions.json");
+const DEFAULT_DATA_DIR = path.resolve(process.cwd(), "data");
+let testDataDirOverride: string | null = null;
+let autoTestTempDir: string | null = null;
+
+export function isTestRuntimeEnv(env?: Record<string, string | undefined>): boolean {
+  const hasExplicitAppEnv =
+    env !== undefined && Object.prototype.hasOwnProperty.call(env, "APP_ENV");
+  const hasExplicitNodeEnv =
+    env !== undefined && Object.prototype.hasOwnProperty.call(env, "NODE_ENV");
+  const appEnv = String(hasExplicitAppEnv ? env["APP_ENV"] : (process.env["APP_ENV"] ?? ""))
+    .trim()
+    .toLowerCase();
+  const nodeEnv = String(hasExplicitNodeEnv ? env["NODE_ENV"] : (process.env["NODE_ENV"] ?? ""))
+    .trim()
+    .toLowerCase();
+  return appEnv === "test" || nodeEnv === "test";
+}
+
+export function getExplicitTestDataDir(env?: Record<string, string | undefined>): string | null {
+  if (isProductionRuntimeEnv(env)) {
+    return null;
+  }
+  if (testDataDirOverride) {
+    return testDataDirOverride;
+  }
+  const envOverride = (
+    env?.["FACETUBE_TEST_DATA_DIR"] ??
+    process.env["FACETUBE_TEST_DATA_DIR"] ??
+    ""
+  ).trim();
+  if (envOverride) {
+    const resolved = path.resolve(envOverride);
+    if (resolved !== DEFAULT_DATA_DIR) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
+export function setTestPersistentDataDir(
+  dir: string | null,
+  env?: Record<string, string | undefined>,
+): void {
+  assertNonProductionJsonAllowed(env, "setTestPersistentDataDir");
+  if (!dir) {
+    testDataDirOverride = null;
+    return;
+  }
+  const resolved = path.resolve(dir);
+  if (resolved === DEFAULT_DATA_DIR) {
+    throw new Error(
+      "[Payments Server] Test persistent data directory must not target protected data/ directory.",
+    );
+  }
+  testDataDirOverride = resolved;
+}
+
+export function getPersistentDataDir(env?: Record<string, string | undefined>): string {
+  if (isProductionRuntimeEnv(env)) {
+    return DEFAULT_DATA_DIR;
+  }
+  const explicit = getExplicitTestDataDir(env);
+  if (explicit) {
+    return explicit;
+  }
+  if (isTestRuntimeEnv(env)) {
+    if (!autoTestTempDir) {
+      autoTestTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-test-premium-"));
+    }
+    return autoTestTempDir;
+  }
+  return DEFAULT_DATA_DIR;
+}
+
+export function getPersistentStateFile(env?: Record<string, string | undefined>): string {
+  return path.join(getPersistentDataDir(env), "premium_transactions.json");
+}
 
 // Mutex lock for atomic sequence generation and duplicate prevention
 let sequenceMutex = Promise.resolve();
@@ -561,13 +637,15 @@ function assertNonProductionJsonAllowed(
  */
 function loadPersistentState(env?: Record<string, string | undefined>): PersistentPremiumState {
   assertNonProductionJsonAllowed(env, "loadPersistentState");
+  const dataDir = getPersistentDataDir(env);
+  const stateFile = getPersistentStateFile(env);
   try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
     }
 
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, "utf-8");
+    if (fs.existsSync(stateFile)) {
+      const raw = fs.readFileSync(stateFile, "utf-8");
       const parsed = JSON.parse(raw);
       if (typeof parsed?.lastTxNumber === "number" && Array.isArray(parsed?.transactions)) {
         return parsed as PersistentPremiumState;
@@ -608,10 +686,10 @@ function loadPersistentState(env?: Record<string, string | undefined>): Persiste
   };
 
   try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
     }
-    fs.writeFileSync(STATE_FILE, JSON.stringify(defaultState, null, 2), "utf-8");
+    fs.writeFileSync(stateFile, JSON.stringify(defaultState, null, 2), "utf-8");
   } catch (err) {
     console.warn("[Payments Server] Could not write initial state file:", err);
   }
@@ -624,13 +702,15 @@ function savePersistentState(
   env?: Record<string, string | undefined>,
 ): void {
   assertNonProductionJsonAllowed(env, "savePersistentState");
+  const dataDir = getPersistentDataDir(env);
+  const stateFile = getPersistentStateFile(env);
   try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
     }
-    const tempFile = `${STATE_FILE}.tmp.${Date.now()}`;
+    const tempFile = `${stateFile}.tmp.${Date.now()}`;
     fs.writeFileSync(tempFile, JSON.stringify(state, null, 2), "utf-8");
-    fs.renameSync(tempFile, STATE_FILE);
+    fs.renameSync(tempFile, stateFile);
   } catch (err) {
     console.error("[Payments Server] Error saving persistent state:", err);
   }

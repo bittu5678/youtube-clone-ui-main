@@ -14,22 +14,9 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     jsonResponse(['success' => false, 'error' => 'Method Not Allowed'], 405);
 }
 
+$isProduction = isAdmobProductionEnv();
 $pdo = getDatabaseConnection();
-$authUser = getAuthUser($pdo);
-
-if (!$authUser) {
-    jsonResponse([
-        'success' => false,
-        'error' => 'Authentication required. Please provide a valid Bearer session token.'
-    ], 401);
-}
-
-if (strtolower($authUser['role'] ?? '') !== 'admin') {
-    jsonResponse([
-        'success' => false,
-        'error' => 'Admin authorization required.'
-    ], 403);
-}
+$authUser = requireAdmobAdminAuth($pdo);
 
 try {
     $stmt = $pdo->query('
@@ -55,7 +42,11 @@ try {
         ]);
     }
 } catch (PDOException $e) {
-    // Return disconnected on database or table uninitialized state
+    error_log('[AdMob OAuth] MySQL status query error: ' . $e->getMessage());
+    jsonResponse([
+        'success' => false,
+        'error' => 'AdMob database table is uninitialized or inaccessible. Please run database migrations before connecting.'
+    ], $isProduction ? 503 : 500);
 }
 
 jsonResponse([

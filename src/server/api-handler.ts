@@ -23,6 +23,9 @@ import {
   type RefundRequestRecord,
   isFailClosedProductionEnv,
   isProductionRuntimeEnv,
+  isTestRuntimeEnv,
+  getExplicitTestDataDir,
+  getPersistentStateFile,
   parseStrictBooleanFlag,
 } from "./payments.ts";
 
@@ -36,7 +39,15 @@ import {
 import { handleAdminRecoverPremiumPayment } from "./premium-recovery.ts";
 
 const DATA_DIR = path.resolve(process.cwd(), "data");
-const STORE_FILE = path.join(DATA_DIR, "facetube_store.json");
+
+function getStoreDir(env?: Record<string, string | undefined>): string {
+  const testDir = getExplicitTestDataDir(env);
+  return testDir || DATA_DIR;
+}
+
+function getStoreFilePath(env?: Record<string, string | undefined>): string {
+  return path.join(getStoreDir(env), "facetube_store.json");
+}
 
 /**
  * Safely evaluates whether an ad promotion is currently active.
@@ -998,10 +1009,12 @@ function getInitialStore(): ServerStore {
 
 let inMemoryStore: ServerStore | null = null;
 let lastLoadedMtime = 0;
+let lastLoadedStorePath = "";
 
 export function resetInMemoryStore(): void {
   inMemoryStore = null;
   lastLoadedMtime = 0;
+  lastLoadedStorePath = "";
 }
 
 function createEmptyStoreForProduction(): ServerStore {
@@ -1040,15 +1053,17 @@ function loadStore(env?: Record<string, string | undefined>): ServerStore {
   if (isProductionRuntimeEnv(env)) {
     return createEmptyStoreForProduction();
   }
+  const storeFile = getStoreFilePath(env);
   try {
-    if (fs.existsSync(STORE_FILE)) {
-      const stats = fs.statSync(STORE_FILE);
-      if (inMemoryStore && stats.mtimeMs <= lastLoadedMtime) {
+    if (fs.existsSync(storeFile)) {
+      const stats = fs.statSync(storeFile);
+      if (inMemoryStore && lastLoadedStorePath === storeFile && stats.mtimeMs <= lastLoadedMtime) {
         return inMemoryStore;
       }
-      const content = fs.readFileSync(STORE_FILE, "utf-8");
+      const content = fs.readFileSync(storeFile, "utf-8");
       inMemoryStore = JSON.parse(content);
       lastLoadedMtime = stats.mtimeMs;
+      lastLoadedStorePath = storeFile;
       if (inMemoryStore) {
         if (!inMemoryStore.liveStreams) inMemoryStore.liveStreams = [];
         if (!inMemoryStore.liveChatMessages) inMemoryStore.liveChatMessages = [];
@@ -1111,15 +1126,29 @@ function saveStore(store: ServerStore, env?: Record<string, string | undefined>)
   if (isProductionRuntimeEnv(env)) {
     throw new Error("JSON store persistence (data/facetube_store.json) is disabled in production.");
   }
+  const storeDir = getStoreDir(env);
+  const storeFile = getStoreFilePath(env);
   inMemoryStore = store;
   try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(storeDir)) {
+      fs.mkdirSync(storeDir, { recursive: true });
     }
-    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), "utf-8");
+    fs.writeFileSync(storeFile, JSON.stringify(store, null, 2), "utf-8");
+    lastLoadedStorePath = storeFile;
     lastLoadedMtime = Date.now();
   } catch (err) {
     console.warn("[FaceTube Store] Could not persist store file", err);
+  }
+}
+
+function assertTestStoreIsolationConfigured(
+  env: Record<string, string | undefined> | undefined,
+  helperName: string,
+): void {
+  if (!isProductionRuntimeEnv(env) && isTestRuntimeEnv(env) && !getExplicitTestDataDir(env)) {
+    throw new Error(
+      `[FaceTube Store] ${helperName} requires an isolated test directory (via setTestPersistentDataDir or FACETUBE_TEST_DATA_DIR) so protected data/facetube_store.json is never modified.`,
+    );
   }
 }
 
@@ -1128,6 +1157,7 @@ export function resetStoreForTests(
   balance = 50000,
   env?: Record<string, string | undefined>,
 ): void {
+  assertTestStoreIsolationConfigured(env, "resetStoreForTests");
   const s = loadStore(env);
   const todayPrefix = new Date().toISOString().split("T")[0];
   if (userId) {
@@ -1160,11 +1190,36 @@ export function resetStoreForTests(
       });
     }
   } else {
+    if (!s.wallets) s.wallets = {};
     if (Array.isArray(s.walletTransactions)) {
       s.walletTransactions = s.walletTransactions.filter((tx: any) => {
         const d = String(tx.created_at || tx.createdAt || "").split("T")[0];
         return d !== todayPrefix;
       });
+    }
+    if (!s.wallets["FT102857"]) {
+      s.wallets["FT102857"] = {
+        balance,
+        total_earned: balance,
+        total_withdrawn: 0,
+        referral_income: 0,
+        global_income: 0,
+        adsense_income: 0,
+        affiliate_income: 0,
+        updated_at: new Date().toISOString(),
+      };
+    }
+    if (!s.wallets["FT483921"]) {
+      s.wallets["FT483921"] = {
+        balance: 50,
+        total_earned: 50,
+        total_withdrawn: 0,
+        referral_income: 0,
+        global_income: 0,
+        adsense_income: 0,
+        affiliate_income: 0,
+        updated_at: new Date().toISOString(),
+      };
     }
     for (const uid of Object.keys(s.wallets || {})) {
       if (s.wallets[uid]) {
@@ -1187,6 +1242,7 @@ export function setStoreWalletBalance(
   balance: number,
   env?: Record<string, string | undefined>,
 ): void {
+  assertTestStoreIsolationConfigured(env, "setStoreWalletBalance");
   const s = loadStore(env);
   const norm = userId.trim().toUpperCase();
   if (!s.wallets) s.wallets = {};
@@ -2380,6 +2436,115 @@ export async function handleApiRequest(
           const conn = await pool.getConnection();
           let premiumLockAcquired = false;
           let inTx = false;
+
+          const buildDuplicateDistribution = async (existingTx: any) => {
+            const existingPaymentId = String(existingTx.payment_id || "").trim();
+            const isDupPremium = existingTx.purpose === "premium_video_upload";
+            const isDupSpec = Boolean(existingTx.is_special);
+            const dupGlobalPoolAmt = Number(existingTx.global_pool_allocation) || 0;
+            const dupReferralAmt = Number(existingTx.referral_commission) || 0;
+
+            let dupEligibleVideoCount: number | null = 0;
+            let dupDistinctCreatorCount: number | null = 0;
+            let dupPerMemberShare: number | null = 0;
+
+            if (isDupPremium && !isDupSpec && dupGlobalPoolAmt > 0) {
+              dupEligibleVideoCount = null;
+              dupDistinctCreatorCount = null;
+              dupPerMemberShare = null;
+              try {
+                const likePrefix = `${`TX_GLB_${existingPaymentId}_`.replace(/[!%_]/g, "!$&")}%`;
+                const [glbRows]: any = await conn.query(
+                  `SELECT user_id, amount
+                   FROM income_ledger
+                   WHERE transaction_id LIKE ? ESCAPE '!' AND income_type = 'global_income'
+                   ORDER BY created_at ASC, id ASC`,
+                  [likePrefix],
+                );
+                if (Array.isArray(glbRows) && glbRows.length > 0) {
+                  dupEligibleVideoCount = glbRows.length;
+                  dupDistinctCreatorCount = new Set(
+                    glbRows
+                      .map((r: any) =>
+                        String(r.user_id || "")
+                          .trim()
+                          .toUpperCase(),
+                      )
+                      .filter((uid: string) => uid.length > 0),
+                  ).size;
+                  dupPerMemberShare = Number(glbRows[0]?.amount) || 0;
+                }
+              } catch {
+                // Leave counts null rather than inventing values when ledger metadata cannot be read
+              }
+            }
+
+            let dupReferrerId: string | null = null;
+            if (existingPaymentId) {
+              if (isDupPremium) {
+                let resolvedFromPremiumTx = false;
+                try {
+                  const [ptRefRows]: any = await conn.query(
+                    `SELECT referrer_id FROM premium_transactions WHERE payment_id = ? LIMIT 1`,
+                    [existingPaymentId],
+                  );
+                  if (Array.isArray(ptRefRows) && ptRefRows.length > 0) {
+                    const ptRef = String(ptRefRows[0]?.referrer_id || "").trim();
+                    if (ptRef) {
+                      dupReferrerId = ptRef;
+                      resolvedFromPremiumTx = true;
+                    } else if (dupReferralAmt <= 0) {
+                      dupReferrerId = null;
+                      resolvedFromPremiumTx = true;
+                    }
+                  }
+                } catch {
+                  // Optional table or read error; fall through to ledger lookup if referral commission > 0
+                }
+
+                if (!resolvedFromPremiumTx && dupReferralAmt > 0) {
+                  try {
+                    const [refLedgerRows]: any = await conn.query(
+                      `SELECT user_id FROM income_ledger WHERE transaction_id = ? LIMIT 1`,
+                      [`TX_REF_${existingPaymentId}`],
+                    );
+                    const ledgerRef = String(refLedgerRows?.[0]?.user_id || "").trim();
+                    if (ledgerRef) {
+                      dupReferrerId = ledgerRef;
+                    }
+                  } catch {
+                    // Leave referrerId null rather than inventing payer user_id
+                  }
+                }
+              } else if (dupReferralAmt > 0) {
+                try {
+                  const [adsRefRows]: any = await conn.query(
+                    `SELECT user_id FROM income_ledger WHERE transaction_id = ? LIMIT 1`,
+                    [`TX_ADS_L1_${existingPaymentId}`],
+                  );
+                  const adsRef = String(adsRefRows?.[0]?.user_id || "").trim();
+                  if (adsRef) {
+                    dupReferrerId = adsRef;
+                  }
+                } catch {
+                  // Leave referrerId null rather than inventing payer user_id
+                }
+              }
+            }
+
+            return {
+              directReferralAmount: dupReferralAmt,
+              referrerId: dupReferrerId,
+              adminAmount: Number(existingTx.admin_allocation) || 0,
+              globalPoolAmount: dupGlobalPoolAmt,
+              eligibleMembersCount: dupEligibleVideoCount,
+              eligibleVideoCount: dupEligibleVideoCount,
+              distinctCreatorCount: dupDistinctCreatorCount,
+              perMemberShare: dupPerMemberShare,
+              totalReferralAmount: dupReferralAmt,
+            };
+          };
+
           try {
             if (isPremiumUploadPurpose) {
               let acquired = 0;
@@ -2417,114 +2582,6 @@ export async function handleApiRequest(
 
             await conn.beginTransaction();
             inTx = true;
-
-            const buildDuplicateDistribution = async (existingTx: any) => {
-              const existingPaymentId = String(existingTx.payment_id || "").trim();
-              const isDupPremium = existingTx.purpose === "premium_video_upload";
-              const isDupSpec = Boolean(existingTx.is_special);
-              const dupGlobalPoolAmt = Number(existingTx.global_pool_allocation) || 0;
-              const dupReferralAmt = Number(existingTx.referral_commission) || 0;
-
-              let dupEligibleVideoCount: number | null = 0;
-              let dupDistinctCreatorCount: number | null = 0;
-              let dupPerMemberShare: number | null = 0;
-
-              if (isDupPremium && !isDupSpec && dupGlobalPoolAmt > 0) {
-                dupEligibleVideoCount = null;
-                dupDistinctCreatorCount = null;
-                dupPerMemberShare = null;
-                try {
-                  const likePrefix = `${`TX_GLB_${existingPaymentId}_`.replace(/[!%_]/g, "!$&")}%`;
-                  const [glbRows]: any = await conn.query(
-                    `SELECT user_id, amount
-                     FROM income_ledger
-                     WHERE transaction_id LIKE ? ESCAPE '!' AND income_type = 'global_income'
-                     ORDER BY created_at ASC, id ASC`,
-                    [likePrefix],
-                  );
-                  if (Array.isArray(glbRows) && glbRows.length > 0) {
-                    dupEligibleVideoCount = glbRows.length;
-                    dupDistinctCreatorCount = new Set(
-                      glbRows
-                        .map((r: any) =>
-                          String(r.user_id || "")
-                            .trim()
-                            .toUpperCase(),
-                        )
-                        .filter((uid: string) => uid.length > 0),
-                    ).size;
-                    dupPerMemberShare = Number(glbRows[0]?.amount) || 0;
-                  }
-                } catch {
-                  // Leave counts null rather than inventing values when ledger metadata cannot be read
-                }
-              }
-
-              let dupReferrerId: string | null = null;
-              if (existingPaymentId) {
-                if (isDupPremium) {
-                  let resolvedFromPremiumTx = false;
-                  try {
-                    const [ptRefRows]: any = await conn.query(
-                      `SELECT referrer_id FROM premium_transactions WHERE payment_id = ? LIMIT 1`,
-                      [existingPaymentId],
-                    );
-                    if (Array.isArray(ptRefRows) && ptRefRows.length > 0) {
-                      const ptRef = String(ptRefRows[0]?.referrer_id || "").trim();
-                      if (ptRef) {
-                        dupReferrerId = ptRef;
-                        resolvedFromPremiumTx = true;
-                      } else if (dupReferralAmt <= 0) {
-                        dupReferrerId = null;
-                        resolvedFromPremiumTx = true;
-                      }
-                    }
-                  } catch {
-                    // Optional table or read error; fall through to ledger lookup if referral commission > 0
-                  }
-
-                  if (!resolvedFromPremiumTx && dupReferralAmt > 0) {
-                    try {
-                      const [refLedgerRows]: any = await conn.query(
-                        `SELECT user_id FROM income_ledger WHERE transaction_id = ? LIMIT 1`,
-                        [`TX_REF_${existingPaymentId}`],
-                      );
-                      const ledgerRef = String(refLedgerRows?.[0]?.user_id || "").trim();
-                      if (ledgerRef) {
-                        dupReferrerId = ledgerRef;
-                      }
-                    } catch {
-                      // Leave referrerId null rather than inventing payer user_id
-                    }
-                  }
-                } else if (dupReferralAmt > 0) {
-                  try {
-                    const [adsRefRows]: any = await conn.query(
-                      `SELECT user_id FROM income_ledger WHERE transaction_id = ? LIMIT 1`,
-                      [`TX_ADS_L1_${existingPaymentId}`],
-                    );
-                    const adsRef = String(adsRefRows?.[0]?.user_id || "").trim();
-                    if (adsRef) {
-                      dupReferrerId = adsRef;
-                    }
-                  } catch {
-                    // Leave referrerId null rather than inventing payer user_id
-                  }
-                }
-              }
-
-              return {
-                directReferralAmount: dupReferralAmt,
-                referrerId: dupReferrerId,
-                adminAmount: Number(existingTx.admin_allocation) || 0,
-                globalPoolAmount: dupGlobalPoolAmt,
-                eligibleMembersCount: dupEligibleVideoCount,
-                eligibleVideoCount: dupEligibleVideoCount,
-                distinctCreatorCount: dupDistinctCreatorCount,
-                perMemberShare: dupPerMemberShare,
-                totalReferralAmount: dupReferralAmt,
-              };
-            };
 
             // Check duplicate under row lock
             const [existingRows]: any = await conn.query(
@@ -6252,11 +6309,11 @@ export async function handleApiRequest(
 
   if (route === "wallet/global-pool-summary") {
     if (method === "GET") {
-      const qExcludeUserId = (
-        url.searchParams.get("excludeUserId") ||
-        url.searchParams.get("exclude_user_id") ||
+      const qRequestedUserId = (
         url.searchParams.get("userId") ||
         url.searchParams.get("user_id") ||
+        url.searchParams.get("excludeUserId") ||
+        url.searchParams.get("exclude_user_id") ||
         ""
       ).trim();
 
@@ -6270,7 +6327,7 @@ export async function handleApiRequest(
       if (earlyResponse) {
         return earlyResponse;
       }
-      const auth = requireAuth(authUser, qExcludeUserId || null);
+      const auth = requireAuth(authUser, qRequestedUserId || null);
       if (!auth.success) {
         return auth.response;
       }
@@ -6286,7 +6343,7 @@ export async function handleApiRequest(
         );
       }
 
-      const normExclude = auth.effectiveUserId.trim().toUpperCase();
+      const normUserId = auth.effectiveUserId.trim().toUpperCase();
       const poolPaise = 300;
 
       if (pool) {
@@ -6295,39 +6352,52 @@ export async function handleApiRequest(
             "(video_type = 'premium' OR payment_status = 'paid')",
             "(is_blocked = 0 OR is_blocked IS NULL)",
           ];
-          const params: any[] = [];
-          if (normExclude) {
-            whereClauses.push("UPPER(user_id) != UPPER(?)");
-            params.push(normExclude);
-          }
 
           const [rows]: any = await pool.query(
             `SELECT
                COUNT(*) AS eligible_video_count,
                COUNT(DISTINCT UPPER(TRIM(user_id))) AS distinct_creator_count,
-               COALESCE(SUM(GREATEST(0, COALESCE(ad_earnings, 0))), 0) AS total_ad_earnings
+               COALESCE(SUM(GREATEST(0, COALESCE(ad_earnings, 0))), 0) AS total_ad_earnings,
+               COALESCE(SUM(CASE WHEN UPPER(user_id) = UPPER(?) THEN 1 ELSE 0 END), 0) AS user_eligible_video_count,
+               COALESCE(SUM(CASE WHEN UPPER(user_id) = UPPER(?) THEN GREATEST(0, COALESCE(ad_earnings, 0)) ELSE 0 END), 0) AS user_total_ad_earnings
              FROM uploaded_videos
              WHERE ${whereClauses.join(" AND ")}`,
-            params,
+            [normUserId, normUserId],
           );
 
           const row = rows?.[0] || {};
-          const eligibleVideoCount = Math.max(0, Number(row.eligible_video_count) || 0);
-          const distinctCreatorCount = Math.max(0, Number(row.distinct_creator_count) || 0);
-          const totalAdEarnings = Math.round((Number(row.total_ad_earnings) || 0) * 100) / 100;
+          const platformEligibleVideoCount = Math.max(0, Number(row.eligible_video_count) || 0);
+          const platformDistinctCreatorCount = Math.max(0, Number(row.distinct_creator_count) || 0);
+          const platformTotalAdEarnings =
+            Math.round((Number(row.total_ad_earnings) || 0) * 100) / 100;
+          const userEligibleVideoCount = Math.max(0, Number(row.user_eligible_video_count) || 0);
+          const userTotalAdEarnings =
+            Math.round((Number(row.user_total_ad_earnings) || 0) * 100) / 100;
+          const weightingMode =
+            platformTotalAdEarnings > 0 ? "ad_earnings_weighted" : "equal_fallback";
           const estimatedEqualSharePerVideo =
-            eligibleVideoCount > 0 ? Math.floor(poolPaise / eligibleVideoCount) / 100 : 0;
+            weightingMode === "equal_fallback"
+              ? platformEligibleVideoCount > 0
+                ? Math.floor(poolPaise / platformEligibleVideoCount) / 100
+                : 0
+              : null;
 
           return jsonResponse({
             success: true,
-            excludedUserId: normExclude || null,
+            userId: normUserId || null,
+            excludedUserId: null,
             poolAmount: 3.0,
             poolPaise,
-            eligibleVideoCount,
-            distinctCreatorCount,
+            eligibleVideoCount: platformEligibleVideoCount,
+            platformEligibleVideoCount,
+            distinctCreatorCount: platformDistinctCreatorCount,
+            platformDistinctCreatorCount,
+            totalAdEarnings: platformTotalAdEarnings,
+            platformTotalAdEarnings,
+            userEligibleVideoCount,
+            userTotalAdEarnings,
             estimatedEqualSharePerVideo,
-            totalAdEarnings,
-            weightingMode: totalAdEarnings > 0 ? "ad_earnings_weighted" : "equal_fallback",
+            weightingMode,
           });
         } catch (dbErr: any) {
           return jsonResponse(
@@ -6342,16 +6412,18 @@ export async function handleApiRequest(
 
       // Non-production JSON store path (only reachable when !isProd && !pool)
       const eligibleVideos = (store.videos || []).filter(
-        (v) =>
-          (v.video_type === "premium" || v.payment_status === "paid") &&
-          !v.is_blocked &&
-          (!normExclude ||
-            String(v.user_id || "")
-              .trim()
-              .toUpperCase() !== normExclude),
+        (v) => (v.video_type === "premium" || v.payment_status === "paid") && !v.is_blocked,
       );
-      const eligibleVideoCount = eligibleVideos.length;
-      const distinctCreatorCount = new Set(
+      const userEligibleVideos = normUserId
+        ? eligibleVideos.filter(
+            (v) =>
+              String(v.user_id || "")
+                .trim()
+                .toUpperCase() === normUserId,
+          )
+        : [];
+      const platformEligibleVideoCount = eligibleVideos.length;
+      const platformDistinctCreatorCount = new Set(
         eligibleVideos
           .map((v) =>
             String(v.user_id || "")
@@ -6360,23 +6432,40 @@ export async function handleApiRequest(
           )
           .filter((uid) => uid.length > 0),
       ).size;
-      const totalAdEarnings =
+      const platformTotalAdEarnings =
         Math.round(
           eligibleVideos.reduce((sum, v) => sum + Math.max(0, Number(v.ad_earnings) || 0), 0) * 100,
         ) / 100;
+      const userEligibleVideoCount = userEligibleVideos.length;
+      const userTotalAdEarnings =
+        Math.round(
+          userEligibleVideos.reduce((sum, v) => sum + Math.max(0, Number(v.ad_earnings) || 0), 0) *
+            100,
+        ) / 100;
+      const weightingMode = platformTotalAdEarnings > 0 ? "ad_earnings_weighted" : "equal_fallback";
       const estimatedEqualSharePerVideo =
-        eligibleVideoCount > 0 ? Math.floor(poolPaise / eligibleVideoCount) / 100 : 0;
+        weightingMode === "equal_fallback"
+          ? platformEligibleVideoCount > 0
+            ? Math.floor(poolPaise / platformEligibleVideoCount) / 100
+            : 0
+          : null;
 
       return jsonResponse({
         success: true,
-        excludedUserId: normExclude || null,
+        userId: normUserId || null,
+        excludedUserId: null,
         poolAmount: 3.0,
         poolPaise,
-        eligibleVideoCount,
-        distinctCreatorCount,
+        eligibleVideoCount: platformEligibleVideoCount,
+        platformEligibleVideoCount,
+        distinctCreatorCount: platformDistinctCreatorCount,
+        platformDistinctCreatorCount,
+        totalAdEarnings: platformTotalAdEarnings,
+        platformTotalAdEarnings,
+        userEligibleVideoCount,
+        userTotalAdEarnings,
         estimatedEqualSharePerVideo,
-        totalAdEarnings,
-        weightingMode: totalAdEarnings > 0 ? "ad_earnings_weighted" : "equal_fallback",
+        weightingMode,
       });
     }
   }
@@ -10766,7 +10855,7 @@ export async function handleApiRequest(
     if (!isProd && allFormatted.length === 0) {
       let persistentFound = false;
       try {
-        const premiumPath = path.resolve(process.cwd(), "data", "premium_transactions.json");
+        const premiumPath = getPersistentStateFile(env);
         if (fs.existsSync(premiumPath)) {
           const content = JSON.parse(fs.readFileSync(premiumPath, "utf-8"));
           if (Array.isArray(content.userSubscriptions)) {
@@ -10997,7 +11086,7 @@ export async function handleApiRequest(
     if (!isProd && allSubs.length === 0) {
       let persistentFound = false;
       try {
-        const premiumPath = path.resolve(process.cwd(), "data", "premium_transactions.json");
+        const premiumPath = getPersistentStateFile(env);
         if (fs.existsSync(premiumPath)) {
           const content = JSON.parse(fs.readFileSync(premiumPath, "utf-8"));
           if (Array.isArray(content.userSubscriptions)) {
@@ -11169,7 +11258,7 @@ export async function handleApiRequest(
 
       if (!foundSub) {
         try {
-          const premiumPath = path.resolve(process.cwd(), "data", "premium_transactions.json");
+          const premiumPath = getPersistentStateFile(env);
           if (fs.existsSync(premiumPath)) {
             const content = JSON.parse(fs.readFileSync(premiumPath, "utf-8"));
             if (Array.isArray(content.userSubscriptions)) {
@@ -12990,10 +13079,117 @@ export async function handleApiRequest(
     return String(process.env[key] ?? "").trim();
   }
 
+  const CANONICAL_ADMOB_REDIRECT_URI = "https://facetube.online/api/admin/admob/oauth-callback";
+  const TRUSTED_ADMOB_REDIRECT_HOSTS = new Set([
+    "facetube.online",
+    "www.facetube.online",
+    "api.facetube.online",
+  ]);
+  const TRUSTED_ADMOB_REDIRECT_PATHS = new Set([
+    "/api/admin/admob/oauth-callback",
+    "/api/admin/admob/oauth-callback.php",
+  ]);
+
+  function validateAdmobEncryptionKey(isProdMode = isProd): {
+    valid: boolean;
+    key: string | null;
+    reason: "ok" | "missing" | "too_short";
+    error: string | null;
+  } {
+    const key = readAdmobEnv("ADMOB_ENCRYPTION_KEY");
+    if (!key) {
+      return {
+        valid: false,
+        key: null,
+        reason: "missing",
+        error:
+          "Google AdMob encryption key is not configured. Please define ADMOB_ENCRYPTION_KEY in your server environment.",
+      };
+    }
+    if (isProdMode && Buffer.byteLength(key, "utf8") < 32) {
+      return {
+        valid: false,
+        key: null,
+        reason: "too_short",
+        error:
+          "Google AdMob encryption key (ADMOB_ENCRYPTION_KEY) must be at least 32 bytes in production.",
+      };
+    }
+    return { valid: true, key, reason: "ok", error: null };
+  }
+
+  function validateAdmobRedirectUri(
+    rawRedirectUri: string,
+    isProdMode = isProd,
+  ): {
+    valid: boolean;
+    redirectUri: string;
+    error: string | null;
+  } {
+    const trimmed = String(rawRedirectUri || "").trim();
+    if (!trimmed) {
+      if (isProdMode) {
+        return {
+          valid: false,
+          redirectUri: "",
+          error:
+            "Google AdMob OAuth redirect URI (ADMOB_OAUTH_REDIRECT_URI) is not configured in production.",
+        };
+      }
+      return {
+        valid: true,
+        redirectUri: CANONICAL_ADMOB_REDIRECT_URI,
+        error: null,
+      };
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return {
+        valid: false,
+        redirectUri: "",
+        error: "Invalid ADMOB_OAUTH_REDIRECT_URI configuration.",
+      };
+    }
+
+    if (parsed.username || parsed.password || parsed.hash) {
+      return {
+        valid: false,
+        redirectUri: "",
+        error: "Untrusted ADMOB_OAUTH_REDIRECT_URI configuration.",
+      };
+    }
+
+    if (isProdMode) {
+      const host = parsed.hostname.toLowerCase();
+      if (
+        parsed.protocol !== "https:" ||
+        parsed.search !== "" ||
+        !TRUSTED_ADMOB_REDIRECT_HOSTS.has(host) ||
+        !TRUSTED_ADMOB_REDIRECT_PATHS.has(parsed.pathname)
+      ) {
+        return {
+          valid: false,
+          redirectUri: "",
+          error: "Untrusted ADMOB_OAUTH_REDIRECT_URI configuration for production environment.",
+        };
+      }
+    } else if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return {
+        valid: false,
+        redirectUri: "",
+        error: "Invalid ADMOB_OAUTH_REDIRECT_URI scheme.",
+      };
+    }
+
+    return { valid: true, redirectUri: trimmed, error: null };
+  }
+
   // Helper functions for AdMob AES-256-GCM encryption & HMAC-signed state
   function getAdmobEncryptionKey(): string | null {
-    const key = readAdmobEnv("ADMOB_ENCRYPTION_KEY");
-    return key ? key : null;
+    return validateAdmobEncryptionKey(isProd).key;
   }
 
   function encryptAdmobSecretGCM(
@@ -13140,7 +13336,7 @@ export async function handleApiRequest(
         401,
       );
     }
-    if (authUser.role !== "admin") {
+    if (String(authUser.role || "").toLowerCase() !== "admin") {
       return jsonResponse(
         {
           success: false,
@@ -13152,9 +13348,10 @@ export async function handleApiRequest(
 
     const clientId = readAdmobEnv("ADMOB_OAUTH_CLIENT_ID");
     const clientSecret = readAdmobEnv("ADMOB_OAUTH_CLIENT_SECRET");
-    const redirectUri =
-      readAdmobEnv("ADMOB_OAUTH_REDIRECT_URI") ||
-      "https://facetube.online/api/admin/admob/oauth-callback";
+    const redirectCheck = validateAdmobRedirectUri(
+      readAdmobEnv("ADMOB_OAUTH_REDIRECT_URI"),
+      isProd,
+    );
 
     if (!clientId || !clientSecret) {
       return jsonResponse(
@@ -13164,23 +13361,39 @@ export async function handleApiRequest(
           error:
             "Google AdMob OAuth credentials are not configured. Please define ADMOB_OAUTH_CLIENT_ID and ADMOB_OAUTH_CLIENT_SECRET in your server environment.",
         },
-        200,
+        isProd ? 500 : 200,
       );
     }
 
-    // Fix B: Fail closed if ADMOB_ENCRYPTION_KEY is missing
-    const secretKey = getAdmobEncryptionKey();
-    if (!secretKey) {
+    if (!redirectCheck.valid) {
       return jsonResponse(
         {
           success: false,
           configured: false,
           error:
-            "Google AdMob encryption key is not configured. Please define ADMOB_ENCRYPTION_KEY in your server environment.",
+            redirectCheck.error ||
+            "Google AdMob OAuth redirect URI (ADMOB_OAUTH_REDIRECT_URI) is missing or untrusted.",
         },
-        200,
+        500,
       );
     }
+    const redirectUri = redirectCheck.redirectUri;
+
+    // Fix B: Fail closed if ADMOB_ENCRYPTION_KEY is missing or < 32 bytes in production
+    const keyCheck = validateAdmobEncryptionKey(isProd);
+    if (!keyCheck.valid || !keyCheck.key) {
+      return jsonResponse(
+        {
+          success: false,
+          configured: false,
+          error:
+            keyCheck.error ||
+            "Google AdMob encryption key is not configured. Please define ADMOB_ENCRYPTION_KEY in your server environment.",
+        },
+        isProd || keyCheck.reason === "too_short" ? 500 : 200,
+      );
+    }
+    const secretKey = keyCheck.key;
 
     // Phase 2.4: Cryptographically random 32-byte binding secret (NEVER put raw Admin session token in cookie)
     const bindingSecret = crypto.randomBytes(32).toString("hex");
@@ -13196,10 +13409,7 @@ export async function handleApiRequest(
 
     const state = generateAdmobOAuthState(authUser.user_id, nonce, secretKey);
     const stateHash = crypto.createHash("sha256").update(state).digest("hex");
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
-      .toISOString()
-      .slice(0, 19)
-      .replace("T", " ");
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     const isDbConfigured = Boolean(pool) || getDbConfig(env).isConfigured;
     if (isDbConfigured) {
@@ -13215,8 +13425,8 @@ export async function handleApiRequest(
       }
       try {
         await pool.query(
-          "INSERT INTO admob_oauth_states (nonce, user_id, session_hash, admin_session_hash, state_hash, is_consumed, expires_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
-          [nonce, authUser.user_id, sessionHash, adminTokenHash, stateHash, expiresAt],
+          "INSERT INTO admob_oauth_states (nonce, user_id, session_hash, admin_session_hash, state_hash, is_consumed, expires_at) VALUES (?, ?, ?, ?, ?, 0, DATE_ADD(NOW(), INTERVAL 10 MINUTE))",
+          [nonce, authUser.user_id, sessionHash, adminTokenHash, stateHash],
         );
       } catch (err: any) {
         console.warn("[AdMob OAuth] MySQL state insert error:", err.message);
@@ -13370,17 +13580,42 @@ export async function handleApiRequest(
       );
     }
 
-    // Fail closed if ADMOB_ENCRYPTION_KEY is missing
-    const secretKey = getAdmobEncryptionKey();
-    if (!secretKey) {
+    // Fail closed if ADMOB_ENCRYPTION_KEY is missing or too short in production
+    const keyCheck = validateAdmobEncryptionKey(isProd);
+    if (!keyCheck.valid || !keyCheck.key) {
       return reply(
         500,
         {
           success: false,
           error:
-            "Google AdMob encryption key is not configured. Server cannot securely store credentials.",
+            keyCheck.reason === "too_short"
+              ? keyCheck.error
+              : "Google AdMob encryption key is not configured. Server cannot securely store credentials.",
         },
-        "admob_error=" + encodeURIComponent("Google AdMob encryption key is not configured."),
+        "admob_error=" +
+          encodeURIComponent(
+            keyCheck.reason === "too_short"
+              ? "Google AdMob encryption key does not meet minimum length requirements."
+              : "Google AdMob encryption key is not configured.",
+          ),
+      );
+    }
+    const secretKey = keyCheck.key;
+
+    const redirectCheck = validateAdmobRedirectUri(
+      readAdmobEnv("ADMOB_OAUTH_REDIRECT_URI"),
+      isProd,
+    );
+    if (!redirectCheck.valid) {
+      return reply(
+        500,
+        {
+          success: false,
+          error:
+            redirectCheck.error ||
+            "Google AdMob OAuth redirect URI is missing or untrusted in production.",
+        },
+        "admob_error=invalid_redirect_uri",
       );
     }
 
@@ -13406,7 +13641,7 @@ export async function handleApiRequest(
     const stateHash = crypto.createHash("sha256").update(state).digest("hex");
 
     // 1. If caller session belongs to non-admin user, reject immediately
-    if (callerAuthUser && callerAuthUser.role !== "admin") {
+    if (callerAuthUser && String(callerAuthUser.role || "").toLowerCase() !== "admin") {
       return reply(
         403,
         {
@@ -13417,12 +13652,24 @@ export async function handleApiRequest(
       );
     }
 
-    // Resolve initiating session binding from cookie or test header
+    // Resolve initiating session binding from HttpOnly cookie; test headers are permitted ONLY in explicit non-production
     const cookieHeader = request.headers.get("cookie") || "";
     const cookieMatch = cookieHeader.match(/(?:^|;\s*)facetube_admob_oauth_binding=([^;]+)/);
     const cookieSecret = cookieMatch && cookieMatch[1] ? decodeURIComponent(cookieMatch[1]) : "";
-    const testBindingHeader =
+    const rawTestBindingHeader =
       request.headers.get("X-Admob-Binding") || request.headers.get("X-Admob-Binding-Secret") || "";
+    if (isProd && !cookieSecret && rawTestBindingHeader) {
+      return reply(
+        403,
+        {
+          success: false,
+          error:
+            "OAuth state rejected: binding header fallback is disabled in production; initiating session cookie is required.",
+        },
+        "admob_error=missing_session_binding",
+      );
+    }
+    const testBindingHeader = !isProd ? rawTestBindingHeader : "";
     const bindingSecret = cookieSecret || testBindingHeader;
 
     if (!bindingSecret) {
@@ -13679,9 +13926,35 @@ export async function handleApiRequest(
 
     const clientId = readOAuthEnv("ADMOB_OAUTH_CLIENT_ID");
     const clientSecret = readOAuthEnv("ADMOB_OAUTH_CLIENT_SECRET");
-    const redirectUri =
-      readOAuthEnv("ADMOB_OAUTH_REDIRECT_URI") ||
-      "https://facetube.online/api/admin/admob/oauth-callback";
+    const exchangeRedirectCheck = validateAdmobRedirectUri(
+      readOAuthEnv("ADMOB_OAUTH_REDIRECT_URI"),
+      isProduction,
+    );
+    if (!exchangeRedirectCheck.valid) {
+      return reply(
+        500,
+        {
+          success: false,
+          error:
+            exchangeRedirectCheck.error ||
+            "Google AdMob OAuth redirect URI is missing or untrusted in production.",
+        },
+        "admob_error=invalid_redirect_uri",
+      );
+    }
+    const redirectUri = exchangeRedirectCheck.redirectUri;
+
+    if (!clientId || !clientSecret) {
+      return reply(
+        500,
+        {
+          success: false,
+          error:
+            "Google AdMob OAuth credentials are not configured. Please define ADMOB_OAUTH_CLIENT_ID and ADMOB_OAUTH_CLIENT_SECRET.",
+        },
+        "admob_error=oauth_not_configured",
+      );
+    }
 
     let accessToken = "";
     let refreshToken = "";
@@ -13983,7 +14256,7 @@ export async function handleApiRequest(
         401,
       );
     }
-    if (authUser.role !== "admin") {
+    if (String(authUser.role || "").toLowerCase() !== "admin") {
       return jsonResponse({ success: false, error: "Admin authorization required." }, 403);
     }
 
@@ -14102,12 +14375,13 @@ export async function handleApiRequest(
         401,
       );
     }
-    if (authUser.role !== "admin") {
+    if (String(authUser.role || "").toLowerCase() !== "admin") {
       return jsonResponse({ success: false, error: "Admin authorization required." }, 403);
     }
 
-    const secretKey = getAdmobEncryptionKey();
-    let credRow: any = null;
+    const keyCheck = validateAdmobEncryptionKey(isProd);
+    const secretKey = keyCheck.key;
+    let activeRows: any[] = [];
     const isDbConfigured = Boolean(pool) || getDbConfig(env).isConfigured;
 
     if (isDbConfigured) {
@@ -14123,9 +14397,11 @@ export async function handleApiRequest(
       }
       try {
         const [rows]: any = await pool.query(
-          "SELECT id, publisher_id, encrypted_refresh_token, refresh_token_iv, refresh_token_tag FROM admob_oauth_credentials WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1",
+          "SELECT id, publisher_id, encrypted_refresh_token, refresh_token_iv, refresh_token_tag FROM admob_oauth_credentials WHERE is_active = 1 ORDER BY updated_at DESC",
         );
-        if (rows && rows.length > 0) credRow = rows[0];
+        if (Array.isArray(rows)) {
+          activeRows = rows;
+        }
       } catch (err: any) {
         console.warn("[AdMob OAuth] MySQL disconnect query error:", err.message);
         return jsonResponse(
@@ -14148,38 +14424,108 @@ export async function handleApiRequest(
           503,
         );
       }
-      if ((store as any).admobOauth) {
-        credRow = (store as any).admobOauth;
+      const localOauth = (store as any).admobOauth;
+      if (localOauth && Number(localOauth.is_active) === 1) {
+        activeRows = [localOauth];
       }
     }
 
-    if (credRow) {
-      const refreshToken = decryptAdmobSecretGCM(
-        credRow.encrypted_refresh_token,
-        credRow.refresh_token_iv,
-        credRow.refresh_token_tag,
-        secretKey,
-      );
+    let googleRevoked = false;
+    let revocationStatus = "no_active_credentials";
+    let revocationWarning: string | undefined;
 
-      // Attempt Google token revocation if real token
-      if (refreshToken && !refreshToken.startsWith("mock_")) {
-        try {
-          await fetch("https://oauth2.googleapis.com/revoke", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({ token: refreshToken }).toString(),
-          });
-        } catch (_e) {
-          // Continue cleanup even if network revocation throws
+    if (activeRows.length > 0) {
+      if (!keyCheck.valid || !secretKey) {
+        revocationStatus =
+          keyCheck.reason === "too_short" ? "invalid_encryption_key" : "missing_encryption_key";
+        revocationWarning =
+          "Local AdMob credentials were deactivated, but Google token revocation could not be performed because ADMOB_ENCRYPTION_KEY is missing or invalid.";
+      } else {
+        let decryptFailedCount = 0;
+        let mockTokenCount = 0;
+        let realRevokedCount = 0;
+        let upstreamFailedCount = 0;
+        const seenTokens = new Set<string>();
+
+        for (const credRow of activeRows) {
+          const refreshToken = decryptAdmobSecretGCM(
+            credRow.encrypted_refresh_token,
+            credRow.refresh_token_iv,
+            credRow.refresh_token_tag,
+            secretKey,
+          );
+
+          if (!refreshToken) {
+            decryptFailedCount += 1;
+            continue;
+          }
+          if (!isProd && refreshToken.startsWith("mock_")) {
+            mockTokenCount += 1;
+            continue;
+          }
+          if (seenTokens.has(refreshToken)) {
+            continue;
+          }
+          seenTokens.add(refreshToken);
+
+          try {
+            const revokeRes = await fetch("https://oauth2.googleapis.com/revoke", {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: new URLSearchParams({ token: refreshToken }).toString(),
+            });
+            if (revokeRes.ok) {
+              realRevokedCount += 1;
+            } else {
+              upstreamFailedCount += 1;
+            }
+          } catch (_e) {
+            upstreamFailedCount += 1;
+          }
+        }
+
+        if (upstreamFailedCount > 0) {
+          googleRevoked = false;
+          revocationStatus = "upstream_revocation_failed";
+          revocationWarning =
+            "Local AdMob credentials were deactivated, but Google upstream token revocation failed or returned a non-200 response.";
+        } else if (decryptFailedCount > 0 && realRevokedCount === 0) {
+          googleRevoked = false;
+          revocationStatus = "decryption_failed";
+          revocationWarning =
+            "Local AdMob credentials were deactivated, but stored refresh tokens could not be decrypted for Google revocation.";
+        } else if (realRevokedCount > 0 && decryptFailedCount === 0) {
+          googleRevoked = true;
+          revocationStatus = "revoked";
+        } else if (realRevokedCount > 0 && decryptFailedCount > 0) {
+          googleRevoked = false;
+          revocationStatus = "partial_revocation_decryption_failed";
+          revocationWarning =
+            "Local AdMob credentials were deactivated, but at least one stored refresh token could not be decrypted for Google revocation.";
+        } else if (mockTokenCount > 0) {
+          googleRevoked = false;
+          revocationStatus = "mock_token_skipped";
         }
       }
 
-      if (isDbConfigured && pool && credRow.id) {
+      if (isDbConfigured && pool) {
+        const publisherIds = Array.from(
+          new Set(
+            activeRows.map((r) => String(r.publisher_id || "").trim()).filter((p) => p.length > 0),
+          ),
+        );
         try {
-          await pool.query(
-            "UPDATE admob_oauth_credentials SET is_active = 0, encrypted_refresh_token = '', refresh_token_iv = '', refresh_token_tag = '', updated_at = NOW() WHERE id = ?",
-            [credRow.id],
-          );
+          if (publisherIds.length > 0) {
+            const placeholders = publisherIds.map(() => "?").join(", ");
+            await pool.query(
+              `UPDATE admob_oauth_credentials SET is_active = 0, encrypted_refresh_token = '', refresh_token_iv = '', refresh_token_tag = '', updated_at = NOW() WHERE is_active = 1 AND (publisher_id IN (${placeholders}) OR is_active = 1)`,
+              publisherIds,
+            );
+          } else {
+            await pool.query(
+              "UPDATE admob_oauth_credentials SET is_active = 0, encrypted_refresh_token = '', refresh_token_iv = '', refresh_token_tag = '', updated_at = NOW() WHERE is_active = 1",
+            );
+          }
         } catch (err: any) {
           console.warn("[AdMob OAuth] MySQL disconnect update error:", err.message);
           return jsonResponse(
@@ -14199,10 +14545,22 @@ export async function handleApiRequest(
       saveStore(store, env);
     }
 
+    const message =
+      activeRows.length === 0
+        ? "No active Google AdMob OAuth credentials were found."
+        : googleRevoked
+          ? "Google AdMob OAuth credentials disconnected and tokens revoked successfully."
+          : revocationWarning
+            ? "Local AdMob credentials deactivated, but Google token revocation was not confirmed."
+            : "Google AdMob OAuth credentials disconnected locally.";
+
     return jsonResponse({
       success: true,
       connected: false,
-      message: "Google AdMob OAuth credentials disconnected and tokens revoked successfully.",
+      google_revoked: googleRevoked,
+      revocation_status: revocationStatus,
+      ...(revocationWarning ? { warning: revocationWarning } : {}),
+      message,
     });
   }
 

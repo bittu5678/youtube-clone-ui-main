@@ -1,18 +1,21 @@
-import { describe, it, before } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { handleApiRequest } from "./api-handler";
+import { handleApiRequest, resetInMemoryStore } from "./api-handler";
 import {
   createServerPaymentOrder,
   verifyServerPayment,
   resetPersistentPremiumState,
+  setTestPersistentDataDir,
   PRICING_CONFIG,
 } from "./payments";
 import { api } from "../lib/api";
 
 describe("Task 2 - Phase 2B: Paid Subscription Payment Verification & Activation Tests", () => {
+  let testDataDir = "";
   const secret = "test_razorpay_secret_key_sub_987654321";
   const keyId = "rzp_test_sub_key_123456789";
   const testEnv = {
@@ -27,6 +30,10 @@ describe("Task 2 - Phase 2B: Paid Subscription Payment Verification & Activation
   const otherUserId = "FT900431"; // maya@facetube.com
 
   before(async () => {
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-sub-checkout-test-"));
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
+
     // Clean persistent state for test isolation
     await resetPersistentPremiumState(10, [], []);
 
@@ -505,5 +512,14 @@ describe("Task 2 - Phase 2B: Paid Subscription Payment Verification & Activation
       assert.equal(activeData.subscription.userId, standardUserId);
       assert.equal(activeData.subscription.planId, "member-vip-monthly");
     });
+  });
+
+  after(() => {
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+      testDataDir = "";
+    }
   });
 });

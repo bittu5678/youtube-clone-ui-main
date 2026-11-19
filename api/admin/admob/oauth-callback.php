@@ -13,16 +13,23 @@
 
 require_once __DIR__ . '/admob-crypto.php';
 
+$requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+if (!in_array($requestMethod, ['GET', 'POST'], true)) {
+    jsonResponse(['success' => false, 'error' => 'Method Not Allowed'], 405);
+}
+
+$isProduction = isAdmobProductionEnv();
 $pdo = getDatabaseConnection();
-$config = getAdmobOAuthConfig();
-$secretKey = getAdmobEncryptionKey();
+$config = getAdmobOAuthConfig($isProduction);
+$keyCheck = validateAdmobEncryptionKey($isProduction);
+$secretKey = $keyCheck['key'];
 
 $input = getRequestPayload();
 $code = $_GET['code'] ?? ($input['code'] ?? '');
 $state = $_GET['state'] ?? ($input['state'] ?? '');
 $errorParam = $_GET['error'] ?? ($input['error'] ?? '');
 
-$isBrowserGet = ($_SERVER['REQUEST_METHOD'] === 'GET');
+$isBrowserGet = ($requestMethod === 'GET');
 
 function clearBindingCookie() {
     $isHttps = isAdmobHttpsRequest();
@@ -35,16 +42,34 @@ function clearBindingCookie() {
     ]);
 }
 
-// Fix B: Fail closed if encryption key is missing or not configured
-if (empty($secretKey)) {
+// Fix B: Fail closed if encryption key is missing or < 32 bytes in production
+if (!$keyCheck['valid'] || empty($secretKey)) {
     clearBindingCookie();
     if ($isBrowserGet) {
-        header('Location: /admob-income?admob_error=' . urlencode('Google AdMob encryption key is not configured.'));
+        $msg = ($keyCheck['reason'] === 'too_short')
+            ? 'Google AdMob encryption key does not meet minimum length requirements.'
+            : 'Google AdMob encryption key is not configured.';
+        header('Location: /admob-income?admob_error=' . urlencode($msg));
         exit;
     }
     jsonResponse([
         'success' => false,
-        'error' => 'Google AdMob encryption key is not configured. Server cannot securely store credentials.'
+        'error' => ($keyCheck['reason'] === 'too_short')
+            ? $keyCheck['error']
+            : 'Google AdMob encryption key is not configured. Server cannot securely store credentials.'
+    ], 500);
+}
+
+// Fail closed if redirect URI is missing or untrusted in production
+if (!$config['redirectUriValid']) {
+    clearBindingCookie();
+    if ($isBrowserGet) {
+        header('Location: /admob-income?admob_error=invalid_redirect_uri');
+        exit;
+    }
+    jsonResponse([
+        'success' => false,
+        'error' => $config['redirectUriError'] ?? 'Google AdMob OAuth redirect URI is missing or untrusted in production.'
     ], 500);
 }
 
@@ -79,9 +104,61 @@ $stateNonce = $stateCheck['nonce'] ?? '';
 $stateUserId = $stateCheck['userId'] ?? '';
 $stateHash = hash('sha256', $state);
 
+// If caller supplied a Bearer token, reject non-admin callers immediately and fail closed on DB errors
+$callerBearer = getBearerToken();
+if (!empty($callerBearer)) {
+    try {
+        $stmtCaller = $pdo->prepare('
+            SELECT u.role
+            FROM sessions s
+            INNER JOIN users u ON (s.user_id = u.id OR s.user_id = u.user_id)
+            WHERE s.token = ? AND s.expires_at > NOW()
+            LIMIT 1
+        ');
+        $stmtCaller->execute([trim((string)$callerBearer)]);
+        $callerRow = $stmtCaller->fetch() ?: null;
+        if ($callerRow && strtolower((string)($callerRow['role'] ?? '')) !== 'admin') {
+            clearBindingCookie();
+            if ($isBrowserGet) {
+                header('Location: /admob-income?admob_error=not_an_administrator');
+                exit;
+            }
+            jsonResponse([
+                'success' => false,
+                'error' => 'Admin authorization required: Caller is not an administrator.'
+            ], 403);
+        }
+    } catch (PDOException $e) {
+        error_log('[AdMob OAuth] Caller session check DB error: ' . $e->getMessage());
+        clearBindingCookie();
+        if ($isBrowserGet) {
+            header('Location: /admob-income?admob_error=database_error');
+            exit;
+        }
+        jsonResponse([
+            'success' => false,
+            'error' => 'Database connection unavailable while verifying session.'
+        ], 503);
+    }
+}
+
 // 2. Resolve Initiating Session Binding via Random binding_secret
-// Checks cookie first, then fallback header for programmatic API testing
-$bindingSecret = $_COOKIE['facetube_admob_oauth_binding'] ?? ($_SERVER['HTTP_X_ADMOB_BINDING_SECRET'] ?? '');
+// Production strictly requires HttpOnly cookie; test binding headers are permitted ONLY in explicit non-production
+$cookieSecret = $_COOKIE['facetube_admob_oauth_binding'] ?? '';
+$rawTestHeader = $_SERVER['HTTP_X_ADMOB_BINDING'] ?? ($_SERVER['HTTP_X_ADMOB_BINDING_SECRET'] ?? '');
+if ($isProduction && empty($cookieSecret) && !empty($rawTestHeader)) {
+    clearBindingCookie();
+    if ($isBrowserGet) {
+        header('Location: /admob-income?admob_error=missing_session_binding');
+        exit;
+    }
+    jsonResponse([
+        'success' => false,
+        'error' => 'OAuth state rejected: binding header fallback is disabled in production; initiating session cookie is required.'
+    ], 403);
+}
+$testHeaderSecret = !$isProduction ? $rawTestHeader : '';
+$bindingSecret = !empty($cookieSecret) ? $cookieSecret : $testHeaderSecret;
 if (empty($bindingSecret)) {
     clearBindingCookie();
     if ($isBrowserGet) {
@@ -114,6 +191,7 @@ try {
     $stmtAdminSession->execute([$stateNonce, $stateHash, $stateUserId, $callerSessionHash]);
     $adminSessionRow = $stmtAdminSession->fetch();
 } catch (PDOException $e) {
+    error_log('[AdMob OAuth] MySQL session verification error: ' . $e->getMessage());
     clearBindingCookie();
     if ($isBrowserGet) {
         header('Location: /admob-income?admob_error=database_error');
@@ -122,7 +200,7 @@ try {
     jsonResponse([
         'success' => false,
         'error' => 'AdMob database table is uninitialized or inaccessible. Please run database migrations before connecting.'
-    ], 500);
+    ], $isProduction ? 503 : 500);
 }
 
 if (!$adminSessionRow) {
@@ -140,7 +218,6 @@ if (!$adminSessionRow) {
 $expectedAdminSessionHash = $adminSessionRow['admin_session_hash'];
 
 // If caller also sent a Bearer token, verify it matches the initiating admin session token hash
-$callerBearer = getBearerToken();
 if (!empty($callerBearer)) {
     $callerBearerHash = hash('sha256', trim((string)$callerBearer));
     if ($callerBearerHash !== $expectedAdminSessionHash) {
@@ -157,12 +234,6 @@ if (!empty($callerBearer)) {
 }
 
 // 3. Strengthened Atomic Nonce Consumption with Live Session & Role Verification (Zero-TOCTOU):
-// Atomically verifies ALL predicates AND joins the live sessions/users table in a single statement:
-// - nonce, state_hash, user_id, session_hash (SHA-256 binding secret)
-// - admin_session_hash (SHA-256 initiating admin session token)
-// - live session is still present, active, unexpired (s.expires_at > NOW())
-// - initiating admin user role is still 'admin'
-// - is_consumed = 0, expires_at > NOW()
 try {
     $stmtConsume = $pdo->prepare('
         UPDATE admob_oauth_states st
@@ -186,6 +257,7 @@ try {
         $expectedAdminSessionHash
     ]);
 } catch (PDOException $e) {
+    error_log('[AdMob OAuth] MySQL state atomic update error: ' . $e->getMessage());
     clearBindingCookie();
     if ($isBrowserGet) {
         header('Location: /admob-income?admob_error=database_error');
@@ -194,7 +266,7 @@ try {
     jsonResponse([
         'success' => false,
         'error' => 'AdMob database table is uninitialized or inaccessible. Please run database migrations before connecting.'
-    ], 500);
+    ], $isProduction ? 503 : 500);
 }
 
 if ($stmtConsume->rowCount() !== 1) {
@@ -214,7 +286,7 @@ clearBindingCookie();
 
 $adminUserId = $stateUserId;
 
-// 2. Validate Authorization Code
+// 2. Validate Authorization Code & OAuth Client Credentials
 if (empty($code)) {
     if ($isBrowserGet) {
         header('Location: /admob-income?admob_error=missing_code');
@@ -224,6 +296,17 @@ if (empty($code)) {
         'success' => false,
         'error' => 'Missing Google authorization code in callback.'
     ], 400);
+}
+
+if (!$config['isConfigured'] || !$config['redirectUriValid']) {
+    if ($isBrowserGet) {
+        header('Location: /admob-income?admob_error=oauth_not_configured');
+        exit;
+    }
+    jsonResponse([
+        'success' => false,
+        'error' => 'Google AdMob OAuth credentials or redirect URI are not configured.'
+    ], 500);
 }
 
 // 3. Server-Side Token Exchange with Google OAuth 2.0
@@ -243,13 +326,27 @@ curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
     CURLOPT_TIMEOUT => 20,
+    CURLOPT_SSL_VERIFYPEER => true,
+    CURLOPT_SSL_VERIFYHOST => 2,
 ]);
 
 $tokenRaw = curl_exec($ch);
+$curlErrno = curl_errno($ch);
 $httpStatus = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-$tokenJson = json_decode($tokenRaw, true);
+if ($tokenRaw === false || $curlErrno !== 0) {
+    if ($isBrowserGet) {
+        header('Location: /admob-income?admob_error=token_exchange_network_error');
+        exit;
+    }
+    jsonResponse([
+        'success' => false,
+        'error' => 'Network error exchanging authorization code with Google.'
+    ], 502);
+}
+
+$tokenJson = json_decode((string)$tokenRaw, true);
 
 if ($httpStatus !== 200 || empty($tokenJson['access_token'])) {
     $errDetail = $tokenJson['error_description'] ?? ($tokenJson['error'] ?? 'Token exchange failed.');
@@ -269,21 +366,6 @@ $expiresIn = intval($tokenJson['expires_in'] ?? 3600);
 $tokenExpiry = date('Y-m-d H:i:s', time() + $expiresIn);
 
 // 4. Fetch Publisher Account Metadata via AdMob API accounts.list
-$rawAppEnv = getenv('APP_ENV');
-if ($rawAppEnv === false) {
-    $rawAppEnv = $_ENV['APP_ENV'] ?? ($_SERVER['APP_ENV'] ?? '');
-}
-$rawNodeEnv = getenv('NODE_ENV');
-if ($rawNodeEnv === false) {
-    $rawNodeEnv = $_ENV['NODE_ENV'] ?? ($_SERVER['NODE_ENV'] ?? '');
-}
-$appEnv = strtolower(trim((string)$rawAppEnv));
-$nodeEnv = strtolower(trim((string)$rawNodeEnv));
-$nonProdEnvs = ['development', 'dev', 'local', 'test'];
-$presentEnvs = array_values(array_filter([$appEnv, $nodeEnv], static fn($v) => $v !== ''));
-$isProduction = ($appEnv === 'production' || $nodeEnv === 'production')
-    || count($presentEnvs) === 0
-    || count(array_filter($presentEnvs, static fn($v) => !in_array($v, $nonProdEnvs, true))) > 0;
 
 $rawConfiguredPublisherId = getenv('ADMOB_PUBLISHER_ID');
 if ($rawConfiguredPublisherId === false) {
@@ -344,14 +426,26 @@ if ($publisherId === '') {
 // 5. Encrypt Refresh Token using AES-256-GCM
 // No runtime DDL: relies on explicit database migration
 if (empty($refreshToken)) {
-    $stmtExisting = $pdo->prepare('
-        SELECT encrypted_refresh_token, refresh_token_iv, refresh_token_tag 
-        FROM admob_oauth_credentials 
-        WHERE publisher_id = ? AND is_active = 1 
-        LIMIT 1
-    ');
-    $stmtExisting->execute([$publisherId]);
-    $existingRow = $stmtExisting->fetch();
+    try {
+        $stmtExisting = $pdo->prepare('
+            SELECT encrypted_refresh_token, refresh_token_iv, refresh_token_tag 
+            FROM admob_oauth_credentials 
+            WHERE publisher_id = ? AND is_active = 1 
+            LIMIT 1
+        ');
+        $stmtExisting->execute([$publisherId]);
+        $existingRow = $stmtExisting->fetch();
+    } catch (PDOException $e) {
+        error_log('[AdMob OAuth] MySQL existing credentials lookup error: ' . $e->getMessage());
+        if ($isBrowserGet) {
+            header('Location: /admob-income?admob_error=database_error');
+            exit;
+        }
+        jsonResponse([
+            'success' => false,
+            'error' => 'AdMob database table is uninitialized or inaccessible. Please run database migrations before connecting.'
+        ], $isProduction ? 503 : 500);
+    }
 
     if ($existingRow && !empty($existingRow['encrypted_refresh_token'])) {
         $encrypted = [
@@ -374,34 +468,46 @@ if (empty($refreshToken)) {
 }
 
 // 6. Securely Store Encrypted Credentials in MySQL
-$stmtUpsert = $pdo->prepare('
-    INSERT INTO admob_oauth_credentials (
-        publisher_id, account_name, currency_code,
-        encrypted_refresh_token, refresh_token_iv, refresh_token_tag,
-        token_expiry, is_active, connected_by, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, NOW())
-    ON DUPLICATE KEY UPDATE
-        account_name = VALUES(account_name),
-        currency_code = VALUES(currency_code),
-        encrypted_refresh_token = VALUES(encrypted_refresh_token),
-        refresh_token_iv = VALUES(refresh_token_iv),
-        refresh_token_tag = VALUES(refresh_token_tag),
-        token_expiry = VALUES(token_expiry),
-        is_active = 1,
-        connected_by = VALUES(connected_by),
-        updated_at = NOW()
-');
+try {
+    $stmtUpsert = $pdo->prepare('
+        INSERT INTO admob_oauth_credentials (
+            publisher_id, account_name, currency_code,
+            encrypted_refresh_token, refresh_token_iv, refresh_token_tag,
+            token_expiry, is_active, connected_by, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, NOW())
+        ON DUPLICATE KEY UPDATE
+            account_name = VALUES(account_name),
+            currency_code = VALUES(currency_code),
+            encrypted_refresh_token = VALUES(encrypted_refresh_token),
+            refresh_token_iv = VALUES(refresh_token_iv),
+            refresh_token_tag = VALUES(refresh_token_tag),
+            token_expiry = VALUES(token_expiry),
+            is_active = 1,
+            connected_by = VALUES(connected_by),
+            updated_at = NOW()
+    ');
 
-$stmtUpsert->execute([
-    $publisherId,
-    $accountName,
-    $currencyCode,
-    $encrypted['ciphertext'],
-    $encrypted['iv'],
-    $encrypted['tag'],
-    $tokenExpiry,
-    $adminUserId,
-]);
+    $stmtUpsert->execute([
+        $publisherId,
+        $accountName,
+        $currencyCode,
+        $encrypted['ciphertext'],
+        $encrypted['iv'],
+        $encrypted['tag'],
+        $tokenExpiry,
+        $adminUserId,
+    ]);
+} catch (PDOException $e) {
+    error_log('[AdMob OAuth] MySQL credential upsert error: ' . $e->getMessage());
+    if ($isBrowserGet) {
+        header('Location: /admob-income?admob_error=database_error');
+        exit;
+    }
+    jsonResponse([
+        'success' => false,
+        'error' => 'Failed to persist AdMob credentials to database.'
+    ], $isProduction ? 503 : 500);
+}
 
 // 7. Response: Redirect browser or return sanitized JSON (NO tokens exposed!)
 if ($isBrowserGet) {

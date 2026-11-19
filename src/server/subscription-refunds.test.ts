@@ -1,9 +1,13 @@
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { handleApiRequest } from "./api-handler";
-import { resetPersistentPremiumState } from "./payments";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { handleApiRequest, resetInMemoryStore } from "./api-handler";
+import { resetPersistentPremiumState, setTestPersistentDataDir } from "./payments";
 
 describe("Phase 2F: Subscription Refund System Tests", () => {
+  let testDataDir = "";
   const secret = "test_razorpay_secret_refund_123456";
   const keyId = "rzp_test_refund_key_123456";
   const testEnv = {
@@ -26,6 +30,10 @@ describe("Phase 2F: Subscription Refund System Tests", () => {
   let otherPaymentId = "";
 
   before(async () => {
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-sub-refund-test-"));
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
+
     // 1. Generate unique dynamic IDs for isolation
     const testRunId = Date.now();
     userSubId = `sub_user_test_refund_${testRunId}`;
@@ -33,11 +41,9 @@ describe("Phase 2F: Subscription Refund System Tests", () => {
     activePaymentId = `pay_refund_test_${testRunId}_1`;
     otherPaymentId = `pay_refund_test_${testRunId}_2`;
 
-    // 2. Clear store.subscriptionRefundRequests from data/facetube_store.json
+    // 2. Clear store.subscriptionRefundRequests in isolated test store if present
     try {
-      const fs = await import("node:fs");
-      const path = await import("node:path");
-      const storePath = path.resolve(process.cwd(), "data", "facetube_store.json");
+      const storePath = path.join(testDataDir, "facetube_store.json");
       if (fs.existsSync(storePath)) {
         const storeData = JSON.parse(fs.readFileSync(storePath, "utf-8"));
         storeData.subscriptionRefundRequests = [];
@@ -511,5 +517,14 @@ describe("Phase 2F: Subscription Refund System Tests", () => {
       // Subscription remains active until confirmed gateway settlement!
       assert.notEqual(reviewData.request.status, "refunded");
     });
+  });
+
+  after(() => {
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+      testDataDir = "";
+    }
   });
 });

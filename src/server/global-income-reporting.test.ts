@@ -14,6 +14,7 @@ import {
 } from "./premium-recovery.ts";
 import { api } from "../lib/api.ts";
 import {
+  SPONSOR_ALLOCATION_RULES,
   deriveGlobalIncomeDisplayState,
   getAuthoritativeUserLedger,
   getAuthoritativeUserWallet,
@@ -55,7 +56,7 @@ function makeVerifyMockPool(handlers: {
 }) {
   const queryLog: Array<{ sql: string; params?: any[] }> = [];
   const mockQuery = async (sql: string, params?: any[]) => {
-    queryLog.push({ sql, params });
+    queryLog.push(params !== undefined ? { sql, params } : { sql });
 
     if (sql.includes("FROM user_sessions")) {
       return [
@@ -79,11 +80,11 @@ function makeVerifyMockPool(handlers: {
       return [
         [
           {
-            order_id: handlers.paymentTxRow.order_id,
+            order_id: handlers.paymentTxRow["order_id"],
             user_id: "FT_PAYER_1",
             user_name: "Payer One",
-            purpose: handlers.orderPurpose ?? handlers.paymentTxRow.purpose,
-            amount: handlers.paymentTxRow.amount,
+            purpose: handlers.orderPurpose ?? handlers.paymentTxRow["purpose"],
+            amount: handlers.paymentTxRow["amount"],
             status: "created",
           },
         ],
@@ -600,7 +601,7 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
       fs.mkdirSync(thumbsDir, { recursive: true });
       fs.writeFileSync(path.join(videosDir, "vid_rec_1.mp4"), "fake-mp4-data");
       fs.writeFileSync(path.join(thumbsDir, "thumb_rec_1.jpg"), "fake-jpg-data");
-      mediaDirs = { videosDir, thumbnailsDir: thumbsDir };
+      mediaDirs = { videos: [videosDir], images: [thumbsDir] };
     });
 
     afterEach(() => {
@@ -614,6 +615,30 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
       const mockQuery = async (sql: string) => {
         if (sql.includes("INFORMATION_SCHEMA.COLUMNS")) {
           return [[{ COLUMN_NAME: "ad_earnings" }, { COLUMN_NAME: "is_blocked" }]];
+        }
+        if (sql.includes("COUNT(*) AS total_tx")) {
+          return [
+            [
+              {
+                total_tx: params.priorTxCount,
+                min_tx: params.priorTxCount > 0 ? 1 : 0,
+                max_tx: params.priorTxCount,
+                distinct_tx: params.priorTxCount,
+              },
+            ],
+          ];
+        }
+        if (sql.includes("COUNT(*) AS total_pt_tx")) {
+          return [
+            [
+              {
+                total_pt_tx: params.priorTxCount,
+                min_pt_tx: params.priorTxCount > 0 ? 1 : 0,
+                max_pt_tx: params.priorTxCount,
+                seed_rows: 0,
+              },
+            ],
+          ];
         }
         if (sql.includes("SELECT COUNT(*) AS total FROM payment_transactions")) {
           return [[{ total: params.priorTxCount }]];
@@ -659,7 +684,12 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
     }
 
     it("preserves eligibleVideosCount and reports eligibleVideoCount & normalized distinctCreatorCount on normal recovery dry-run", async () => {
-      const adminUser: RecoveryAuthUser = { user_id: "FT102857", role: "admin" };
+      const adminUser: RecoveryAuthUser = {
+        id: "u-admin",
+        user_id: "FT102857",
+        name: "Platform Admin",
+        role: "admin",
+      };
       const pool = createRecoveryMockPool({
         priorTxCount: 2,
         eligibleVideos: [
@@ -672,6 +702,20 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
 
       const fakeFetch = (async (input: any) => {
         const url = String(input);
+        if (url.includes("/v1/orders/") && url.endsWith("/payments")) {
+          return new Response(
+            JSON.stringify({
+              items: [
+                {
+                  id: "pay_rec_001",
+                  status: "captured",
+                  amount: 600,
+                },
+              ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
         if (url.includes("/v1/payments/")) {
           return new Response(
             JSON.stringify({
@@ -680,6 +724,9 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
               status: "captured",
               amount: 600,
               currency: "INR",
+              amount_refunded: 0,
+              refund_status: null,
+              created_at: 1730000005,
             }),
             { status: 200, headers: { "Content-Type": "application/json" } },
           );
@@ -692,29 +739,44 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
             amount_paid: 600,
             currency: "INR",
             created_at: 1730000000,
+            notes: {
+              purpose: "premium_video_upload",
+              userId: "FT_REC_UPLOADER",
+              videoId: "vid_rec_001",
+              contentType: "long",
+            },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }) as typeof fetch;
 
-      const res = await handleAdminRecoverPremiumPayment({
+      const req = new Request("http://localhost:3000/api/admin/recover-premium-payment", {
         method: "POST",
-        pool,
-        authUser: adminUser,
-        body: {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer tok_admin",
+        },
+        body: JSON.stringify({
           dryRun: true,
           items: [
             {
               paymentId: "pay_rec_001",
               orderId: "order_rec_001",
+              videoId: "vid_rec_001",
               userId: "FT_REC_UPLOADER",
               title: "Recovered Premium Video",
+              category: "Technology",
               contentType: "long",
               videoFilename: "vid_rec_1.mp4",
               thumbnailFilename: "thumb_rec_1.jpg",
             },
           ],
-        },
+        }),
+      });
+
+      const res = await handleAdminRecoverPremiumPayment(req, {
+        pool,
+        getAuthUser: async () => adminUser,
         env: {
           RAZORPAY_KEY_ID: "rzp_live_rec",
           RAZORPAY_KEY_SECRET: "rzp_secret_rec",
@@ -726,7 +788,7 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
       assert.equal(res.status, 200);
       const data = (await res.json()) as any;
       assert.equal(data.success, true);
-      const acc = data.items[0].accounting;
+      const acc = data.results[0].accounting;
       assert.equal(acc.txNumber, 3);
       assert.equal(acc.isSpecial, false);
       assert.equal(acc.eligibleVideosCount, 4);
@@ -739,7 +801,12 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
     });
 
     it("reports 0 for eligibleVideosCount, eligibleVideoCount, and distinctCreatorCount on special 11th transaction recovery", async () => {
-      const adminUser: RecoveryAuthUser = { user_id: "FT102857", role: "admin" };
+      const adminUser: RecoveryAuthUser = {
+        id: "u-admin",
+        user_id: "FT102857",
+        name: "Platform Admin",
+        role: "admin",
+      };
       const pool = createRecoveryMockPool({
         priorTxCount: 10, // Next tx is #11 (SPECIAL_GLOBAL_RULE)
         eligibleVideos: [{ video_id: "v1", user_id: "CR_ALPHA", ad_earnings: 0 }],
@@ -747,6 +814,20 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
 
       const fakeFetch = (async (input: any) => {
         const url = String(input);
+        if (url.includes("/v1/orders/") && url.endsWith("/payments")) {
+          return new Response(
+            JSON.stringify({
+              items: [
+                {
+                  id: "pay_rec_11",
+                  status: "captured",
+                  amount: 600,
+                },
+              ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
         if (url.includes("/v1/payments/")) {
           return new Response(
             JSON.stringify({
@@ -755,6 +836,9 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
               status: "captured",
               amount: 600,
               currency: "INR",
+              amount_refunded: 0,
+              refund_status: null,
+              created_at: 1730000005,
             }),
             { status: 200, headers: { "Content-Type": "application/json" } },
           );
@@ -767,29 +851,44 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
             amount_paid: 600,
             currency: "INR",
             created_at: 1730000000,
+            notes: {
+              purpose: "premium_video_upload",
+              userId: "FT_REC_UPLOADER",
+              videoId: "vid_rec_011",
+              contentType: "short",
+            },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }) as typeof fetch;
 
-      const res = await handleAdminRecoverPremiumPayment({
+      const req = new Request("http://localhost:3000/api/admin/recover-premium-payment", {
         method: "POST",
-        pool,
-        authUser: adminUser,
-        body: {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer tok_admin",
+        },
+        body: JSON.stringify({
           dryRun: true,
           items: [
             {
               paymentId: "pay_rec_11",
               orderId: "order_rec_11",
+              videoId: "vid_rec_011",
               userId: "FT_REC_UPLOADER",
               title: "Special 11th Video",
+              category: "Entertainment",
               contentType: "short",
               videoFilename: "vid_rec_1.mp4",
               thumbnailFilename: "thumb_rec_1.jpg",
             },
           ],
-        },
+        }),
+      });
+
+      const res = await handleAdminRecoverPremiumPayment(req, {
+        pool,
+        getAuthUser: async () => adminUser,
         env: {
           RAZORPAY_KEY_ID: "rzp_live_rec",
           RAZORPAY_KEY_SECRET: "rzp_secret_rec",
@@ -800,7 +899,7 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
 
       assert.equal(res.status, 200);
       const data = (await res.json()) as any;
-      const acc = data.items[0].accounting;
+      const acc = data.results[0].accounting;
       assert.equal(acc.txNumber, 11);
       assert.equal(acc.isSpecial, true);
       assert.equal(acc.specialTag, "SPECIAL_GLOBAL_RULE");
@@ -1103,6 +1202,269 @@ describe("FaceTube — Phase 1 Approved Global Income Pool Reporting Fixes", () 
       assert.ok(!routeSource.includes("getUserWallet("));
       assert.ok(!routeSource.includes("getUserLedger("));
       assert.ok(!routeSource.includes("Cached server balance"));
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 4. Sponsor ₹6 allocation overview, separated platform/user stats, weightingMode
+  // --------------------------------------------------------------------------
+  describe("4. Global Pool reporting clarity, Sponsor ₹6 buckets, weightingMode & privacy", () => {
+    const originalGetGlobalPoolSummary = api.wallet.getGlobalPoolSummary;
+
+    afterEach(() => {
+      api.wallet.getGlobalPoolSummary = originalGetGlobalPoolSummary;
+    });
+
+    it("SPONSOR_ALLOCATION_RULES & global-income.tsx display all 4 ₹6 buckets, no-referrer Admin rule, and #11/#21/#31 special rules", () => {
+      const normal = SPONSOR_ALLOCATION_RULES.normalWithReferrer;
+      assert.equal(normal.directReferral, 1);
+      assert.equal(normal.admin, 1);
+      assert.equal(normal.gstAndPg, 1);
+      assert.equal(normal.globalPool, 3);
+      assert.equal(normal.directReferral + normal.admin + normal.gstAndPg + normal.globalPool, 6);
+
+      const noRef = SPONSOR_ALLOCATION_RULES.normalWithoutReferrer;
+      assert.equal(noRef.directReferral, 0);
+      assert.equal(noRef.admin, 2);
+      assert.equal(noRef.gstAndPg, 1);
+      assert.equal(noRef.globalPool, 3);
+      assert.equal(noRef.directReferral + noRef.admin + noRef.gstAndPg + noRef.globalPool, 6);
+
+      const spWithRef = SPONSOR_ALLOCATION_RULES.specialTransactions.withReferrer;
+      assert.equal(spWithRef.globalPool, 0);
+      assert.equal(spWithRef.directReferral, 1);
+      assert.equal(spWithRef.admin, 4);
+      assert.equal(spWithRef.gstAndPg, 1);
+      assert.equal(
+        spWithRef.directReferral + spWithRef.admin + spWithRef.gstAndPg + spWithRef.globalPool,
+        6,
+      );
+
+      const spNoRef = SPONSOR_ALLOCATION_RULES.specialTransactions.withoutReferrer;
+      assert.equal(spNoRef.globalPool, 0);
+      assert.equal(spNoRef.directReferral, 0);
+      assert.equal(spNoRef.admin, 5);
+      assert.equal(spNoRef.gstAndPg, 1);
+      assert.equal(
+        spNoRef.directReferral + spNoRef.admin + spNoRef.gstAndPg + spNoRef.globalPool,
+        6,
+      );
+
+      const routeSource = fs.readFileSync(path.join(ROOT, "src/routes/global-income.tsx"), "utf8");
+      assert.ok(routeSource.includes("Direct Referral"));
+      assert.ok(routeSource.includes("Admin Allocation"));
+      assert.ok(routeSource.includes("GST + Payment Gateway"));
+      assert.ok(routeSource.includes("Global Income Pool"));
+      assert.ok(routeSource.includes("Without Referrer Rule"));
+      assert.ok(routeSource.includes("Special Transactions"));
+      assert.ok(routeSource.includes("Platform-Wide Global Pool Statistics"));
+      assert.ok(routeSource.includes("Your Eligible Sponsor Videos"));
+    });
+
+    it("/api/wallet/global-pool-summary (Node MySQL + PHP parity) includes current user in platform counts, separates user stats, omits equal share when weighted, and leaks no individual creator earnings", async () => {
+      const capturedSql: string[] = [];
+      const makePoolForMetrics = (metrics: {
+        eligible_video_count: number;
+        distinct_creator_count: number;
+        total_ad_earnings: number;
+        user_eligible_video_count: number;
+        user_total_ad_earnings: number;
+      }) =>
+        ({
+          query: async (sql: string) => {
+            capturedSql.push(sql);
+            if (sql.includes("FROM sessions")) {
+              return [
+                [
+                  {
+                    id: "u-self",
+                    user_id: "FT_SELF1",
+                    name: "Creator Self",
+                    mobile: "",
+                    email: "self@facetube.com",
+                    role: "user",
+                    referral_code: "",
+                    created_at: new Date().toISOString(),
+                  },
+                ],
+              ];
+            }
+            if (sql.includes("COUNT(*) AS eligible_video_count")) {
+              return [[metrics]];
+            }
+            return [[]];
+          },
+          getConnection: async () => {
+            throw new Error("Unexpected write connection in read-only summary endpoint");
+          },
+        }) as unknown as Pool;
+
+      const prodEnv = { APP_ENV: "production", NODE_ENV: "production" };
+
+      // Weighted mode: total_ad_earnings > 0 -> estimatedEqualSharePerVideo must be null
+      const weightedPool = makePoolForMetrics({
+        eligible_video_count: 8,
+        distinct_creator_count: 3,
+        total_ad_earnings: 120.5,
+        user_eligible_video_count: 2,
+        user_total_ad_earnings: 45.25,
+      });
+
+      const weightedRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/global-pool-summary?userId=FT_SELF1", {
+          method: "GET",
+          headers: { Authorization: "Bearer tok_self1" },
+        }),
+        prodEnv,
+        { pool: weightedPool },
+      );
+      assert.ok(weightedRes);
+      assert.equal(weightedRes.status, 200);
+      const weightedJson = (await weightedRes.json()) as any;
+      assert.equal(weightedJson.success, true);
+      assert.equal(weightedJson.userId, "FT_SELF1");
+      assert.equal(weightedJson.excludedUserId, null);
+      assert.equal(weightedJson.eligibleVideoCount, 8);
+      assert.equal(weightedJson.platformEligibleVideoCount, 8);
+      assert.equal(weightedJson.distinctCreatorCount, 3);
+      assert.equal(weightedJson.platformDistinctCreatorCount, 3);
+      assert.equal(weightedJson.totalAdEarnings, 120.5);
+      assert.equal(weightedJson.platformTotalAdEarnings, 120.5);
+      assert.equal(weightedJson.userEligibleVideoCount, 2);
+      assert.equal(weightedJson.userTotalAdEarnings, 45.25);
+      assert.equal(weightedJson.weightingMode, "ad_earnings_weighted");
+      assert.equal(weightedJson.estimatedEqualSharePerVideo, null);
+
+      // Must NOT expose any creator lists or other creators' individual earnings
+      assert.equal(weightedJson.creatorPayouts, undefined);
+      assert.equal(weightedJson.creators, undefined);
+      assert.equal(weightedJson.videos, undefined);
+
+      // Platform-wide summary SQL must NOT exclude the current user
+      const summarySql = capturedSql.find((s) => s.includes("COUNT(*) AS eligible_video_count"));
+      assert.ok(summarySql);
+      assert.ok(!summarySql.includes("UPPER(user_id) != UPPER(?)"));
+      assert.ok(summarySql.includes("user_eligible_video_count"));
+      assert.ok(summarySql.includes("user_total_ad_earnings"));
+
+      // Equal fallback mode: total_ad_earnings === 0 -> estimatedEqualSharePerVideo computed
+      const equalPool = makePoolForMetrics({
+        eligible_video_count: 5,
+        distinct_creator_count: 2,
+        total_ad_earnings: 0,
+        user_eligible_video_count: 1,
+        user_total_ad_earnings: 0,
+      });
+      const equalRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/global-pool-summary?userId=FT_SELF1", {
+          method: "GET",
+          headers: { Authorization: "Bearer tok_self1" },
+        }),
+        prodEnv,
+        { pool: equalPool },
+      );
+      assert.ok(equalRes);
+      assert.equal(equalRes.status, 200);
+      const equalJson = (await equalRes.json()) as any;
+      assert.equal(equalJson.weightingMode, "equal_fallback");
+      assert.equal(equalJson.estimatedEqualSharePerVideo, 0.6);
+      assert.equal(equalJson.userEligibleVideoCount, 1);
+      assert.equal(equalJson.userTotalAdEarnings, 0);
+
+      // PHP parity verification
+      const phpSource = fs.readFileSync(
+        path.join(ROOT, "api/wallet/global-pool-summary.php"),
+        "utf8",
+      );
+      assert.ok(!phpSource.includes("UPPER(user_id) != UPPER(?)"));
+      assert.ok(phpSource.includes("user_eligible_video_count"));
+      assert.ok(phpSource.includes("user_total_ad_earnings"));
+      assert.ok(phpSource.includes("'platformEligibleVideoCount' => $platformEligibleVideoCount"));
+      assert.ok(phpSource.includes("'userEligibleVideoCount' => $userEligibleVideoCount"));
+      assert.ok(phpSource.includes("'userTotalAdEarnings' => $userTotalAdEarnings"));
+      assert.ok(phpSource.includes("weightingMode === 'equal_fallback'"));
+    });
+
+    it("deriveGlobalIncomeDisplayState & getGlobalPoolSummary distinguish ad_earnings_weighted vs equal_fallback, separate user stats, and refuse fabricated zero/equal estimates", async () => {
+      api.wallet.getGlobalPoolSummary = async () => ({
+        success: true,
+        userId: "FT_SELF1",
+        excludedUserId: null,
+        poolAmount: 3,
+        poolPaise: 300,
+        eligibleVideoCount: 8,
+        platformEligibleVideoCount: 8,
+        distinctCreatorCount: 3,
+        platformDistinctCreatorCount: 3,
+        totalAdEarnings: 120.5,
+        platformTotalAdEarnings: 120.5,
+        userEligibleVideoCount: 2,
+        userTotalAdEarnings: 45.25,
+        // Even if an equal number were mistakenly sent alongside weighted mode, client strips it
+        estimatedEqualSharePerVideo: 0.37,
+        weightingMode: "ad_earnings_weighted",
+      });
+
+      const weightedSummary = await getGlobalPoolSummary("FT_SELF1");
+      assert.equal(weightedSummary.isStale, false);
+      assert.equal(weightedSummary.estimatedEqualSharePerVideo, null);
+      assert.equal(weightedSummary.userEligibleVideoCount, 2);
+      assert.equal(weightedSummary.userTotalAdEarnings, 45.25);
+
+      const liveWallet: UserWallet = {
+        userId: "FT_SELF1",
+        balance: 50,
+        totalEarned: 50,
+        totalWithdrawn: 0,
+        referralIncome: 10,
+        globalIncome: 22.5,
+        adsenseIncome: 17.5,
+        admobIncome: 0,
+        affiliateIncome: 0,
+        updatedAt: "2026-11-18T00:00:00.000Z",
+        isStale: false,
+      };
+
+      const weightedView = deriveGlobalIncomeDisplayState({
+        loading: false,
+        userId: "FT_SELF1",
+        wallet: liveWallet,
+        walletError: null,
+        transactions: [],
+        ledgerError: null,
+        poolSummary: weightedSummary,
+      });
+
+      // Never displays equal-share ₹0.37 when ad_earnings_weighted
+      assert.equal(weightedView.sharePerVideoValue, "Ad-Weighted");
+      assert.ok(!weightedView.sharePerVideoValue.includes("0.37"));
+      assert.ok(
+        weightedView.sharePerVideoCaption.includes("Weighted by eligible video ad earnings"),
+      );
+      assert.equal(weightedView.weightingModeLabel, "Ad Earnings Weighted");
+      assert.equal(weightedView.eligibleVideosValue, 8);
+      assert.equal(weightedView.platformCreatorsValue, 3);
+      assert.equal(weightedView.platformAdEarningsValue, "₹120.50");
+      assert.equal(weightedView.userEligibleVideosValue, 2);
+      assert.equal(weightedView.userAdEarningsValue, "₹45.25");
+
+      // Missing/unavailable user fields or stale pool -> "—" (never fabricated ₹0.00)
+      const unavailableView = deriveGlobalIncomeDisplayState({
+        loading: false,
+        userId: "FT_SELF1",
+        wallet: liveWallet,
+        walletError: null,
+        transactions: [],
+        ledgerError: null,
+        poolSummary: { ...weightedSummary, isStale: true, error: "Timeout" },
+      });
+      assert.equal(unavailableView.platformCreatorsValue, "—");
+      assert.equal(unavailableView.platformAdEarningsValue, "—");
+      assert.equal(unavailableView.userEligibleVideosValue, "—");
+      assert.equal(unavailableView.userAdEarningsValue, "—");
+      assert.equal(unavailableView.sharePerVideoValue, "—");
+      assert.equal(unavailableView.weightingModeLabel, "Unavailable");
+      assert.equal(unavailableView.distributionStatusCaption, "Awaiting server sync");
     });
   });
 });
