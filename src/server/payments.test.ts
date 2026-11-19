@@ -4503,18 +4503,64 @@ describe("Global Income Pool Phase A: Per-Video Eligibility & Authoritative Serv
       assert.equal(baseJson.isSpecialTransaction, false);
       const baselineCount = Number(baseJson?.distribution?.eligibleVideoCount || 0);
 
+      // Register OR creator & verify an ads_promotion payment so paid free-type video creation passes ownership & payment checks
+      const orRegRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: "OR Creator",
+            email: `or_creator_${Date.now()}@facetube.test`,
+            password: "Password123!",
+          }),
+        }),
+        nonProdEnv,
+        { pool: null },
+      );
+      assert.equal(orRegRes?.status, 201);
+      const orRegJson = await orRegRes?.json();
+      const orCreatorId = orRegJson.user.userId;
+      const orCreatorToken = orRegJson.token;
+
+      const orOrder = `order_nonprod_or_${Date.now()}`;
+      const orPay = `pay_nonprod_or_${Date.now()}`;
+      const orSig = crypto.createHmac("sha256", secret).update(`${orOrder}|${orPay}`).digest("hex");
+      const orPayRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/payments/verify", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${orCreatorToken}`,
+          },
+          body: JSON.stringify({
+            orderId: orOrder,
+            paymentId: orPay,
+            signature: orSig,
+            userId: orCreatorId,
+            purpose: "ads_promotion",
+          }),
+        }),
+        nonProdEnv,
+        { pool: null },
+      );
+      assert.equal(orPayRes?.status, 200);
+
       // Add a video matching ONLY payment_status === "paid" (with video_type === "free")
       const orVidRes = await handleApiRequest(
         new Request("http://localhost:3000/api/videos/create", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${orCreatorToken}`,
+          },
           body: JSON.stringify({
             id: `vid-or-filter-${Date.now()}`,
-            userId: "FT_OR_CREATOR",
+            userId: orCreatorId,
             title: "Paid Free-Type Eligibility Check",
             videoUrl: "/uploads/or-check.mp4",
             video_type: "free",
             payment_status: "paid",
+            payment_id: orPay,
           }),
         }),
         nonProdEnv,

@@ -311,3 +311,357 @@ function ensureMediaStorageDir($subfolder = 'videos') {
     return $primaryDir;
 }
 
+/**
+ * Normalizes and validates video visibility ('public' | 'unlisted' | 'private').
+ * Returns null if an invalid non-empty value is supplied.
+ */
+function normalizeVideoVisibility($raw, $default = 'public') {
+    if ($raw === null) {
+        return $default;
+    }
+    $val = strtolower(trim((string)$raw));
+    if ($val === '') {
+        return $default;
+    }
+    if (in_array($val, ['public', 'unlisted', 'private'], true)) {
+        return $val;
+    }
+    return null;
+}
+
+/**
+ * Enforces approved FaceTube company visibility rules:
+ * 1. Free videos: public, unlisted, private
+ * 2. Paid Premium videos: public, unlisted only
+ * 3. Sponsored / Global Pool eligible videos: public only
+ */
+function validateVideoVisibilityRules($visibility, $videoType, $paymentStatus, $isPromoted = false, $isSponsored = false, $globalPoolEligible = false) {
+    if ($isPromoted || $isSponsored || $globalPoolEligible) {
+        if ($visibility !== 'public') {
+            return 'Sponsored and Global Pool eligible videos must use \'public\' visibility.';
+        }
+        return null;
+    }
+
+    if ($videoType === 'premium' || $paymentStatus === 'paid') {
+        if ($visibility === 'private') {
+            return 'Paid Premium videos can only use \'public\' or \'unlisted\' visibility.';
+        }
+        return null;
+    }
+
+    return null;
+}
+
+/**
+ * Checks whether uploaded_videos.visibility exists in the active schema.
+ */
+function hasUploadedVideosVisibilityColumn($pdo) {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    try {
+        $stmt = $pdo->query("
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'uploaded_videos'
+              AND COLUMN_NAME = 'visibility'
+        ");
+        $cached = ($stmt && $stmt->fetchColumn() !== false);
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
+function getPrivateStorageRoot() {
+    return __DIR__ . '/storage/';
+}
+
+function ensurePrivateStorageHtaccess() {
+    $root = getPrivateStorageRoot();
+    if (!is_dir($root)) {
+        @mkdir($root, 0755, true);
+    }
+    $htaccessPath = $root . '.htaccess';
+    if (!file_exists($htaccessPath)) {
+        $rules = "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order allow,deny\n    Deny from all\n</IfModule>\nOptions -Indexes\n";
+        @file_put_contents($htaccessPath, $rules);
+    }
+}
+
+function ensurePrivateMediaDir($subfolder = 'videos') {
+    ensurePrivateStorageHtaccess();
+    $dir = getPrivateStorageRoot() . 'private_' . $subfolder . '/';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+    return (is_dir($dir) && is_writable($dir)) ? $dir : false;
+}
+
+function getMediaSigningSecret() {
+    foreach (['FACETUBE_MEDIA_SECRET', 'ADMOB_ENCRYPTION_KEY', 'RAZORPAY_KEY_SECRET'] as $envKey) {
+        $val = getenv($envKey) ?: ($_ENV[$envKey] ?? ($_SERVER[$envKey] ?? ''));
+        if (is_string($val) && strlen(trim($val)) >= 16) {
+            return trim($val);
+        }
+    }
+    ensurePrivateStorageHtaccess();
+    $keyFile = getPrivateStorageRoot() . '.media_signing_key';
+    if (file_exists($keyFile) && is_readable($keyFile)) {
+        $existing = trim((string)@file_get_contents($keyFile));
+        if (strlen($existing) >= 32) {
+            return $existing;
+        }
+    }
+    $generated = bin2hex(random_bytes(32));
+    @file_put_contents($keyFile, $generated);
+    @chmod($keyFile, 0600);
+    return $generated;
+}
+
+function signPrivateMediaUrl($videoId, $kind = 'video', $ttlSeconds = 600) {
+    $exp = time() + max(60, intval($ttlSeconds));
+    $sig = hash_hmac('sha256', "media:{$videoId}:{$kind}:{$exp}", getMediaSigningSecret());
+    $baseUrl = getApiBaseUrl();
+    $apiPrefix = str_ends_with(strtolower($baseUrl), '/api') ? $baseUrl : $baseUrl . '/api';
+    if (str_contains(strtolower($baseUrl), 'api.facetube.online') && !str_ends_with(strtolower($baseUrl), '/api')) {
+        $apiPrefix = $baseUrl;
+    }
+    return $apiPrefix . '/videos/media.php?id=' . rawurlencode((string)$videoId) . '&kind=' . rawurlencode($kind) . '&exp=' . $exp . '&sig=' . $sig;
+}
+
+function verifyPrivateMediaSignature($videoId, $kind, $expRaw, $sigRaw) {
+    if ($expRaw === null || $sigRaw === null || $expRaw === '' || $sigRaw === '') {
+        return false;
+    }
+    if (!ctype_digit((string)$expRaw)) {
+        return false;
+    }
+    $exp = intval($expRaw);
+    if ($exp <= time()) {
+        return false;
+    }
+    $expected = hash_hmac('sha256', "media:{$videoId}:{$kind}:{$exp}", getMediaSigningSecret());
+    return hash_equals($expected, trim((string)$sigRaw));
+}
+
+function extractLocalUploadRef($url) {
+    if (empty($url) || !is_string($url)) {
+        return null;
+    }
+    $trimmed = trim($url);
+    $path = $trimmed;
+    if (preg_match('/^https?:\/\//i', $trimmed)) {
+        $parts = @parse_url($trimmed);
+        $host = strtolower((string)($parts['host'] ?? ''));
+        $isAllowedHost = in_array($host, ['localhost', '127.0.0.1', 'facetube.online', 'www.facetube.online', 'api.facetube.online'], true)
+            || str_ends_with($host, '.facetube.online');
+        if (!$isAllowedHost) {
+            return null;
+        }
+        $path = (string)($parts['path'] ?? '');
+    }
+    $path = str_replace('\\', '/', $path);
+    if (preg_match('/^\/?(?:api\/)?uploads\/(videos|images)\/([^\/?#]+)$/i', $path, $m)) {
+        $fileName = basename(rawurldecode($m[2]));
+        if ($fileName === '' || $fileName === '.' || $fileName === '..' || str_contains($fileName, '..')) {
+            return null;
+        }
+        return ['subfolder' => strtolower($m[1]), 'fileName' => $fileName];
+    }
+    return null;
+}
+
+function extractPrivateMediaRef($url) {
+    if (empty($url) || !is_string($url)) {
+        return null;
+    }
+    $trimmed = trim($url);
+    if (!str_starts_with($trimmed, 'private_media://')) {
+        return null;
+    }
+    $rel = substr($trimmed, strlen('private_media://'));
+    if (preg_match('/^(videos|images)\/([^\/?#]+)$/i', $rel, $m)) {
+        $fileName = basename($m[2]);
+        if ($fileName === '' || $fileName === '.' || $fileName === '..' || str_contains($fileName, '..')) {
+            return null;
+        }
+        return ['subfolder' => strtolower($m[1]), 'fileName' => $fileName];
+    }
+    return null;
+}
+
+function moveLocalMediaToPrivate($url, $expectedSubfolder = 'videos') {
+    if (extractPrivateMediaRef($url) !== null) {
+        return trim((string)$url);
+    }
+    $ref = extractLocalUploadRef($url);
+    if ($ref === null) {
+        return $url;
+    }
+    $subfolder = $ref['subfolder'] ?: $expectedSubfolder;
+    $fileName = $ref['fileName'];
+    $privateDir = ensurePrivateMediaDir($subfolder);
+    if ($privateDir) {
+        $privatePath = $privateDir . $fileName;
+        $publicDirs = getMediaStorageDirectories($subfolder);
+        $copied = file_exists($privatePath);
+        foreach ($publicDirs as $pubDir) {
+            $pubFile = $pubDir . $fileName;
+            if (is_file($pubFile)) {
+                if (!$copied) {
+                    if (@rename($pubFile, $privatePath)) {
+                        $copied = true;
+                        continue;
+                    }
+                    if (@copy($pubFile, $privatePath)) {
+                        $copied = true;
+                    }
+                }
+                @unlink($pubFile);
+            }
+        }
+    }
+    return 'private_media://' . $subfolder . '/' . $fileName;
+}
+
+function restorePrivateMediaToPublic($privateRef) {
+    $ref = extractPrivateMediaRef($privateRef);
+    if ($ref === null) {
+        return $privateRef;
+    }
+    $subfolder = $ref['subfolder'];
+    $fileName = $ref['fileName'];
+    $privatePath = getPrivateStorageRoot() . 'private_' . $subfolder . '/' . $fileName;
+    $publicDir = ensureMediaStorageDir($subfolder);
+    if ($publicDir && is_file($privatePath)) {
+        $target = $publicDir . $fileName;
+        if (!@rename($privatePath, $target)) {
+            if (@copy($privatePath, $target)) {
+                @unlink($privatePath);
+            }
+        }
+        $allDirs = getMediaStorageDirectories($subfolder);
+        foreach ($allDirs as $otherDir) {
+            if ($otherDir !== $publicDir && is_dir($otherDir) && is_writable($otherDir) && is_file($target)) {
+                @copy($target, $otherDir . $fileName);
+            }
+        }
+    }
+    return toAbsoluteMediaUrl('/uploads/' . $subfolder . '/' . $fileName, $subfolder);
+}
+
+function resolveVideoMediaOutputUrl($storedUrl, $videoId, $visibility, $kind, $canAccessPrivate) {
+    $raw = trim((string)($storedUrl ?? ''));
+    if ($raw === '') {
+        return '';
+    }
+    if (extractPrivateMediaRef($raw) !== null) {
+        if (!$canAccessPrivate) {
+            return '';
+        }
+        return signPrivateMediaUrl($videoId, $kind);
+    }
+    if ($visibility === 'private' && !$canAccessPrivate) {
+        return '';
+    }
+    return toAbsoluteMediaUrl($raw, $kind === 'thumbnail' ? 'images' : 'videos');
+}
+
+function resolvePrivateMediaFilePath($storedUrl) {
+    $ref = extractPrivateMediaRef($storedUrl);
+    if ($ref === null) {
+        $ref = extractLocalUploadRef($storedUrl);
+    }
+    if ($ref === null) {
+        return null;
+    }
+    $subfolder = $ref['subfolder'];
+    $fileName = $ref['fileName'];
+    $privCandidate = getPrivateStorageRoot() . 'private_' . $subfolder . '/' . $fileName;
+    if (is_file($privCandidate)) {
+        return $privCandidate;
+    }
+    foreach (getMediaStorageDirectories($subfolder) as $pubDir) {
+        $pubCandidate = $pubDir . $fileName;
+        if (is_file($pubCandidate)) {
+            return $pubCandidate;
+        }
+    }
+    return null;
+}
+
+function streamMediaFileWithRange($filePath) {
+    $fileSize = filesize($filePath);
+    $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+    $mimeMap = [
+        'mp4' => 'video/mp4',
+        'm4v' => 'video/mp4',
+        'webm' => 'video/webm',
+        'ogg' => 'video/ogg',
+        'ogv' => 'video/ogg',
+        'mov' => 'video/quicktime',
+        'mkv' => 'video/x-matroska',
+        'jpg' => 'image/jpeg',
+        'jpeg' => 'image/jpeg',
+        'png' => 'image/png',
+        'webp' => 'image/webp',
+        'gif' => 'image/gif',
+    ];
+    $contentType = $mimeMap[$ext] ?? 'application/octet-stream';
+
+    header('Accept-Ranges: bytes');
+    header('Cache-Control: private, no-store, no-cache, must-revalidate');
+    header('X-Content-Type-Options: nosniff');
+    header('Content-Type: ' . $contentType);
+
+    $rangeHeader = $_SERVER['HTTP_RANGE'] ?? '';
+    $start = 0;
+    $end = $fileSize - 1;
+    $status = 200;
+
+    if (!empty($rangeHeader) && preg_match('/bytes=(\d*)-(\d*)/i', $rangeHeader, $m)) {
+        $start = $m[1] !== '' ? intval($m[1]) : 0;
+        $end = $m[2] !== '' ? intval($m[2]) : ($fileSize - 1);
+        if ($end >= $fileSize) {
+            $end = $fileSize - 1;
+        }
+        if ($start > $end || $start >= $fileSize) {
+            http_response_code(416);
+            header("Content-Range: bytes */{$fileSize}");
+            exit;
+        }
+        $status = 206;
+        header("Content-Range: bytes {$start}-{$end}/{$fileSize}");
+    }
+
+    $length = $end - $start + 1;
+    http_response_code($status);
+    header('Content-Length: ' . $length);
+
+    $fp = @fopen($filePath, 'rb');
+    if (!$fp) {
+        http_response_code(500);
+        exit;
+    }
+    if ($start > 0) {
+        fseek($fp, $start);
+    }
+    $remaining = $length;
+    while ($remaining > 0 && !feof($fp)) {
+        $chunkSize = min(65536, $remaining);
+        $buffer = fread($fp, $chunkSize);
+        if ($buffer === false) {
+            break;
+        }
+        echo $buffer;
+        $remaining -= strlen($buffer);
+    }
+    fclose($fp);
+    exit;
+}
+
+

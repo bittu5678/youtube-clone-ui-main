@@ -39,6 +39,36 @@ import {
   resolveSmtpConfig,
 } from "./email.ts";
 import { handleAdminRecoverPremiumPayment } from "./premium-recovery.ts";
+import {
+  normalizeVideoVisibility,
+  validateVisibilityRules,
+  moveLocalMediaToPrivate,
+  restorePrivateMediaToPublic,
+  resolvePrivateMediaOutputUrl,
+  resolvePrivateMediaDiskPath,
+  streamPrivateFileWithRange,
+  verifyPrivateMediaSignature,
+  getPrivateMediaDir,
+  extractPrivateMediaReference,
+  extractLocalUploadReference,
+  PRIVATE_MEDIA_PREFIX,
+  type VideoVisibility,
+} from "./private-media.ts";
+
+async function hasVisibilityColumnMysql(pool: Pool): Promise<boolean> {
+  try {
+    const [rows]: any = await pool.query(
+      `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'uploaded_videos'
+         AND COLUMN_NAME = 'visibility'`,
+    );
+    return Array.isArray(rows) && rows.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 export function getStoreDir(env?: Record<string, string | undefined>): string {
   const storeDir = getPersistentDataDir(env);
@@ -262,6 +292,7 @@ interface ServerStore {
     payment_id?: string | undefined;
     payment_amount: number;
     is_promoted: boolean;
+    visibility?: "public" | "unlisted" | "private" | undefined;
     promotion_plan?: string | undefined;
     promotion_expires_at?: string | undefined;
     is_blocked?: boolean | undefined;
@@ -4915,13 +4946,52 @@ export async function handleApiRequest(
   // 5. Videos
   if (route === "videos/list") {
     if (method === "GET") {
-      const userId = url.searchParams.get("userId");
-      const videoType = url.searchParams.get("videoType");
-      const contentType = url.searchParams.get("contentType");
-      const category = url.searchParams.get("category");
-      const search = url.searchParams.get("search");
+      const userId = (
+        url.searchParams.get("userId") ||
+        url.searchParams.get("user_id") ||
+        ""
+      ).trim();
+      const videoType = (
+        url.searchParams.get("videoType") ||
+        url.searchParams.get("video_type") ||
+        ""
+      ).trim();
+      const contentType = (
+        url.searchParams.get("contentType") ||
+        url.searchParams.get("content_type") ||
+        ""
+      ).trim();
+      const category = (url.searchParams.get("category") || "").trim();
+      const search = (url.searchParams.get("search") || url.searchParams.get("q") || "").trim();
+      const includeBlockedRequested = Boolean(
+        url.searchParams.get("include_blocked") || url.searchParams.get("includeBlocked"),
+      );
+      const includeNonPublicRequested = Boolean(
+        url.searchParams.get("include_non_public") ||
+        url.searchParams.get("includeNonPublic") ||
+        url.searchParams.get("include_private") ||
+        url.searchParams.get("includePrivate"),
+      );
 
       const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+        request,
+        store,
+        pool,
+        env,
+      );
+      if (earlyResponse) {
+        return earlyResponse;
+      }
+      const isAdmin = Boolean(authUser && authUser.role === "admin");
+      const authUserId = authUser ? authUser.user_id.trim() : "";
+      const isOwnerRequest = Boolean(
+        authUser && userId !== "" && authUserId.toUpperCase() === userId.toUpperCase(),
+      );
+      const canViewOwnerNonPublic =
+        (userId !== "" && (isOwnerRequest || isAdmin)) ||
+        (userId === "" && isAdmin && (includeBlockedRequested || includeNonPublicRequested));
+
       if (isProd && !pool) {
         return jsonResponse(
           { success: false, error: "Database connection unavailable in production." },
@@ -4930,11 +5000,21 @@ export async function handleApiRequest(
       }
       if (pool) {
         try {
+          const hasVisibilityCol = await hasVisibilityColumnMysql(pool);
           const where: string[] = [];
           const params: any[] = [];
+          if (!(includeBlockedRequested && isAdmin)) {
+            where.push("COALESCE(is_blocked, 0) = 0");
+          }
           if (userId) {
             where.push("UPPER(user_id) = UPPER(?)");
-            params.push(userId.trim());
+            params.push(userId);
+          }
+          if (!canViewOwnerNonPublic) {
+            if (hasVisibilityCol) {
+              where.push("COALESCE(visibility, 'public') = 'public'");
+            }
+            where.push("(video_type != 'premium' OR payment_status IN ('paid', 'not_required'))");
           }
           if (videoType && videoType !== "all") {
             where.push("video_type = ?");
@@ -4953,16 +5033,16 @@ export async function handleApiRequest(
             const s = `%${search}%`;
             params.push(s, s, s);
           }
-          if (!url.searchParams.get("include_blocked")) {
-            where.push("COALESCE(is_blocked, 0) = 0");
-          }
 
           const whereSql = where.length > 0 ? "WHERE " + where.join(" AND ") : "";
+          const visibilitySelect = hasVisibilityCol
+            ? "COALESCE(visibility, 'public') AS visibility"
+            : "'public' AS visibility";
           const sql = `
             SELECT 
               id, user_id, creator_name, title, description, video_url, thumbnail_url,
               video_type, content_type, category, duration, views, likes,
-              payment_status, payment_id, payment_amount, is_promoted,
+              payment_status, payment_id, payment_amount, is_promoted, ${visibilitySelect},
               promotion_plan, promotion_expires_at, created_at, updated_at,
               (is_promoted = 1 AND promotion_expires_at IS NOT NULL AND promotion_expires_at > NOW()) AS is_active_promoted
             FROM uploaded_videos
@@ -4977,6 +5057,29 @@ export async function handleApiRequest(
                 is_promoted: r.is_promoted,
                 promotion_expires_at: r.promotion_expires_at,
               });
+              const visibility = normalizeVideoVisibility(r.visibility, "public") ?? "public";
+              const isRowOwner =
+                authUserId !== "" &&
+                String(r.user_id || "")
+                  .trim()
+                  .toUpperCase() === authUserId.toUpperCase();
+              const canAccessPrivate = isRowOwner || isAdmin;
+              const resolvedVideoUrl = resolvePrivateMediaOutputUrl({
+                storedUrl: r.video_url,
+                videoId: String(r.id),
+                visibility,
+                kind: "video",
+                canAccessPrivate,
+                env,
+              });
+              const resolvedThumbUrl = resolvePrivateMediaOutputUrl({
+                storedUrl: r.thumbnail_url,
+                videoId: String(r.id),
+                visibility,
+                kind: "thumbnail",
+                canAccessPrivate,
+                env,
+              });
               return {
                 id: String(r.id),
                 userId: r.user_id,
@@ -4985,10 +5088,10 @@ export async function handleApiRequest(
                 creator_name: r.creator_name,
                 title: r.title,
                 description: r.description || "",
-                videoUrl: r.video_url,
-                video_url: r.video_url,
-                thumbnailUrl: r.thumbnail_url || "",
-                thumbnail_url: r.thumbnail_url || "",
+                videoUrl: resolvedVideoUrl,
+                video_url: resolvedVideoUrl,
+                thumbnailUrl: resolvedThumbUrl,
+                thumbnail_url: resolvedThumbUrl,
                 videoType: r.video_type,
                 video_type: r.video_type,
                 contentType: r.content_type,
@@ -5009,6 +5112,7 @@ export async function handleApiRequest(
                 is_active_promoted: active,
                 rawIsPromoted: Boolean(r.is_promoted),
                 raw_is_promoted: Boolean(r.is_promoted),
+                visibility,
                 promotionPlan: r.promotion_plan,
                 promotion_plan: r.promotion_plan,
                 promotionExpiresAt: r.promotion_expires_at,
@@ -5040,11 +5144,24 @@ export async function handleApiRequest(
       }
 
       let filtered = [...store.videos];
-      if (!url.searchParams.get("include_blocked")) {
+      if (!(includeBlockedRequested && isAdmin)) {
         filtered = filtered.filter((v) => !v.is_blocked);
       }
       if (userId) {
-        filtered = filtered.filter((v) => v.user_id.toUpperCase() === userId.trim().toUpperCase());
+        filtered = filtered.filter((v) => v.user_id.toUpperCase() === userId.toUpperCase());
+      }
+      if (!canViewOwnerNonPublic) {
+        filtered = filtered.filter((v) => {
+          const vis = normalizeVideoVisibility(v.visibility, "public") ?? "public";
+          if (vis !== "public") return false;
+          if (
+            v.video_type === "premium" &&
+            (v.payment_status === "pending" || v.payment_status === "failed")
+          ) {
+            return false;
+          }
+          return true;
+        });
       }
       if (videoType && videoType !== "all") {
         filtered = filtered.filter((v) => v.video_type === videoType);
@@ -5077,12 +5194,34 @@ export async function handleApiRequest(
 
       const formatted = filtered.map((v) => {
         const active = isAdPromotionActive(v);
+        const visibility = normalizeVideoVisibility(v.visibility, "public") ?? "public";
+        const isRowOwner =
+          authUserId !== "" && v.user_id.trim().toUpperCase() === authUserId.toUpperCase();
+        const canAccessPrivate = isRowOwner || isAdmin;
+        const resolvedVideoUrl = resolvePrivateMediaOutputUrl({
+          storedUrl: v.video_url,
+          videoId: v.id,
+          visibility,
+          kind: "video",
+          canAccessPrivate,
+          env,
+        });
+        const resolvedThumbUrl = resolvePrivateMediaOutputUrl({
+          storedUrl: v.thumbnail_url,
+          videoId: v.id,
+          visibility,
+          kind: "thumbnail",
+          canAccessPrivate,
+          env,
+        });
         return {
           ...v,
           userId: v.user_id,
           creatorName: v.creator_name,
-          videoUrl: v.video_url,
-          thumbnailUrl: v.thumbnail_url,
+          videoUrl: resolvedVideoUrl,
+          video_url: resolvedVideoUrl,
+          thumbnailUrl: resolvedThumbUrl,
+          thumbnail_url: resolvedThumbUrl,
           videoType: v.video_type,
           contentType: v.content_type,
           paymentStatus: v.payment_status,
@@ -5094,6 +5233,7 @@ export async function handleApiRequest(
           is_active_promoted: active,
           rawIsPromoted: Boolean(v.is_promoted),
           raw_is_promoted: Boolean(v.is_promoted),
+          visibility,
           promotionPlan: v.promotion_plan,
           promotion_plan: v.promotion_plan,
           promotionExpiresAt: v.promotion_expires_at,
@@ -5109,10 +5249,22 @@ export async function handleApiRequest(
 
   if (route === "videos/get") {
     if (method === "GET") {
-      const id = url.searchParams.get("id");
+      const id = (url.searchParams.get("id") || "").trim();
       if (!id) return jsonResponse({ success: false, error: "Missing video id" }, 400);
 
       const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+        request,
+        store,
+        pool,
+        env,
+      );
+      if (earlyResponse) {
+        return earlyResponse;
+      }
+      const isAdmin = Boolean(authUser && authUser.role === "admin");
+      const authUserId = authUser ? authUser.user_id.trim() : "";
+
       if (isProd && !pool) {
         return jsonResponse(
           { success: false, error: "Database connection unavailable in production." },
@@ -5136,9 +5288,57 @@ export async function handleApiRequest(
                 403,
               );
             }
+            const visibility = normalizeVideoVisibility(r.visibility, "public") ?? "public";
+            const isOwner =
+              authUserId !== "" &&
+              String(r.user_id || "")
+                .trim()
+                .toUpperCase() === authUserId.toUpperCase();
+            const canAccessOwnerOrAdmin = isOwner || isAdmin;
+
+            if (visibility === "private" && !canAccessOwnerOrAdmin) {
+              return jsonResponse(
+                {
+                  success: false,
+                  error:
+                    "Forbidden: This video is private. Only the video owner or an administrator can access it.",
+                },
+                403,
+              );
+            }
+            if (
+              String(r.video_type || "free").toLowerCase() === "premium" &&
+              (r.payment_status === "pending" || r.payment_status === "failed") &&
+              !canAccessOwnerOrAdmin
+            ) {
+              return jsonResponse(
+                {
+                  success: false,
+                  error: "Forbidden: This premium video is awaiting payment confirmation.",
+                },
+                403,
+              );
+            }
+
             const active = isAdPromotionActive({
               is_promoted: r.is_promoted,
               promotion_expires_at: r.promotion_expires_at,
+            });
+            const resolvedVideoUrl = resolvePrivateMediaOutputUrl({
+              storedUrl: r.video_url,
+              videoId: String(r.id),
+              visibility,
+              kind: "video",
+              canAccessPrivate: canAccessOwnerOrAdmin,
+              env,
+            });
+            const resolvedThumbUrl = resolvePrivateMediaOutputUrl({
+              storedUrl: r.thumbnail_url,
+              videoId: String(r.id),
+              visibility,
+              kind: "thumbnail",
+              canAccessPrivate: canAccessOwnerOrAdmin,
+              env,
             });
             return jsonResponse({
               success: true,
@@ -5150,10 +5350,10 @@ export async function handleApiRequest(
                 creator_name: r.creator_name,
                 title: r.title,
                 description: r.description || "",
-                videoUrl: r.video_url,
-                video_url: r.video_url,
-                thumbnailUrl: r.thumbnail_url || "",
-                thumbnail_url: r.thumbnail_url || "",
+                videoUrl: resolvedVideoUrl,
+                video_url: resolvedVideoUrl,
+                thumbnailUrl: resolvedThumbUrl,
+                thumbnail_url: resolvedThumbUrl,
                 videoType: r.video_type,
                 video_type: r.video_type,
                 contentType: r.content_type,
@@ -5174,6 +5374,7 @@ export async function handleApiRequest(
                 is_active_promoted: active,
                 rawIsPromoted: Boolean(r.is_promoted),
                 raw_is_promoted: Boolean(r.is_promoted),
+                visibility,
                 promotionPlan: r.promotion_plan,
                 promotion_plan: r.promotion_plan,
                 promotionExpiresAt: r.promotion_expires_at,
@@ -5217,15 +5418,62 @@ export async function handleApiRequest(
             403,
           );
         }
+        const visibility = normalizeVideoVisibility(v.visibility, "public") ?? "public";
+        const isOwner =
+          authUserId !== "" && v.user_id.trim().toUpperCase() === authUserId.toUpperCase();
+        const canAccessOwnerOrAdmin = isOwner || isAdmin;
+
+        if (visibility === "private" && !canAccessOwnerOrAdmin) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Forbidden: This video is private. Only the video owner or an administrator can access it.",
+            },
+            403,
+          );
+        }
+        if (
+          v.video_type === "premium" &&
+          (v.payment_status === "pending" || v.payment_status === "failed") &&
+          !canAccessOwnerOrAdmin
+        ) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Forbidden: This premium video is awaiting payment confirmation.",
+            },
+            403,
+          );
+        }
+
         const active = isAdPromotionActive(v);
+        const resolvedVideoUrl = resolvePrivateMediaOutputUrl({
+          storedUrl: v.video_url,
+          videoId: v.id,
+          visibility,
+          kind: "video",
+          canAccessPrivate: canAccessOwnerOrAdmin,
+          env,
+        });
+        const resolvedThumbUrl = resolvePrivateMediaOutputUrl({
+          storedUrl: v.thumbnail_url,
+          videoId: v.id,
+          visibility,
+          kind: "thumbnail",
+          canAccessPrivate: canAccessOwnerOrAdmin,
+          env,
+        });
         return jsonResponse({
           success: true,
           video: {
             ...v,
             userId: v.user_id,
             creatorName: v.creator_name,
-            videoUrl: v.video_url,
-            thumbnailUrl: v.thumbnail_url,
+            videoUrl: resolvedVideoUrl,
+            video_url: resolvedVideoUrl,
+            thumbnailUrl: resolvedThumbUrl,
+            thumbnail_url: resolvedThumbUrl,
             videoType: v.video_type,
             contentType: v.content_type,
             paymentStatus: v.payment_status,
@@ -5237,6 +5485,7 @@ export async function handleApiRequest(
             is_active_promoted: active,
             rawIsPromoted: Boolean(v.is_promoted),
             raw_is_promoted: Boolean(v.is_promoted),
+            visibility,
             promotionPlan: v.promotion_plan,
             promotion_plan: v.promotion_plan,
             promotionExpiresAt: v.promotion_expires_at,
@@ -5252,9 +5501,49 @@ export async function handleApiRequest(
 
   if (route === "videos/create") {
     if (method === "POST") {
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+        request,
+        store,
+        pool,
+        env,
+      );
+      if (earlyResponse) {
+        return earlyResponse;
+      }
+      if (!authUser) {
+        return jsonResponse(
+          {
+            success: false,
+            error: "Authentication required. Please provide a valid Bearer session token.",
+          },
+          401,
+        );
+      }
+
       const body = await request.json();
-      const title = (body.title || "").trim();
-      const videoUrl = (body.video_url || body.videoUrl || "").trim();
+      const isAdmin = authUser.role === "admin";
+      const requestedUserId = String(body.user_id ?? body.userId ?? "").trim();
+
+      let targetUserId = authUser.user_id;
+      if (requestedUserId !== "") {
+        if (requestedUserId.toUpperCase() === authUser.user_id.toUpperCase()) {
+          targetUserId = authUser.user_id;
+        } else if (isAdmin) {
+          targetUserId = requestedUserId;
+        } else {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Unauthorized: You can only create or update videos for your own account.",
+            },
+            403,
+          );
+        }
+      }
+
+      const title = String(body.title || "").trim();
+      let videoUrl = String(body.video_url || body.videoUrl || "").trim();
 
       if (!title) {
         return jsonResponse({ success: false, error: "Video title is required." }, 400);
@@ -5263,58 +5552,63 @@ export async function handleApiRequest(
         return jsonResponse({ success: false, error: "Video URL is required." }, 400);
       }
 
-      let finalThumbnailUrl =
-        body.thumbnail_url ||
-        body.thumbnailUrl ||
-        "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800&auto=format&fit=crop&q=60";
+      const rawVideoType = String(body.video_type ?? body.videoType ?? "free")
+        .trim()
+        .toLowerCase();
+      if (rawVideoType !== "free" && rawVideoType !== "premium") {
+        return jsonResponse(
+          { success: false, error: "Invalid video_type. Allowed values are free or premium." },
+          400,
+        );
+      }
+      const videoType = rawVideoType as "free" | "premium";
 
-      const vidId = body.id || `vid-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      const rawContentType = String(body.content_type ?? body.contentType ?? "long")
+        .trim()
+        .toLowerCase();
+      if (rawContentType !== "short" && rawContentType !== "long") {
+        return jsonResponse(
+          { success: false, error: "Invalid content_type. Allowed values are short or long." },
+          400,
+        );
+      }
+      const contentType = rawContentType as "short" | "long";
 
-      // Save base64 thumbnail to physical disk if provided
-      if (finalThumbnailUrl.startsWith("data:image/")) {
-        try {
-          const parts = finalThumbnailUrl.split(",");
-          if (parts.length === 2) {
-            const buffer = Buffer.from(parts[1], "base64");
-            const imgUploadDir = path.resolve(process.cwd(), "uploads", "images");
-            await fs.promises.mkdir(imgUploadDir, { recursive: true });
-            const safeVidId = vidId.replace(/[^a-zA-Z0-9_-]/g, "_");
-            const imgFileName = `thumb_${safeVidId}.jpg`;
-            await fs.promises.writeFile(path.join(imgUploadDir, imgFileName), buffer);
-            finalThumbnailUrl = `/uploads/images/${imgFileName}`;
-          }
-        } catch (imgErr) {
-          console.warn("Base64 thumbnail save error:", imgErr);
-        }
+      const rawPaymentStatus = body.payment_status ?? body.paymentStatus;
+      const paymentStatusStr =
+        rawPaymentStatus === undefined ||
+        rawPaymentStatus === null ||
+        String(rawPaymentStatus).trim() === ""
+          ? videoType === "premium"
+            ? "pending"
+            : "not_required"
+          : String(rawPaymentStatus).trim().toLowerCase();
+      if (!["not_required", "pending", "paid", "failed"].includes(paymentStatusStr)) {
+        return jsonResponse({ success: false, error: "Invalid payment_status." }, 400);
+      }
+      const paymentStatus = paymentStatusStr as "not_required" | "pending" | "paid" | "failed";
+      const paymentId =
+        body.payment_id || body.paymentId
+          ? String(body.payment_id || body.paymentId).trim()
+          : undefined;
+
+      const visibility = normalizeVideoVisibility(body.visibility, "public");
+      if (!visibility) {
+        return jsonResponse(
+          {
+            success: false,
+            error: "Invalid video visibility. Allowed values are public, unlisted, or private.",
+          },
+          400,
+        );
       }
 
-      const newVideo = {
-        id: vidId,
-        user_id: body.user_id || body.userId || "FT483921",
-        creator_name: body.creator_name || body.creatorName || "FaceTube Creator",
-        title,
-        description: (body.description || "").trim(),
-        video_url: videoUrl,
-        thumbnail_url: finalThumbnailUrl,
-        video_type: (body.video_type || body.videoType || "free") as "free" | "premium",
-        content_type: (body.content_type || body.contentType || "long") as "short" | "long",
-        category: body.category || "General",
-        duration: body.duration || "1:00",
-        views: 0,
-        likes: 0,
-        payment_status: (body.payment_status ||
-          body.paymentStatus ||
-          (body.video_type === "premium" ? "pending" : "not_required")) as
-          "not_required" | "pending" | "paid" | "failed",
-        payment_id: body.payment_id || body.paymentId || undefined,
-        payment_amount: Number(body.payment_amount || body.paymentAmount) || 0,
-        is_promoted: Boolean(body.is_promoted || body.isPromoted),
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
+      let isPromotedInput = Boolean(body.is_promoted || body.isPromoted);
+      const isSponsoredInput = Boolean(body.is_sponsored || body.isSponsored);
+      const isGlobalPoolInput = Boolean(body.global_pool_eligible || body.globalPoolEligible);
 
-      // Persist to MySQL uploaded_videos table if pool is configured
-      const pool = resolvePool();
+      const vidId = String(body.id || `vid-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
+
       if (isProd && !pool) {
         return jsonResponse(
           {
@@ -5326,47 +5620,407 @@ export async function handleApiRequest(
         );
       }
 
+      // Check existing video ownership and promotion state before writing
+      let existingRow: any = null;
       if (pool) {
         try {
-          await pool.query(
-            `INSERT INTO uploaded_videos (
-              id, user_id, creator_name, title, description, video_url, thumbnail_url,
-              video_type, content_type, category, duration, views, likes,
-              payment_status, payment_id, payment_amount, is_promoted,
-              created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, NOW(), NOW())
-            ON DUPLICATE KEY UPDATE
-              title = VALUES(title),
-              description = VALUES(description),
-              video_url = VALUES(video_url),
-              thumbnail_url = VALUES(thumbnail_url),
-              video_type = VALUES(video_type),
-              content_type = VALUES(content_type),
-              category = VALUES(category),
-              duration = VALUES(duration),
-              payment_status = VALUES(payment_status),
-              payment_id = VALUES(payment_id),
-              payment_amount = VALUES(payment_amount),
-              updated_at = NOW()`,
-            [
-              newVideo.id,
-              newVideo.user_id,
-              newVideo.creator_name,
-              newVideo.title,
-              newVideo.description,
-              newVideo.video_url,
-              newVideo.thumbnail_url,
-              newVideo.video_type,
-              newVideo.content_type,
-              newVideo.category,
-              newVideo.duration,
-              newVideo.payment_status,
-              newVideo.payment_id || null,
-              newVideo.payment_amount,
-              newVideo.is_promoted ? 1 : 0,
-            ],
+          const [exRows]: any = await pool.query(
+            "SELECT id, user_id, is_promoted, payment_status, video_url, thumbnail_url FROM uploaded_videos WHERE id = ? LIMIT 1",
+            [vidId],
           );
-          return jsonResponse({ success: true, video: newVideo }, 201);
+          if (Array.isArray(exRows) && exRows.length > 0) {
+            existingRow = exRows[0];
+          }
+        } catch (dbCheckErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              {
+                success: false,
+                error: "Database error checking existing video: " + dbCheckErr.message,
+              },
+              503,
+            );
+          }
+        }
+      }
+      if (!existingRow && !isProd) {
+        existingRow = store.videos.find((v) => v.id === vidId) || null;
+      }
+
+      if (existingRow) {
+        if (
+          String(existingRow.user_id || "")
+            .trim()
+            .toUpperCase() !== targetUserId.toUpperCase() &&
+          !isAdmin
+        ) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Forbidden: You do not own this video ID and cannot overwrite another user's video.",
+            },
+            403,
+          );
+        }
+        if (existingRow.is_promoted) {
+          isPromotedInput = true;
+        }
+      }
+
+      // Enforce visibility rules
+      const ruleCheck = validateVisibilityRules({
+        visibility,
+        videoType,
+        paymentStatus,
+        isPromoted: isPromotedInput,
+        isSponsored: isSponsoredInput,
+        globalPoolEligible: isGlobalPoolInput,
+      });
+      if (!ruleCheck.valid) {
+        return jsonResponse({ success: false, error: ruleCheck.error }, 400);
+      }
+
+      // Prevent client from bypassing Ads Promotion payment via arbitrary is_promoted=true on create
+      if (isPromotedInput && !existingRow?.is_promoted && !isAdmin) {
+        let verifiedPromo = false;
+        if (paymentId) {
+          if (pool) {
+            try {
+              const [pRows]: any = await pool.query(
+                "SELECT payment_id FROM payment_transactions WHERE payment_id = ? AND purpose = 'ads_promotion' AND UPPER(user_id) = UPPER(?) LIMIT 1",
+                [paymentId, targetUserId],
+              );
+              verifiedPromo = Array.isArray(pRows) && pRows.length > 0;
+            } catch {
+              verifiedPromo = false;
+            }
+          } else {
+            const txId = `TX_ADS_ADM_${paymentId}`;
+            verifiedPromo = (store.walletTransactions || []).some(
+              (t: any) =>
+                (t.transactionId === txId || t.transaction_id === txId) &&
+                String(t.sourceUserId || t.source_user_id || "").toUpperCase() ===
+                  targetUserId.toUpperCase(),
+            );
+          }
+        }
+        if (!verifiedPromo) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Payment verification required: cannot enable promotion without a verified Ads Promotion payment.",
+            },
+            402,
+          );
+        }
+      }
+
+      // Preserve payment verification integrity: reject spoofed payment_status='paid' without verified transaction
+      if (paymentStatus === "paid") {
+        if (!paymentId) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Payment verification required: payment_id is required for paid videos.",
+            },
+            402,
+          );
+        }
+        let isPaymentVerified = false;
+        if (pool) {
+          try {
+            const [txRows]: any = await pool.query(
+              "SELECT payment_id, user_id, video_id FROM payment_transactions WHERE payment_id = ? LIMIT 1",
+              [paymentId],
+            );
+            const tx = txRows?.[0];
+            if (
+              tx &&
+              (String(tx.user_id || "").toUpperCase() === targetUserId.toUpperCase() || isAdmin) &&
+              (!tx.video_id || String(tx.video_id) === vidId)
+            ) {
+              isPaymentVerified = true;
+            }
+            if (!isPaymentVerified) {
+              const [poRows]: any = await pool.query(
+                "SELECT payment_id, user_id, video_id FROM payment_orders WHERE payment_id = ? AND status = 'paid' LIMIT 1",
+                [paymentId],
+              );
+              const po = poRows?.[0];
+              if (
+                po &&
+                (String(po.user_id || "").toUpperCase() === targetUserId.toUpperCase() ||
+                  isAdmin) &&
+                (!po.video_id || String(po.video_id) === vidId)
+              ) {
+                isPaymentVerified = true;
+              }
+            }
+          } catch {
+            isPaymentVerified = false;
+          }
+        } else {
+          const persistentTxs = await getPersistentTransactions(env).catch(() => []);
+          const txMatch = persistentTxs.find(
+            (t) =>
+              t.paymentId === paymentId &&
+              (t.userId.toUpperCase() === targetUserId.toUpperCase() || isAdmin) &&
+              (!t.videoId || t.videoId === vidId),
+          );
+          if (txMatch) {
+            isPaymentVerified = true;
+          }
+          if (!isPaymentVerified) {
+            const walletMatch = (store.walletTransactions || []).some(
+              (t: any) =>
+                (t.transactionId === `TX_ADM_${paymentId}` ||
+                  t.transaction_id === `TX_ADM_${paymentId}` ||
+                  t.transactionId === `TX_ADS_ADM_${paymentId}` ||
+                  t.transaction_id === `TX_ADS_ADM_${paymentId}`) &&
+                (String(t.sourceUserId || t.source_user_id || "").toUpperCase() ===
+                  targetUserId.toUpperCase() ||
+                  isAdmin),
+            );
+            if (walletMatch) {
+              isPaymentVerified = true;
+            }
+          }
+          if (!isPaymentVerified) {
+            const poMatch = (store.paymentOrders || []).some(
+              (o) =>
+                (o as { payment_id?: string | null }).payment_id === paymentId &&
+                o.status === "paid" &&
+                (o.user_id.toUpperCase() === targetUserId.toUpperCase() || isAdmin) &&
+                (!o.video_id || o.video_id === vidId),
+            );
+            if (poMatch) {
+              isPaymentVerified = true;
+            }
+          }
+        }
+        if (!isPaymentVerified) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "Payment verification required: no verified payment transaction found for this payment_id.",
+            },
+            402,
+          );
+        }
+      }
+
+      let finalThumbnailUrl = String(
+        body.thumbnail_url ||
+          body.thumbnailUrl ||
+          "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=800&auto=format&fit=crop&q=60",
+      ).trim();
+
+      // Save base64 thumbnail to private or public disk depending on visibility
+      if (finalThumbnailUrl.startsWith("data:image/")) {
+        try {
+          const parts = finalThumbnailUrl.split(",");
+          if (parts.length === 2) {
+            const buffer = Buffer.from(parts[1]!, "base64");
+            const safeVidId = vidId.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const imgFileName = `thumb_${safeVidId}.jpg`;
+            if (visibility === "private") {
+              const privImgDir = getPrivateMediaDir("images", env);
+              await fs.promises.mkdir(privImgDir, { recursive: true });
+              await fs.promises.writeFile(path.join(privImgDir, imgFileName), buffer);
+              finalThumbnailUrl = `${PRIVATE_MEDIA_PREFIX}images/${imgFileName}`;
+            } else {
+              const imgUploadDir = path.resolve(process.cwd(), "uploads", "images");
+              await fs.promises.mkdir(imgUploadDir, { recursive: true });
+              await fs.promises.writeFile(path.join(imgUploadDir, imgFileName), buffer);
+              finalThumbnailUrl = `/uploads/images/${imgFileName}`;
+            }
+          }
+        } catch (imgErr) {
+          console.warn("Base64 thumbnail save error:", imgErr);
+        }
+      }
+
+      if (visibility === "private") {
+        videoUrl = await moveLocalMediaToPrivate(videoUrl, "videos", env);
+        finalThumbnailUrl = await moveLocalMediaToPrivate(finalThumbnailUrl, "images", env);
+      } else {
+        if (extractPrivateMediaReference(videoUrl)) {
+          videoUrl = await restorePrivateMediaToPublic(videoUrl, env);
+        } else if (
+          existingRow &&
+          extractPrivateMediaReference(existingRow.video_url) &&
+          extractLocalUploadReference(videoUrl)
+        ) {
+          await restorePrivateMediaToPublic(existingRow.video_url, env);
+        }
+        if (extractPrivateMediaReference(finalThumbnailUrl)) {
+          finalThumbnailUrl = await restorePrivateMediaToPublic(finalThumbnailUrl, env);
+        }
+      }
+
+      const defaultCreatorName =
+        targetUserId.toUpperCase() === authUser.user_id.toUpperCase()
+          ? authUser.name || "FaceTube Creator"
+          : "FaceTube Creator";
+
+      const newVideo = {
+        id: vidId,
+        user_id: targetUserId,
+        creator_name: String(body.creator_name || body.creatorName || defaultCreatorName).trim(),
+        title,
+        description: String(body.description || "").trim(),
+        video_url: videoUrl,
+        thumbnail_url: finalThumbnailUrl,
+        video_type: videoType,
+        content_type: contentType,
+        category: String(body.category || "General").trim(),
+        duration: String(body.duration || "1:00").trim(),
+        views: existingRow ? Number(existingRow.views) || 0 : 0,
+        likes: existingRow ? Number(existingRow.likes) || 0 : 0,
+        payment_status: paymentStatus,
+        payment_id: paymentId,
+        payment_amount:
+          Number(body.payment_amount ?? body.paymentAmount ?? (videoType === "premium" ? 6 : 0)) ||
+          0,
+        is_promoted: Boolean(existingRow?.is_promoted || isPromotedInput),
+        visibility,
+        created_at: existingRow?.created_at || new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+
+      const buildCreatedResponseVideo = () => {
+        const outVideoUrl = resolvePrivateMediaOutputUrl({
+          storedUrl: newVideo.video_url,
+          videoId: newVideo.id,
+          visibility,
+          kind: "video",
+          canAccessPrivate: true,
+          env,
+        });
+        const outThumbUrl = resolvePrivateMediaOutputUrl({
+          storedUrl: newVideo.thumbnail_url,
+          videoId: newVideo.id,
+          visibility,
+          kind: "thumbnail",
+          canAccessPrivate: true,
+          env,
+        });
+        return {
+          ...newVideo,
+          userId: newVideo.user_id,
+          creatorName: newVideo.creator_name,
+          videoUrl: outVideoUrl,
+          video_url: outVideoUrl,
+          thumbnailUrl: outThumbUrl,
+          thumbnail_url: outThumbUrl,
+          videoType: newVideo.video_type,
+          contentType: newVideo.content_type,
+          paymentStatus: newVideo.payment_status,
+          paymentId: newVideo.payment_id,
+          paymentAmount: newVideo.payment_amount,
+          isPromoted: newVideo.is_promoted,
+        };
+      };
+
+      if (pool) {
+        try {
+          const hasVisibilityCol = await hasVisibilityColumnMysql(pool);
+          if (!hasVisibilityCol && visibility !== "public") {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Database migration required: uploaded_videos.visibility column does not exist yet.",
+              },
+              500,
+            );
+          }
+
+          if (hasVisibilityCol) {
+            await pool.query(
+              `INSERT INTO uploaded_videos (
+                id, user_id, creator_name, title, description, video_url, thumbnail_url,
+                video_type, content_type, category, duration, views, likes,
+                payment_status, payment_id, payment_amount, is_promoted, visibility,
+                created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, NOW(), NOW())
+              ON DUPLICATE KEY UPDATE
+                title = VALUES(title),
+                description = VALUES(description),
+                video_url = VALUES(video_url),
+                thumbnail_url = VALUES(thumbnail_url),
+                video_type = VALUES(video_type),
+                content_type = VALUES(content_type),
+                category = VALUES(category),
+                duration = VALUES(duration),
+                payment_status = VALUES(payment_status),
+                payment_id = VALUES(payment_id),
+                payment_amount = VALUES(payment_amount),
+                visibility = VALUES(visibility),
+                updated_at = NOW()`,
+              [
+                newVideo.id,
+                newVideo.user_id,
+                newVideo.creator_name,
+                newVideo.title,
+                newVideo.description,
+                newVideo.video_url,
+                newVideo.thumbnail_url,
+                newVideo.video_type,
+                newVideo.content_type,
+                newVideo.category,
+                newVideo.duration,
+                newVideo.payment_status,
+                newVideo.payment_id || null,
+                newVideo.payment_amount,
+                newVideo.is_promoted ? 1 : 0,
+                newVideo.visibility,
+              ],
+            );
+          } else {
+            await pool.query(
+              `INSERT INTO uploaded_videos (
+                id, user_id, creator_name, title, description, video_url, thumbnail_url,
+                video_type, content_type, category, duration, views, likes,
+                payment_status, payment_id, payment_amount, is_promoted,
+                created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, NOW(), NOW())
+              ON DUPLICATE KEY UPDATE
+                title = VALUES(title),
+                description = VALUES(description),
+                video_url = VALUES(video_url),
+                thumbnail_url = VALUES(thumbnail_url),
+                video_type = VALUES(video_type),
+                content_type = VALUES(content_type),
+                category = VALUES(category),
+                duration = VALUES(duration),
+                payment_status = VALUES(payment_status),
+                payment_id = VALUES(payment_id),
+                payment_amount = VALUES(payment_amount),
+                updated_at = NOW()`,
+              [
+                newVideo.id,
+                newVideo.user_id,
+                newVideo.creator_name,
+                newVideo.title,
+                newVideo.description,
+                newVideo.video_url,
+                newVideo.thumbnail_url,
+                newVideo.video_type,
+                newVideo.content_type,
+                newVideo.category,
+                newVideo.duration,
+                newVideo.payment_status,
+                newVideo.payment_id || null,
+                newVideo.payment_amount,
+                newVideo.is_promoted ? 1 : 0,
+              ],
+            );
+          }
+          return jsonResponse({ success: true, video: buildCreatedResponseVideo() }, 201);
         } catch (dbErr: any) {
           console.warn("MySQL uploaded_videos insert warning:", dbErr?.message);
           if (isProd) {
@@ -5392,9 +6046,121 @@ export async function handleApiRequest(
         );
       }
 
-      store.videos.unshift(newVideo);
+      const existingStoreIdx = store.videos.findIndex((v) => v.id === vidId);
+      if (existingStoreIdx !== -1) {
+        store.videos[existingStoreIdx] = {
+          ...store.videos[existingStoreIdx]!,
+          ...newVideo,
+        };
+      } else {
+        store.videos.unshift(newVideo);
+      }
       saveStore(store, env);
-      return jsonResponse({ success: true, video: newVideo }, 201);
+      return jsonResponse({ success: true, video: buildCreatedResponseVideo() }, 201);
+    }
+  }
+
+  if (route === "videos/media") {
+    if (method === "GET" || method === "HEAD") {
+      const id = (url.searchParams.get("id") || "").trim();
+      const rawKind = (url.searchParams.get("kind") || "video").trim().toLowerCase();
+      const kind: "video" | "thumbnail" = rawKind === "thumbnail" ? "thumbnail" : "video";
+      if (!id) {
+        return jsonResponse({ success: false, error: "Video ID is required." }, 400);
+      }
+
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+        request,
+        store,
+        pool,
+        env,
+      );
+      if (earlyResponse) {
+        return earlyResponse;
+      }
+
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
+
+      let videoRecord: any = null;
+      if (pool) {
+        try {
+          const [rows]: any = await pool.query(
+            "SELECT * FROM uploaded_videos WHERE id = ? LIMIT 1",
+            [id],
+          );
+          if (Array.isArray(rows) && rows.length > 0) {
+            videoRecord = rows[0];
+          }
+        } catch (dbErr: any) {
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error loading media: " + dbErr.message },
+              503,
+            );
+          }
+        }
+      }
+      if (!videoRecord && !isProd) {
+        videoRecord = store.videos.find((v) => v.id === id) || null;
+      }
+
+      if (!videoRecord) {
+        return jsonResponse({ success: false, error: "Video not found." }, 404);
+      }
+
+      const isAdmin = Boolean(authUser && authUser.role === "admin");
+      const isOwner = Boolean(
+        authUser &&
+        String(videoRecord.user_id || "")
+          .trim()
+          .toUpperCase() === authUser.user_id.trim().toUpperCase(),
+      );
+
+      if (videoRecord.is_blocked && !isAdmin) {
+        return jsonResponse(
+          { success: false, error: "This video has been blocked by administrators." },
+          403,
+        );
+      }
+
+      const visibility = normalizeVideoVisibility(videoRecord.visibility, "public") ?? "public";
+      const hasValidSig = verifyPrivateMediaSignature(
+        id,
+        kind,
+        url.searchParams.get("exp"),
+        url.searchParams.get("sig"),
+        env,
+      );
+
+      if (visibility === "private" && !isOwner && !isAdmin && !hasValidSig) {
+        return jsonResponse(
+          {
+            success: false,
+            error: authUser
+              ? "Forbidden: Private media is restricted to the video owner or an administrator."
+              : "Authentication required to access private media.",
+          },
+          authUser ? 403 : 401,
+        );
+      }
+
+      const storedUrl =
+        kind === "thumbnail" ? videoRecord.thumbnail_url || "" : videoRecord.video_url || "";
+      const diskPath = await resolvePrivateMediaDiskPath(storedUrl, env);
+      if (!diskPath) {
+        return jsonResponse(
+          { success: false, error: "Media file not found in protected storage." },
+          404,
+        );
+      }
+
+      return streamPrivateFileWithRange(request, diskPath);
     }
   }
 
@@ -5541,15 +6307,35 @@ export async function handleApiRequest(
 
   if (route === "videos/promote") {
     if (method === "POST") {
+      const pool = resolvePool();
+      const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+        request,
+        store,
+        pool,
+        env,
+      );
+      if (earlyResponse) {
+        return earlyResponse;
+      }
+      if (!authUser) {
+        return jsonResponse(
+          {
+            success: false,
+            error: "Authentication required. Please provide a valid Bearer session token.",
+          },
+          401,
+        );
+      }
+
       const body = await request.json();
-      const videoId = body.videoId || body.video_id;
+      const videoId = String(body.videoId || body.video_id || "").trim();
       if (!videoId) return jsonResponse({ success: false, error: "Missing videoId" }, 400);
 
-      const days = Number(body.durationDays || body.duration_days) || 30;
-      const planId = body.planId || body.plan_id || "plan-monthly";
+      const days = Math.max(1, Number(body.durationDays || body.duration_days) || 30);
+      const planId = String(body.planId || body.plan_id || "plan-monthly").trim();
       const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+      const isAdmin = authUser.role === "admin";
 
-      const pool = resolvePool();
       if (isProd && !pool) {
         return jsonResponse(
           {
@@ -5563,6 +6349,35 @@ export async function handleApiRequest(
 
       if (pool) {
         try {
+          const [vRows]: any = await pool.query(
+            "SELECT * FROM uploaded_videos WHERE id = ? LIMIT 1",
+            [videoId],
+          );
+          if (!Array.isArray(vRows) || vRows.length === 0) {
+            return jsonResponse({ success: false, error: "Video not found." }, 404);
+          }
+          const vRow = vRows[0];
+          if (
+            String(vRow.user_id || "").toUpperCase() !== authUser.user_id.toUpperCase() &&
+            !isAdmin
+          ) {
+            return jsonResponse(
+              { success: false, error: "Forbidden: You do not own this video." },
+              403,
+            );
+          }
+          const vis = normalizeVideoVisibility(vRow.visibility, "public") ?? "public";
+          if (vis !== "public") {
+            return jsonResponse(
+              {
+                success: false,
+                error:
+                  "Sponsored and Global Pool eligible videos must use 'public' visibility. Only public videos can be promoted.",
+              },
+              400,
+            );
+          }
+
           await pool.query(
             "UPDATE uploaded_videos SET is_promoted = 1, promotion_plan = ?, promotion_expires_at = ?, updated_at = NOW() WHERE id = ?",
             [planId, expiresAt, videoId],
@@ -5599,12 +6414,31 @@ export async function handleApiRequest(
       }
 
       const vid = store.videos.find((v) => v.id === videoId);
-      if (vid) {
-        vid.is_promoted = true;
-        vid.promotion_plan = planId;
-        vid.promotion_expires_at = expiresAt;
-        saveStore(store, env);
+      if (!vid) {
+        return jsonResponse({ success: false, error: "Video not found." }, 404);
       }
+      if (vid.user_id.toUpperCase() !== authUser.user_id.toUpperCase() && !isAdmin) {
+        return jsonResponse(
+          { success: false, error: "Forbidden: You do not own this video." },
+          403,
+        );
+      }
+      const vis = normalizeVideoVisibility(vid.visibility, "public") ?? "public";
+      if (vis !== "public") {
+        return jsonResponse(
+          {
+            success: false,
+            error:
+              "Sponsored and Global Pool eligible videos must use 'public' visibility. Only public videos can be promoted.",
+          },
+          400,
+        );
+      }
+
+      vid.is_promoted = true;
+      vid.promotion_plan = planId;
+      vid.promotion_expires_at = expiresAt;
+      saveStore(store, env);
 
       return jsonResponse({
         success: true,
@@ -5620,6 +6454,27 @@ export async function handleApiRequest(
       try {
         const formData = await request.formData();
         const file = formData.get("video");
+        const requestedVis = normalizeVideoVisibility(formData.get("visibility"), "public");
+        if (!requestedVis) {
+          return jsonResponse({ success: false, error: "Invalid visibility parameter." }, 400);
+        }
+        const isPrivateUpload = requestedVis === "private";
+        if (isPrivateUpload) {
+          const pool = resolvePool();
+          const { authUser, earlyResponse } = await resolveAuthWithProdDbGuard(
+            request,
+            store,
+            pool,
+            env,
+          );
+          if (earlyResponse) return earlyResponse;
+          if (!authUser) {
+            return jsonResponse(
+              { success: false, error: "Authentication required for private media uploads." },
+              401,
+            );
+          }
+        }
 
         if (!file || typeof file === "string") {
           return jsonResponse(
@@ -5660,7 +6515,9 @@ export async function handleApiRequest(
           );
         }
 
-        const uploadDir = path.resolve(process.cwd(), "uploads", "videos");
+        const uploadDir = isPrivateUpload
+          ? getPrivateMediaDir("videos", env)
+          : path.resolve(process.cwd(), "uploads", "videos");
         await fs.promises.mkdir(uploadDir, { recursive: true });
 
         const uniqueName = `vid_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${ext}`;
@@ -5673,11 +6530,14 @@ export async function handleApiRequest(
         return jsonResponse(
           {
             success: true,
-            url: `/uploads/videos/${uniqueName}`,
+            url: isPrivateUpload
+              ? `${PRIVATE_MEDIA_PREFIX}videos/${uniqueName}`
+              : `/uploads/videos/${uniqueName}`,
             fileName: uniqueName,
             format: ext,
             fileSize: fileSizeMb,
             sizeBytes: videoFile.size,
+            visibility: requestedVis,
             uploadedAt: new Date().toISOString(),
           },
           201,
@@ -7669,33 +8529,43 @@ export async function handleApiRequest(
       if (pool) {
         try {
           let hasAdEarningsCol = false;
+          let hasVisibilityCol = false;
           try {
             const [colRows]: any = await pool.query(
               `SELECT COLUMN_NAME
                FROM INFORMATION_SCHEMA.COLUMNS
                WHERE TABLE_SCHEMA = DATABASE()
                  AND TABLE_NAME = 'uploaded_videos'
-                 AND COLUMN_NAME = 'ad_earnings'`,
+                 AND COLUMN_NAME IN ('ad_earnings', 'visibility')`,
             );
-            if (Array.isArray(colRows) && colRows.length > 0) {
-              hasAdEarningsCol = true;
+            if (Array.isArray(colRows)) {
+              for (const row of colRows) {
+                const colName = String(row?.COLUMN_NAME || "").toLowerCase();
+                if (colName === "ad_earnings") hasAdEarningsCol = true;
+                if (colName === "visibility") hasVisibilityCol = true;
+              }
             }
           } catch (_colErr) {
             hasAdEarningsCol = false;
+            hasVisibilityCol = false;
           }
 
           const adEarningsSelect = hasAdEarningsCol
             ? ", COALESCE(ad_earnings, 0.00) AS ad_earnings"
             : "";
+          const visibilitySelect = hasVisibilityCol
+            ? ", COALESCE(visibility, 'public') AS visibility"
+            : "";
           const [rows]: any = await pool.query(
             `SELECT id, user_id, creator_name, title, description, video_url, thumbnail_url,
                     video_type, content_type, category, duration, views, likes,
-                    is_promoted, is_blocked, block_reason, blocked_at, created_at${adEarningsSelect}
+                    is_promoted, is_blocked, block_reason, blocked_at, created_at${visibilitySelect}${adEarningsSelect}
              FROM uploaded_videos
              ORDER BY created_at DESC`,
           );
           const list = (Array.isArray(rows) ? rows : []).map((v: any) => ({
             ...v,
+            visibility: normalizeVideoVisibility(v.visibility, "public") ?? "public",
             is_blocked: Boolean(v.is_blocked),
             ...(hasAdEarningsCol ||
             (Object.prototype.hasOwnProperty.call(v, "ad_earnings") &&
@@ -7726,6 +8596,7 @@ export async function handleApiRequest(
       }
       const list = store.videos.map((v) => ({
         ...v,
+        visibility: normalizeVideoVisibility(v.visibility, "public") ?? "public",
         is_blocked: Boolean(v.is_blocked),
         ...(v.ad_earnings !== undefined && v.ad_earnings !== null
           ? { ad_earnings: Math.round((Number(v.ad_earnings) || 0) * 100) / 100 }

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isFileInPrivateMediaStorage } from "./private-media.ts";
 
 const MIME_TYPES: Record<string, string> = {
   ".mp4": "video/mp4",
@@ -40,6 +41,29 @@ export async function serveUploadFile(request: Request): Promise<Response | null
       status: 403,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  const privateMatch = relPath.match(/^(videos|images)\/([^/]+)$/i);
+  if (
+    privateMatch &&
+    isFileInPrivateMediaStorage(
+      privateMatch[1]!.toLowerCase() as "videos" | "images",
+      privateMatch[2]!,
+    )
+  ) {
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: "Private media cannot be accessed via public static URLs.",
+      }),
+      {
+        status: 403,
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "private, no-store",
+        },
+      },
+    );
   }
 
   const DEMO_SAMPLE_FALLBACKS: Record<string, string> = {

@@ -22,34 +22,35 @@ if ($method === 'GET') {
         $hasAdEarningsCol = false;
         try {
             $colStmt = $pdo->query("
-                SELECT COLUMN_NAME
+                SELECT COUNT(*)
                 FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME = 'uploaded_videos'
                   AND COLUMN_NAME = 'ad_earnings'
             ");
-            if ($colStmt && $colStmt->fetchColumn()) {
-                $hasAdEarningsCol = true;
-            }
+            $hasAdEarningsCol = $colStmt && intval($colStmt->fetchColumn()) > 0;
         } catch (Exception $eCol) {
             $hasAdEarningsCol = false;
         }
+        $hasVisibilityCol = hasUploadedVideosVisibilityColumn($pdo);
 
         $adEarningsSelect = $hasAdEarningsCol ? ', COALESCE(ad_earnings, 0.00) AS ad_earnings' : '';
+        $visibilitySelect = $hasVisibilityCol ? ", COALESCE(visibility, 'public') AS visibility" : ", 'public' AS visibility";
         $stmt = $pdo->query("
             SELECT id, user_id, creator_name, title, description, video_url, thumbnail_url,
                    video_type, content_type, category, duration, views, likes,
-                   is_promoted, is_blocked, block_reason, blocked_at, created_at{$adEarningsSelect}
+                   is_promoted, is_blocked, block_reason, blocked_at, created_at{$visibilitySelect}{$adEarningsSelect}
             FROM uploaded_videos
             ORDER BY created_at DESC
         ");
         $videos = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        if ($hasAdEarningsCol) {
-            $videos = array_map(function ($v) {
+        $videos = array_map(function ($v) use ($hasAdEarningsCol) {
+            $v['visibility'] = normalizeVideoVisibility($v['visibility'] ?? null, 'public') ?? 'public';
+            if ($hasAdEarningsCol) {
                 $v['ad_earnings'] = round(floatval($v['ad_earnings'] ?? 0), 2);
-                return $v;
-            }, $videos);
-        }
+            }
+            return $v;
+        }, $videos);
 
         jsonResponse([
             'success' => true,

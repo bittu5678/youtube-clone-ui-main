@@ -7,13 +7,16 @@
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../response.php';
 
-$id = trim($_GET['id'] ?? '');
+$id = trim((string)($_GET['id'] ?? ''));
 
 if (empty($id)) {
     jsonResponse(['success' => false, 'error' => 'Video ID is required.'], 400);
 }
 
 $pdo = getDatabaseConnection();
+$authUser = getAuthUser($pdo);
+$isAdmin = $authUser && isset($authUser['role']) && strtolower((string)$authUser['role']) === 'admin';
+$authUserId = $authUser ? trim((string)$authUser['user_id']) : '';
 
 try {
     $stmt = $pdo->prepare('SELECT * FROM uploaded_videos WHERE id = ? LIMIT 1');
@@ -33,11 +36,34 @@ try {
         ], 403);
     }
 
-    // Increment views counter
+    $visibility = normalizeVideoVisibility($row['visibility'] ?? null, 'public') ?? 'public';
+    $isOwner = $authUserId !== '' && strcasecmp((string)$row['user_id'], $authUserId) === 0;
+    $canAccessOwnerOrAdmin = ($isOwner || $isAdmin);
+
+    if ($visibility === 'private' && !$canAccessOwnerOrAdmin) {
+        jsonResponse([
+            'success' => false,
+            'error' => 'Forbidden: This video is private. Only the video owner or an administrator can access it.'
+        ], 403);
+    }
+
+    $videoType = strtolower((string)($row['video_type'] ?? 'free'));
+    $paymentStatus = strtolower((string)($row['payment_status'] ?? 'not_required'));
+    if ($videoType === 'premium' && in_array($paymentStatus, ['pending', 'failed'], true) && !$canAccessOwnerOrAdmin) {
+        jsonResponse([
+            'success' => false,
+            'error' => 'Forbidden: This premium video is awaiting payment confirmation.'
+        ], 403);
+    }
+
+    // Increment views counter ONLY after authorization checks succeed
     $pdo->prepare('UPDATE uploaded_videos SET views = views + 1 WHERE id = ?')->execute([$id]);
 
     $expiryTime = !empty($row['promotion_expires_at']) ? strtotime($row['promotion_expires_at']) : false;
     $isActivePromoted = !empty($row['is_promoted']) && $expiryTime !== false && $expiryTime > time();
+
+    $videoUrl = resolveVideoMediaOutputUrl($row['video_url'] ?? '', (string)$row['id'], $visibility, 'video', $canAccessOwnerOrAdmin);
+    $thumbUrl = resolveVideoMediaOutputUrl($row['thumbnail_url'] ?? '', (string)$row['id'], $visibility, 'thumbnail', $canAccessOwnerOrAdmin);
 
     $video = [
         'id' => $row['id'],
@@ -47,10 +73,10 @@ try {
         'creator_name' => $row['creator_name'],
         'title' => $row['title'],
         'description' => $row['description'] ?? '',
-        'videoUrl' => toAbsoluteMediaUrl($row['video_url'], 'videos'),
-        'video_url' => toAbsoluteMediaUrl($row['video_url'], 'videos'),
-        'thumbnailUrl' => toAbsoluteMediaUrl($row['thumbnail_url'] ?? '', 'images'),
-        'thumbnail_url' => toAbsoluteMediaUrl($row['thumbnail_url'] ?? '', 'images'),
+        'videoUrl' => $videoUrl,
+        'video_url' => $videoUrl,
+        'thumbnailUrl' => $thumbUrl,
+        'thumbnail_url' => $thumbUrl,
         'videoType' => $row['video_type'],
         'video_type' => $row['video_type'],
         'contentType' => $row['content_type'],
@@ -71,6 +97,7 @@ try {
         'is_active_promoted' => (bool)$isActivePromoted,
         'rawIsPromoted' => (bool)$row['is_promoted'],
         'raw_is_promoted' => (bool)$row['is_promoted'],
+        'visibility' => $visibility,
         'promotionPlan' => $row['promotion_plan'],
         'promotionExpiresAt' => $row['promotion_expires_at'],
         'createdAt' => $row['created_at'],

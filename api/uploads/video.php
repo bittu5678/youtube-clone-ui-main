@@ -10,12 +10,28 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     jsonResponse(['success' => false, 'error' => 'Method Not Allowed. Use POST to upload video files.'], 405);
 }
 
-// Ensure destination storage directory exists and is writable in the public web root
-$uploadDir = ensureMediaStorageDir('videos');
+$requestedVisibility = normalizeVideoVisibility($_POST['visibility'] ?? null, 'public');
+if ($requestedVisibility === null) {
+    jsonResponse(['success' => false, 'error' => 'Invalid visibility parameter.'], 400);
+}
+$isPrivateUpload = ($requestedVisibility === 'private');
+
+if ($isPrivateUpload) {
+    require_once __DIR__ . '/../config/database.php';
+    $pdoUpload = getDatabaseConnection();
+    $authUploadUser = getAuthUser($pdoUpload);
+    if (!$authUploadUser) {
+        jsonResponse(['success' => false, 'error' => 'Authentication required for private media uploads.'], 401);
+    }
+    $uploadDir = ensurePrivateMediaDir('videos');
+} else {
+    // Ensure destination storage directory exists and is writable in the public web root
+    $uploadDir = ensureMediaStorageDir('videos');
+}
 if (!$uploadDir) {
     jsonResponse([
         'success' => false,
-        'error' => 'Failed to initialize video upload storage directory. Please verify write permissions on uploads/videos/ on Hostinger.'
+        'error' => 'Failed to initialize video upload storage directory. Please verify write permissions on storage on Hostinger.'
     ], 500);
 }
 
@@ -115,16 +131,20 @@ if (!@move_uploaded_file($tmpName, $target)) {
     ], 500);
 }
 
-// Sync to secondary storage directories (e.g. root uploads/) so both docroots stay consistent
-$allDirs = getMediaStorageDirectories('videos');
-foreach ($allDirs as $otherDir) {
-    if ($otherDir !== $uploadDir && is_dir($otherDir) && is_writable($otherDir)) {
-        @copy($target, $otherDir . $fileName);
+if (!$isPrivateUpload) {
+    // Sync to secondary storage directories (e.g. root uploads/) so both docroots stay consistent
+    $allDirs = getMediaStorageDirectories('videos');
+    foreach ($allDirs as $otherDir) {
+        if ($otherDir !== $uploadDir && is_dir($otherDir) && is_writable($otherDir)) {
+            @copy($target, $otherDir . $fileName);
+        }
     }
 }
 
 $fileSizeMb = round($fileSize / (1024 * 1024), 2) . ' MB';
-$publicUrl = toAbsoluteMediaUrl('/uploads/videos/' . $fileName, 'videos');
+$publicUrl = $isPrivateUpload
+    ? 'private_media://videos/' . $fileName
+    : toAbsoluteMediaUrl('/uploads/videos/' . $fileName, 'videos');
 
 jsonResponse([
     'success' => true,
@@ -133,5 +153,6 @@ jsonResponse([
     'format' => $ext,
     'fileSize' => $fileSizeMb,
     'sizeBytes' => $fileSize,
+    'visibility' => $requestedVisibility,
     'uploadedAt' => date('c'),
 ], 201);

@@ -8,23 +8,45 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../response.php';
 
 $pdo = getDatabaseConnection();
+$authUser = getAuthUser($pdo);
+$isAdmin = $authUser && isset($authUser['role']) && strtolower((string)$authUser['role']) === 'admin';
+$authUserId = $authUser ? trim((string)$authUser['user_id']) : '';
 
-$userId = trim($_GET['userId'] ?? ($_GET['user_id'] ?? ''));
-$videoType = trim($_GET['videoType'] ?? ($_GET['video_type'] ?? ''));
-$contentType = trim($_GET['contentType'] ?? ($_GET['content_type'] ?? ''));
-$category = trim($_GET['category'] ?? '');
-$search = trim($_GET['search'] ?? ($_GET['q'] ?? ''));
+$userId = trim((string)($_GET['userId'] ?? ($_GET['user_id'] ?? '')));
+$videoType = trim((string)($_GET['videoType'] ?? ($_GET['video_type'] ?? '')));
+$contentType = trim((string)($_GET['contentType'] ?? ($_GET['content_type'] ?? '')));
+$category = trim((string)($_GET['category'] ?? ''));
+$search = trim((string)($_GET['search'] ?? ($_GET['q'] ?? '')));
 $limit = max(1, min(100, intval($_GET['limit'] ?? 50)));
 $offset = max(0, intval($_GET['offset'] ?? 0));
 
-$includeBlocked = !empty($_GET['include_blocked']) || !empty($_GET['includeBlocked']);
-if (!$includeBlocked) {
+$includeBlockedRequested = !empty($_GET['include_blocked']) || !empty($_GET['includeBlocked']);
+$includeNonPublicRequested = !empty($_GET['include_non_public']) || !empty($_GET['includeNonPublic']) || !empty($_GET['include_private']) || !empty($_GET['includePrivate']);
+
+$isOwnerRequest = $authUser && $userId !== '' && strcasecmp($authUserId, $userId) === 0;
+$canViewOwnerNonPublic = ($userId !== '' && ($isOwnerRequest || $isAdmin))
+    || ($userId === '' && $isAdmin && ($includeBlockedRequested || $includeNonPublicRequested));
+
+$hasVisibilityCol = hasUploadedVideosVisibilityColumn($pdo);
+
+$where = [];
+$params = [];
+
+if (!($includeBlockedRequested && $isAdmin)) {
     $where[] = 'COALESCE(is_blocked, 0) = 0';
 }
 
-if (!empty($userId)) {
+if ($userId !== '') {
     $where[] = 'UPPER(user_id) = UPPER(?)';
     $params[] = $userId;
+}
+
+if (!$canViewOwnerNonPublic) {
+    if ($hasVisibilityCol) {
+        $where[] = "COALESCE(visibility, 'public') = 'public'";
+    }
+    // Prevent unpaid/pending/failed premium videos from leaking into public feeds
+    $where[] = "(video_type != 'premium' OR payment_status IN ('paid', 'not_required'))";
 }
 
 if (!empty($videoType) && in_array($videoType, ['free', 'premium'], true)) {
@@ -51,13 +73,14 @@ if (!empty($search)) {
 }
 
 $whereSql = !empty($where) ? 'WHERE ' . implode(' AND ', $where) : '';
+$visibilitySelect = $hasVisibilityCol ? "COALESCE(visibility, 'public') AS visibility" : "'public' AS visibility";
 
 try {
     $sql = "
         SELECT 
             id, user_id, creator_name, title, description, video_url, thumbnail_url,
             video_type, content_type, category, duration, views, likes,
-            payment_status, payment_id, payment_amount, is_promoted,
+            payment_status, payment_id, payment_amount, is_promoted, {$visibilitySelect},
             promotion_plan, promotion_expires_at, created_at, updated_at,
             (is_promoted = 1 AND promotion_expires_at IS NOT NULL AND promotion_expires_at > NOW()) AS is_active_promoted
         FROM uploaded_videos
@@ -70,9 +93,15 @@ try {
     $stmt->execute($params);
     $rows = $stmt->fetchAll();
 
-    $videos = array_map(function ($row) {
+    $videos = array_map(function ($row) use ($authUserId, $isAdmin) {
         $expiryTime = !empty($row['promotion_expires_at']) ? strtotime($row['promotion_expires_at']) : false;
         $isActivePromoted = !empty($row['is_promoted']) && $expiryTime !== false && $expiryTime > time();
+        $visibility = normalizeVideoVisibility($row['visibility'] ?? null, 'public') ?? 'public';
+        $isOwner = $authUserId !== '' && strcasecmp((string)$row['user_id'], $authUserId) === 0;
+        $canAccessPrivate = ($isOwner || $isAdmin);
+
+        $videoUrl = resolveVideoMediaOutputUrl($row['video_url'] ?? '', (string)$row['id'], $visibility, 'video', $canAccessPrivate);
+        $thumbUrl = resolveVideoMediaOutputUrl($row['thumbnail_url'] ?? '', (string)$row['id'], $visibility, 'thumbnail', $canAccessPrivate);
 
         return [
             'id' => $row['id'],
@@ -82,10 +111,10 @@ try {
             'creator_name' => $row['creator_name'],
             'title' => $row['title'],
             'description' => $row['description'] ?? '',
-            'videoUrl' => toAbsoluteMediaUrl($row['video_url'], 'videos'),
-            'video_url' => toAbsoluteMediaUrl($row['video_url'], 'videos'),
-            'thumbnailUrl' => toAbsoluteMediaUrl($row['thumbnail_url'] ?? '', 'images'),
-            'thumbnail_url' => toAbsoluteMediaUrl($row['thumbnail_url'] ?? '', 'images'),
+            'videoUrl' => $videoUrl,
+            'video_url' => $videoUrl,
+            'thumbnailUrl' => $thumbUrl,
+            'thumbnail_url' => $thumbUrl,
             'videoType' => $row['video_type'],
             'video_type' => $row['video_type'],
             'contentType' => $row['content_type'],
@@ -106,6 +135,7 @@ try {
             'is_active_promoted' => (bool)$isActivePromoted,
             'rawIsPromoted' => (bool)$row['is_promoted'],
             'raw_is_promoted' => (bool)$row['is_promoted'],
+            'visibility' => $visibility,
             'promotionPlan' => $row['promotion_plan'],
             'promotionExpiresAt' => $row['promotion_expires_at'],
             'createdAt' => $row['created_at'],

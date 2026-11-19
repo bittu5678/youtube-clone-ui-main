@@ -259,25 +259,47 @@ describe("Task 10: Bulk Video Upload Verification & Integration Tests", () => {
       assert.equal(data.video.videoType || data.video.video_type, "free");
     });
 
-    it("verifies both bulk uploaded videos appear in the video feed via /api/videos/list", async () => {
-      const req = new Request("http://localhost:3000/api/videos/list?userId=FT483921", {
+    it("verifies both bulk uploaded videos appear in owner feed via /api/videos/list and unlisted is excluded for anonymous callers", async () => {
+      const ownerReq = new Request("http://localhost:3000/api/videos/list?userId=FT483921", {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${userToken}`,
+        },
+      });
+      const ownerRes = await handleApiRequest(ownerReq);
+      assert.ok(ownerRes);
+      assert.equal(ownerRes.status, 200);
+
+      const ownerData = await ownerRes.json();
+      assert.equal(ownerData.success, true);
+      assert.ok(Array.isArray(ownerData.videos), "Must return videos array");
+
+      const foundShort = ownerData.videos.find((v: any) => v.id === shortVidId);
+      assert.ok(foundShort, "Bulk uploaded short video must be found in owner catalog");
+      assert.equal(foundShort.content_type || foundShort.contentType, "short");
+      assert.equal(foundShort.visibility, "public");
+
+      const foundLong = ownerData.videos.find((v: any) => v.id === longVidId);
+      assert.ok(foundLong, "Bulk uploaded long unlisted video must be found in owner catalog");
+      assert.equal(foundLong.content_type || foundLong.contentType, "long");
+      assert.equal(foundLong.visibility, "unlisted");
+
+      const anonReq = new Request("http://localhost:3000/api/videos/list?userId=FT483921", {
         method: "GET",
       });
-      const res = await handleApiRequest(req);
-      assert.ok(res);
-      assert.equal(res.status, 200);
-
-      const data = await res.json();
-      assert.equal(data.success, true);
-      assert.ok(Array.isArray(data.videos), "Must return videos array");
-
-      const foundShort = data.videos.find((v: any) => v.id === shortVidId);
-      assert.ok(foundShort, "Bulk uploaded short video must be found in catalog");
-      assert.equal(foundShort.content_type || foundShort.contentType, "short");
-
-      const foundLong = data.videos.find((v: any) => v.id === longVidId);
-      assert.ok(foundLong, "Bulk uploaded long video must be found in catalog");
-      assert.equal(foundLong.content_type || foundLong.contentType, "long");
+      const anonRes = await handleApiRequest(anonReq);
+      assert.ok(anonRes);
+      assert.equal(anonRes.status, 200);
+      const anonData = await anonRes.json();
+      assert.ok(
+        anonData.videos.some((v: any) => v.id === shortVidId),
+        "Public video must remain visible in public feed",
+      );
+      assert.equal(
+        anonData.videos.some((v: any) => v.id === longVidId),
+        false,
+        "Unlisted video must not appear in public/anonymous listing",
+      );
     });
   });
 
