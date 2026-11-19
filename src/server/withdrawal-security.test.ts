@@ -1,10 +1,13 @@
-import { describe, it, beforeEach, after } from "node:test";
+import { describe, it, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { handleApiRequest } from "./api-handler.ts";
+import { handleApiRequest, resetInMemoryStore, resetStoreForTests } from "./api-handler.ts";
+import { setTestPersistentDataDir } from "./payments.ts";
 
-const STORE_PATH = path.resolve(process.cwd(), "data/facetube_store.json");
+let testDataDir = "";
+let STORE_PATH = "";
 
 function resetUserForTest(userId: string, balance = 25000) {
   const raw = fs.readFileSync(STORE_PATH, "utf-8");
@@ -39,10 +42,21 @@ function resetUserForTest(userId: string, balance = 25000) {
 
 describe("FaceTube Node.js Withdrawal Security & Cumulative Daily Limit Tests", () => {
   const env = { JWT_SECRET: "test_jwt_secret_key" };
-  const initialStoreSnapshot = fs.readFileSync(STORE_PATH, "utf-8");
+
+  before(() => {
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-withdrawal-sec-test-"));
+    STORE_PATH = path.join(testDataDir, "facetube_store.json");
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
+    resetStoreForTests(undefined, 50000, env);
+  });
 
   after(() => {
-    fs.writeFileSync(STORE_PATH, initialStoreSnapshot, "utf-8");
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+    }
   });
 
   // Helper to login and get token

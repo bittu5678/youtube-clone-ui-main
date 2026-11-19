@@ -4,19 +4,14 @@ import {
   LayoutDashboard,
   TrendingUp,
   Wallet,
-  Users,
   Video,
-  ArrowUpRight,
-  Sparkles,
-  Award,
   Bell,
-  Layers,
   Clapperboard,
   Clock,
   DollarSign,
-  Network,
-  CheckCircle2,
   Zap,
+  AlertCircle,
+  Lock,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -26,15 +21,17 @@ import {
   YAxis,
   Tooltip,
   CartesianGrid,
-  BarChart,
-  Bar,
 } from "recharts";
 import { VideoHubLayout } from "@/components/videohub/VideoHubLayout";
 import { DashboardSummaryCards } from "@/components/videohub/DashboardSummaryCards";
 import { useAuth } from "@/lib/auth-context";
 import { api } from "@/lib/api";
-import { calculateUserVideoCounts, type VideoCategoryCounts } from "@/lib/video-service";
-import { getUserWallet, type UserWallet } from "@/lib/ledger-service";
+import type { VideoCategoryCounts } from "@/lib/video-service";
+import {
+  getAuthoritativeUserWallet,
+  calculateTotalAdEarning,
+  type UserWallet,
+} from "@/lib/ledger-service";
 import { getReferralDashboardData, type ReferralDashboardData } from "@/lib/referral-service";
 import { calculateRankFromSubscribers } from "@/lib/certificate-service";
 
@@ -45,40 +42,24 @@ export const Route = createFileRoute("/dashboard")({
       {
         name: "description",
         content:
-          "Unified creator dashboard with database-driven video counts, real subscriber analytics, watch time, and revenue streams on FaceTube.",
+          "Unified creator dashboard with database-driven video counts, subscriber analytics, and verified ad revenue streams on FaceTube.",
       },
     ],
   }),
   component: DashboardPage,
 });
 
-// Analytics trend data for Charts
-
-const WATCH_TIME_CHART_DATA = [
-  { day: "Mon", hours: 410 },
-  { day: "Tue", hours: 520 },
-  { day: "Wed", hours: 480 },
-  { day: "Thu", hours: 640 },
-  { day: "Fri", hours: 780 },
-  { day: "Sat", hours: 910 },
-  { day: "Sun", hours: 860 },
-];
-
 function DashboardPage() {
-  const { user, profile, dbUser } = useAuth();
+  const { user, profile, dbUser, isLoading: authLoading } = useAuth();
   const [filter, setFilter] = useState<"all" | "income" | "videos" | "network">("all");
 
-  const [videoCounts, setVideoCounts] = useState<VideoCategoryCounts>({
-    freeShort: 1,
-    freeLong: 1,
-    premiumShort: 2,
-    premiumLong: 1,
-    totalFree: 2,
-    totalPremium: 3,
-    totalUploaded: 5,
-  });
+  const [videoCounts, setVideoCounts] = useState<VideoCategoryCounts | null>(null);
+  const [adVideoCount, setAdVideoCount] = useState<number | null>(null);
+  const [liveVideoCount, setLiveVideoCount] = useState<number | null>(null);
+  const [imagesUploadedCount, setImagesUploadedCount] = useState<number | null>(null);
 
   const [wallet, setWallet] = useState<UserWallet | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
   const [referralData, setReferralData] = useState<ReferralDashboardData | null>(null);
   const [earningsPeriod, setEarningsPeriod] = useState<"7D" | "30D" | "90D" | "12M">("30D");
   const [earningsHistory, setEarningsHistory] = useState<
@@ -90,6 +71,7 @@ function DashboardPage() {
       global: number;
       adsense: number;
       admob: number;
+      total_ad_earning: number;
       affiliate: number;
       ad_boost: number;
       tx_count?: number;
@@ -101,39 +83,137 @@ function DashboardPage() {
     global: number;
     adsense: number;
     admob: number;
+    total_ad_earning: number;
     affiliate: number;
     ad_boost: number;
   } | null>(null);
+  const [earningsError, setEarningsError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isEarningsLoading, setIsEarningsLoading] = useState(false);
 
-  const userId = profile?.user_id || dbUser?.user_id || user?.email?.split("@")[0] || "FT483921";
+  const userId =
+    profile?.user_id || dbUser?.user_id || (user?.email ? user.email.split("@")[0] : "") || "";
 
-  const [subscriberCount, setSubscriberCount] = useState<number>(0);
+  const [subscriberCount, setSubscriberCount] = useState<number | null>(null);
   const [isSubscriberLoading, setIsSubscriberLoading] = useState(true);
 
   useEffect(() => {
+    if (authLoading) return;
+    if (!userId) {
+      setWallet(null);
+      setWalletError(null);
+      setReferralData(null);
+      setVideoCounts(null);
+      setAdVideoCount(null);
+      setLiveVideoCount(null);
+      setImagesUploadedCount(null);
+      setSubscriberCount(null);
+      setIsLoading(false);
+      setIsSubscriberLoading(false);
+      return;
+    }
+
     let mounted = true;
+    setIsLoading(true);
+    setIsSubscriberLoading(true);
+    setWalletError(null);
+
     async function loadRealData() {
       try {
-        const [counts, userWallet, refData, subRes] = await Promise.all([
-          calculateUserVideoCounts(userId),
-          getUserWallet(userId),
-          getReferralDashboardData(userId),
+        const [videosRes, walletRes, refRes, subRes, liveRes, imagesRes] = await Promise.all([
+          api.videos.list({ userId, limit: 200 }).catch(() => null),
+          getAuthoritativeUserWallet(userId),
+          getReferralDashboardData(userId).catch(() => null),
           api.channel.getSubscriberCount(userId).catch(() => null),
+          api.live.listStreams().catch(() => null),
+          api.images.list({ userId, limit: 200 }).catch(() => null),
         ]);
-        if (mounted) {
-          setVideoCounts(counts);
-          setWallet(userWallet);
-          setReferralData(refData);
-          if (subRes && subRes.success) {
-            setSubscriberCount(Number(subRes.subscriber_count) || 0);
+
+        if (!mounted) return;
+
+        if (videosRes && videosRes.success !== false && Array.isArray(videosRes.videos)) {
+          let freeShort = 0;
+          let freeLong = 0;
+          let premiumShort = 0;
+          let premiumLong = 0;
+          let promotedCount = 0;
+
+          for (const v of videosRes.videos) {
+            const vType = String(v.video_type || v.videoType || "free").toLowerCase();
+            const cType = String(v.content_type || v.contentType || "long").toLowerCase();
+            const pStatus = String(
+              v.payment_status || v.paymentStatus || "not_required",
+            ).toLowerCase();
+            const isPromoted = Boolean(v.is_promoted ?? v.isPromoted);
+
+            if (isPromoted) promotedCount++;
+
+            if (vType === "free") {
+              if (cType === "short") freeShort++;
+              else freeLong++;
+            } else if (vType === "premium" && (pStatus === "paid" || pStatus === "not_required")) {
+              if (cType === "short") premiumShort++;
+              else premiumLong++;
+            }
           }
-          setIsLoading(false);
-          setIsSubscriberLoading(false);
+
+          const totalFree = freeShort + freeLong;
+          const totalPremium = premiumShort + premiumLong;
+          setVideoCounts({
+            freeShort,
+            freeLong,
+            premiumShort,
+            premiumLong,
+            totalFree,
+            totalPremium,
+            totalUploaded: totalFree + totalPremium,
+          });
+          setAdVideoCount(promotedCount);
+        } else {
+          setVideoCounts(null);
+          setAdVideoCount(null);
+        }
+
+        if (walletRes.wallet) {
+          setWallet(walletRes.wallet);
+          setWalletError(null);
+        } else {
+          setWallet(null);
+          setWalletError(walletRes.error || "Unable to load authoritative wallet balance.");
+        }
+
+        setReferralData(refRes);
+
+        if (subRes && subRes.success) {
+          setSubscriberCount(Number(subRes.subscriber_count) || 0);
+        } else {
+          setSubscriberCount(null);
+        }
+
+        if (liveRes && liveRes.success !== false && Array.isArray(liveRes.streams)) {
+          const ownStreams = liveRes.streams.filter(
+            (s: any) =>
+              String(s?.user_id || s?.userId || "")
+                .trim()
+                .toUpperCase() === userId.trim().toUpperCase(),
+          );
+          setLiveVideoCount(ownStreams.length);
+        } else {
+          setLiveVideoCount(null);
+        }
+
+        if (imagesRes && imagesRes.success !== false && Array.isArray(imagesRes.images)) {
+          setImagesUploadedCount(imagesRes.images.length);
+        } else {
+          setImagesUploadedCount(null);
         }
       } catch (err) {
         console.error("Dashboard real data load error:", err);
+        if (mounted) {
+          setWallet(null);
+          setWalletError("Failed to load live dashboard data from server.");
+        }
+      } finally {
         if (mounted) {
           setIsLoading(false);
           setIsSubscriberLoading(false);
@@ -145,49 +225,80 @@ function DashboardPage() {
     return () => {
       mounted = false;
     };
-  }, [userId]);
+  }, [authLoading, userId]);
 
   useEffect(() => {
+    if (authLoading || !userId) {
+      setEarningsHistory([]);
+      setEarningsSummary(null);
+      setEarningsError(null);
+      setIsEarningsLoading(false);
+      return;
+    }
+
     let mounted = true;
     async function loadEarnings() {
       setIsEarningsLoading(true);
+      setEarningsError(null);
       try {
-        const res = await api.wallet
-          .getEarningsHistory(userId, { period: earningsPeriod })
-          .catch(() => null);
-        if (mounted && res) {
+        const res = await api.wallet.getEarningsHistory(userId, { period: earningsPeriod });
+        if (!mounted) return;
+        if (res && res.success !== false) {
           if (Array.isArray(res.history)) {
             setEarningsHistory(
-              res.history.map((h) => ({
-                day: h.day,
-                revenue: Number(h.revenue) || 0,
-                date: h.date,
-                referral: Number(h.referral ?? h.referral_income) || 0,
-                global: Number(h.global ?? h.global_income) || 0,
-                adsense: Number(h.adsense ?? h.adsense_income) || 0,
-                admob: Number(h.admob ?? h.admob_income) || 0,
-                affiliate: Number(h.affiliate ?? h.affiliate_income) || 0,
-                ad_boost: Number(h.ad_boost ?? h.ad_boost_income) || 0,
-                tx_count: h.tx_count,
-              })),
+              res.history.map((h) => {
+                const adsense = Number(h.adsense ?? h.adsense_income) || 0;
+                const admob = Number(h.admob ?? h.admob_income) || 0;
+                const totalAdEarning =
+                  h.total_ad_earning !== undefined && h.total_ad_earning !== null
+                    ? Number(h.total_ad_earning) || 0
+                    : Math.round((adsense + admob) * 100) / 100;
+                return {
+                  day: h.day,
+                  revenue: Number(h.revenue) || 0,
+                  date: h.date,
+                  referral: Number(h.referral ?? h.referral_income) || 0,
+                  global: Number(h.global ?? h.global_income) || 0,
+                  adsense,
+                  admob,
+                  total_ad_earning: totalAdEarning,
+                  affiliate: Number(h.affiliate ?? h.affiliate_income) || 0,
+                  ad_boost: Number(h.ad_boost ?? h.ad_boost_income) || 0,
+                  tx_count: h.tx_count,
+                };
+              }),
             );
           } else {
             setEarningsHistory([]);
           }
           if (res.summary) {
+            const adsense = Number(res.summary.adsense) || 0;
+            const admob = Number(res.summary.admob) || 0;
+            const totalAdEarning =
+              res.summary.total_ad_earning !== undefined && res.summary.total_ad_earning !== null
+                ? Number(res.summary.total_ad_earning) || 0
+                : Math.round((adsense + admob) * 100) / 100;
             setEarningsSummary({
               total_revenue: Number(res.summary.total_revenue) || 0,
               referral: Number(res.summary.referral) || 0,
               global: Number(res.summary.global) || 0,
-              adsense: Number(res.summary.adsense) || 0,
-              admob: Number(res.summary.admob) || 0,
+              adsense,
+              admob,
+              total_ad_earning: totalAdEarning,
               affiliate: Number(res.summary.affiliate) || 0,
               ad_boost: Number(res.summary.ad_boost) || 0,
             });
+          } else {
+            setEarningsSummary(null);
           }
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error("Dashboard earnings history load error:", err);
+        if (mounted) {
+          setEarningsHistory([]);
+          setEarningsSummary(null);
+          setEarningsError(err?.message || "Unable to load verified earnings history.");
+        }
       } finally {
         if (mounted) setIsEarningsLoading(false);
       }
@@ -197,30 +308,66 @@ function DashboardPage() {
     return () => {
       mounted = false;
     };
-  }, [userId, earningsPeriod]);
+  }, [authLoading, userId, earningsPeriod]);
 
-  const currentCreatorRank = calculateRankFromSubscribers(subscriberCount);
+  const currentCreatorRank =
+    subscriberCount !== null ? calculateRankFromSubscribers(subscriberCount) : null;
 
-  // Dynamic overrides mapped directly to the 17 summary cards
+  const adsenseIncome = wallet ? Number(wallet.adsenseIncome) || 0 : null;
+  const admobIncome = wallet ? Number(wallet.admobIncome) || 0 : null;
+  const totalAdEarning = wallet ? calculateTotalAdEarning(wallet) : null;
+
+  const unavailableLabel = isLoading ? "..." : "Unavailable";
+
+  // Dynamic overrides mapped directly to the 18 summary cards
   const dynamicCardOverrides: Record<string, string> = {
-    "free-videos": String(videoCounts.totalFree),
-    "premium-videos": String(videoCounts.totalPremium),
-    "short-videos": String(videoCounts.freeShort + videoCounts.premiumShort),
-    "total-referrals": referralData ? String(referralData.directReferralsCount) : "0",
-    "total-team": referralData ? String(referralData.teamMembersCount) : "0",
-    "wallet-balance": wallet ? `₹${wallet.balance.toFixed(2)}` : "₹0.00",
+    "free-videos": videoCounts ? String(videoCounts.totalFree) : isLoading ? "..." : "—",
+    "premium-videos": videoCounts ? String(videoCounts.totalPremium) : isLoading ? "..." : "—",
+    "short-videos": videoCounts
+      ? String(videoCounts.freeShort + videoCounts.premiumShort)
+      : isLoading
+        ? "..."
+        : "—",
+    "live-videos": liveVideoCount !== null ? String(liveVideoCount) : isLoading ? "..." : "—",
+    "advertisement-videos": adVideoCount !== null ? String(adVideoCount) : isLoading ? "..." : "—",
+    "images-uploaded":
+      imagesUploadedCount !== null ? String(imagesUploadedCount) : isLoading ? "..." : "—",
+    "total-referrals": referralData
+      ? String(referralData.directReferralsCount)
+      : isLoading
+        ? "..."
+        : "—",
+    "total-team": referralData ? String(referralData.teamMembersCount) : isLoading ? "..." : "—",
+    "wallet-balance": wallet ? `₹${wallet.balance.toFixed(2)}` : unavailableLabel,
     "referral-income": referralData
       ? `₹${referralData.referralIncome.toFixed(2)}`
       : wallet
         ? `₹${wallet.referralIncome.toFixed(2)}`
-        : "₹0.00",
-    "global-income": wallet ? `₹${wallet.globalIncome.toFixed(2)}` : "₹0.00",
-    "adsense-income": wallet ? `₹${wallet.adsenseIncome.toFixed(2)}` : "₹0.00",
-    "admob-income": wallet ? `₹${(Number(wallet.admobIncome) || 0).toFixed(2)}` : "₹0.00",
-    "affiliate-income": wallet ? `₹${wallet.affiliateIncome.toFixed(2)}` : "₹0.00",
-    "withdrawal-balance": wallet ? `₹${wallet.totalWithdrawn.toFixed(2)}` : "₹0.00",
-    "current-rank": currentCreatorRank.awardName,
-    "subscriber-count": isSubscriberLoading ? "..." : subscriberCount.toLocaleString(),
+        : unavailableLabel,
+    "global-income": wallet ? `₹${wallet.globalIncome.toFixed(2)}` : unavailableLabel,
+    "adsense-income": adsenseIncome !== null ? `₹${adsenseIncome.toFixed(2)}` : unavailableLabel,
+    "admob-income": admobIncome !== null ? `₹${admobIncome.toFixed(2)}` : unavailableLabel,
+    "total-ad-earning":
+      totalAdEarning !== null ? `₹${totalAdEarning.toFixed(2)}` : unavailableLabel,
+    "affiliate-income": wallet ? `₹${wallet.affiliateIncome.toFixed(2)}` : unavailableLabel,
+    "withdrawal-balance": wallet ? `₹${wallet.totalWithdrawn.toFixed(2)}` : unavailableLabel,
+    "current-rank": currentCreatorRank
+      ? currentCreatorRank.awardName
+      : isSubscriberLoading
+        ? "..."
+        : "—",
+    "subscriber-count": isSubscriberLoading
+      ? "..."
+      : subscriberCount !== null
+        ? subscriberCount.toLocaleString()
+        : "—",
+  };
+
+  const trendOverrides: Record<string, string> = {
+    "total-ad-earning":
+      adsenseIncome !== null && admobIncome !== null
+        ? `AdSense ₹${adsenseIncome.toFixed(2)} + AdMob ₹${admobIncome.toFixed(2)}`
+        : unavailableLabel,
   };
 
   return (
@@ -237,9 +384,13 @@ function DashboardPage() {
                 <h1 className="text-2xl font-extrabold tracking-tight text-foreground sm:text-3xl">
                   Dashboard
                 </h1>
-                {wallet?.isStale || referralData?.isStale ? (
+                {!userId ? (
+                  <span className="rounded-full border border-border bg-secondary px-2.5 py-0.5 text-[10px] font-bold text-muted-foreground">
+                    Sign In Required
+                  </span>
+                ) : walletError || !wallet ? (
                   <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-[10px] font-bold text-amber-400">
-                    Offline Cache
+                    {isLoading ? "Syncing..." : "Server Unavailable"}
                   </span>
                 ) : (
                   <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-0.5 text-[10px] font-bold text-emerald-400">
@@ -248,8 +399,14 @@ function DashboardPage() {
                 )}
               </div>
               <p className="text-sm text-muted-foreground">
-                All 17 performance metrics, dynamic video classifications, and income streams for{" "}
-                <strong>{userId}</strong>
+                {userId ? (
+                  <>
+                    All 18 performance metrics, dynamic video classifications, and income streams
+                    for <strong>{userId}</strong>
+                  </>
+                ) : (
+                  "Sign in to view your live creator metrics and verified ad earnings"
+                )}
               </p>
             </div>
           </div>
@@ -260,7 +417,7 @@ function DashboardPage() {
               className="inline-flex items-center justify-center gap-2 rounded-full border border-border bg-secondary/80 px-4 py-2 text-xs font-bold text-foreground transition hover:bg-secondary active:scale-95"
             >
               <Wallet className="h-3.5 w-3.5 text-emerald-400" />
-              Wallet: {wallet ? `₹${wallet.balance.toFixed(2)}` : "₹0.00"}
+              Wallet: {wallet ? `₹${wallet.balance.toFixed(2)}` : isLoading ? "..." : "Unavailable"}
             </Link>
             <Link
               to="/upload"
@@ -272,11 +429,91 @@ function DashboardPage() {
           </div>
         </div>
 
+        {/* Auth or Authoritative Wallet Error Notice */}
+        {!authLoading && !userId && (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs text-amber-200">
+              <Lock className="h-4 w-4 text-amber-400 shrink-0" />
+              <span>
+                Sign in with your FaceTube creator account to load verified wallet balances and
+                Total Ad Earning metrics.
+              </span>
+            </div>
+            <Link
+              to="/auth"
+              className="inline-flex items-center justify-center rounded-full bg-amber-500 px-4 py-1.5 text-xs font-bold text-black hover:bg-amber-400 shrink-0"
+            >
+              Sign In
+            </Link>
+          </div>
+        )}
+
+        {userId && walletError && !isLoading && (
+          <div className="rounded-2xl border border-destructive/40 bg-destructive/10 p-4 flex items-center gap-2.5 text-xs text-destructive">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span>
+              <strong>Wallet Unavailable:</strong> {walletError}
+            </span>
+          </div>
+        )}
+
+        {/* Dedicated Total Ad Earning Highlight Card (Verified AdSense + AdMob only) */}
+        <div className="rounded-3xl border border-emerald-500/30 bg-gradient-to-r from-emerald-500/10 via-card to-card p-5 sm:p-6 shadow-card">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                <DollarSign className="h-3.5 w-3.5" />
+                Total Ad Earning (Verified AdSense + AdMob Only)
+              </span>
+              <div className="text-3xl font-black text-emerald-400 font-mono">
+                {totalAdEarning !== null
+                  ? `₹${totalAdEarning.toFixed(2)}`
+                  : isLoading
+                    ? "..."
+                    : "Unavailable"}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Excludes Referral, Affiliate, AdBoost, and Global Income Pool earnings
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 sm:min-w-[300px]">
+              <Link
+                to="/adsense-income"
+                className="rounded-2xl border border-border bg-card/80 p-3.5 hover:border-yellow-500/40 transition"
+              >
+                <span className="text-[10px] font-bold uppercase tracking-wider text-yellow-400 block">
+                  Verified AdSense
+                </span>
+                <span className="text-lg font-black text-foreground font-mono mt-0.5 block">
+                  {adsenseIncome !== null
+                    ? `₹${adsenseIncome.toFixed(2)}`
+                    : isLoading
+                      ? "..."
+                      : "Unavailable"}
+                </span>
+              </Link>
+              <Link
+                to="/admob-income"
+                className="rounded-2xl border border-border bg-card/80 p-3.5 hover:border-blue-500/40 transition"
+              >
+                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400 block">
+                  Verified AdMob
+                </span>
+                <span className="text-lg font-black text-foreground font-mono mt-0.5 block">
+                  {admobIncome !== null
+                    ? `₹${admobIncome.toFixed(2)}`
+                    : isLoading
+                      ? "..."
+                      : "Unavailable"}
+                </span>
+              </Link>
+            </div>
+          </div>
+        </div>
+
         {/* ------------------------------------------------------------------ */}
-        {/* REQUIREMENT 5: DEDICATED VIDEO COUNT SECTION                       */}
-        {/* Displaying 4 separate counts:                                      */}
-        {/* FREE: 1. Free Short Video | 2. Free Long Video                     */}
-        {/* PREMIUM: 3. Premium Short Video | 4. Premium Long Video            */}
+        {/* DEDICATED VIDEO COUNT SECTION                                      */}
         {/* ------------------------------------------------------------------ */}
         <div className="rounded-3xl border border-border bg-card p-6 sm:p-7 shadow-card space-y-5">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/60 pb-4">
@@ -289,14 +526,22 @@ function DashboardPage() {
                 Uploaded Video Counts
               </h2>
               <p className="text-xs text-muted-foreground">
-                Dynamically calculated from real uploaded video records for User {userId}.
+                {userId
+                  ? `Dynamically calculated from real uploaded video records for User ${userId}.`
+                  : "Sign in to load your uploaded video classification counts."}
               </p>
             </div>
 
             <div className="flex items-center gap-3 text-xs">
               <span className="font-semibold text-muted-foreground">
                 Total Uploaded:{" "}
-                <strong className="text-foreground">{videoCounts.totalUploaded} Videos</strong>
+                <strong className="text-foreground">
+                  {videoCounts
+                    ? `${videoCounts.totalUploaded} Videos`
+                    : isLoading
+                      ? "..."
+                      : "Unavailable"}
+                </strong>
               </span>
               <Link
                 to="/upload"
@@ -319,7 +564,7 @@ function DashboardPage() {
                 </span>
               </div>
               <div className="text-3xl font-black text-foreground tracking-tight">
-                {videoCounts.freeShort}
+                {videoCounts ? videoCounts.freeShort : isLoading ? "..." : "—"}
               </div>
               <div className="flex items-center justify-between pt-1 border-t border-sky-500/20 text-[11px]">
                 <span className="font-semibold text-sky-300">1. Free Short Video</span>
@@ -338,7 +583,7 @@ function DashboardPage() {
                 </span>
               </div>
               <div className="text-3xl font-black text-foreground tracking-tight">
-                {videoCounts.freeLong}
+                {videoCounts ? videoCounts.freeLong : isLoading ? "..." : "—"}
               </div>
               <div className="flex items-center justify-between pt-1 border-t border-sky-500/20 text-[11px]">
                 <span className="font-semibold text-sky-300">2. Free Long Video</span>
@@ -358,7 +603,7 @@ function DashboardPage() {
                 </span>
               </div>
               <div className="text-3xl font-black text-foreground tracking-tight">
-                {videoCounts.premiumShort}
+                {videoCounts ? videoCounts.premiumShort : isLoading ? "..." : "—"}
               </div>
               <div className="flex items-center justify-between pt-1 border-t border-amber-500/20 text-[11px]">
                 <span className="font-bold text-amber-300">3. Sponsor Short Video</span>
@@ -378,7 +623,7 @@ function DashboardPage() {
                 </span>
               </div>
               <div className="text-3xl font-black text-foreground tracking-tight">
-                {videoCounts.premiumLong}
+                {videoCounts ? videoCounts.premiumLong : isLoading ? "..." : "—"}
               </div>
               <div className="flex items-center justify-between pt-1 border-t border-amber-500/20 text-[11px]">
                 <span className="font-bold text-amber-300">4. Sponsor Long Video</span>
@@ -389,7 +634,7 @@ function DashboardPage() {
         </div>
 
         {/* ------------------------------------------------------------------ */}
-        {/* REQUIREMENT 10: SUBSCRIBERS, WATCH TIME & ESTIMATED REVENUE CHARTS */}
+        {/* SUBSCRIBERS, WATCH TIME & EARNINGS GROWTH CHARTS                   */}
         {/* ------------------------------------------------------------------ */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Chart 1: Subscribers Chart Section */}
@@ -401,7 +646,11 @@ function DashboardPage() {
                   Subscribers Growth
                 </span>
                 <div className="text-2xl font-black text-foreground mt-0.5">
-                  {isSubscriberLoading ? "..." : subscriberCount.toLocaleString()}
+                  {isSubscriberLoading
+                    ? "..."
+                    : subscriberCount !== null
+                      ? subscriberCount.toLocaleString()
+                      : "Unavailable"}
                 </div>
               </div>
               <span className="text-[11px] font-bold text-rose-400 bg-rose-500/10 px-2.5 py-0.5 rounded-full flex items-center gap-1">
@@ -414,6 +663,16 @@ function DashboardPage() {
                 <span className="text-xs text-muted-foreground">
                   Loading channel subscribers...
                 </span>
+              </div>
+            ) : subscriberCount === null ? (
+              <div className="h-44 w-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-border/60 bg-secondary/10 p-6 text-center">
+                <Bell className="h-8 w-8 text-muted-foreground/40 mb-2" />
+                <p className="text-xs font-semibold text-muted-foreground">
+                  Subscriber count unavailable
+                </p>
+                <p className="text-[11px] text-muted-foreground/70 mt-1 max-w-[220px]">
+                  Sign in or reconnect to load real-time database subscriber counts
+                </p>
               </div>
             ) : (
               <div className="h-44 w-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-border/60 bg-secondary/10 p-6 text-center">
@@ -433,7 +692,7 @@ function DashboardPage() {
             </p>
           </div>
 
-          {/* Chart 2: Watch Time Section */}
+          {/* Chart 2: Watch Time Section (Honest Unavailable State — no watch-duration API) */}
           <div className="rounded-3xl border border-border bg-card p-5 sm:p-6 shadow-card space-y-4">
             <div className="flex items-center justify-between">
               <div>
@@ -441,37 +700,29 @@ function DashboardPage() {
                   <Clock className="h-3.5 w-3.5 text-blue-400" />
                   Watch Time (Hours)
                 </span>
-                <div className="text-2xl font-black text-foreground mt-0.5">4,660 hrs</div>
+                <div className="text-2xl font-black text-foreground mt-0.5">—</div>
               </div>
-              <span className="text-[11px] font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full flex items-center gap-0.5">
-                <TrendingUp className="h-3 w-3" /> +18.4%
+              <span className="text-[11px] font-bold text-muted-foreground bg-secondary px-2.5 py-0.5 rounded-full">
+                Unavailable
               </span>
             </div>
 
-            <div className="h-44 w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={WATCH_TIME_CHART_DATA}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                  <XAxis dataKey="day" stroke="#71717a" fontSize={11} tickLine={false} />
-                  <YAxis stroke="#71717a" fontSize={11} tickLine={false} />
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: "#18181b",
-                      borderColor: "#27272a",
-                      borderRadius: "12px",
-                      fontSize: "12px",
-                    }}
-                  />
-                  <Bar dataKey="hours" fill="#38bdf8" radius={[6, 6, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
+            <div className="h-44 w-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-border/60 bg-secondary/10 p-6 text-center">
+              <Clock className="h-8 w-8 text-blue-400/50 mb-2" />
+              <p className="text-xs font-semibold text-foreground">
+                Watch-time telemetry unavailable
+              </p>
+              <p className="text-[11px] text-muted-foreground/70 mt-1 max-w-[240px]">
+                No server watch-duration API is available yet; metrics remain hidden rather than
+                estimated.
+              </p>
             </div>
             <p className="text-[11px] text-muted-foreground text-center">
-              Avg view duration: <strong>8m 42s</strong> across all videos
+              Average view duration: — (telemetry pending)
             </p>
           </div>
 
-          {/* Chart 3: FaceTube Earnings Growth Graph Section (Req 4 & Req 6) */}
+          {/* Chart 3: FaceTube Earnings Growth Graph Section */}
           <div className="rounded-3xl border border-border bg-card p-5 sm:p-6 shadow-card space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
@@ -485,7 +736,7 @@ function DashboardPage() {
                   ) : wallet ? (
                     `₹${(wallet.totalEarned ?? wallet.balance ?? 0).toFixed(2)}`
                   ) : (
-                    "₹0.00"
+                    <span className="text-sm font-semibold text-amber-400">Unavailable</span>
                   )}
                 </div>
               </div>
@@ -515,14 +766,35 @@ function DashboardPage() {
               </div>
             </div>
 
-            {/* Income Streams Breakdown (6 real streams including AdMob) */}
+            {/* Income Streams Breakdown (including period Total Ad Earning = AdSense + AdMob) */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 pb-1">
+              <div className="rounded-xl bg-emerald-500/10 p-2.5 border border-emerald-500/30 col-span-2 sm:col-span-3 flex items-center justify-between">
+                <div>
+                  <div className="text-[10px] uppercase font-bold text-emerald-400 tracking-wider">
+                    Period Total Ad Earning (AdSense + AdMob)
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {earningsSummary
+                      ? `AdSense ₹${earningsSummary.adsense.toFixed(2)} + AdMob ₹${earningsSummary.admob.toFixed(2)}`
+                      : isEarningsLoading
+                        ? "Calculating..."
+                        : "Unavailable"}
+                  </div>
+                </div>
+                <div className="text-base font-black text-emerald-400 font-mono">
+                  {earningsSummary
+                    ? `₹${earningsSummary.total_ad_earning.toFixed(2)}`
+                    : isEarningsLoading
+                      ? "..."
+                      : "—"}
+                </div>
+              </div>
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
                 <div className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider">
                   Referral
                 </div>
                 <div className="text-sm font-bold text-foreground">
-                  ₹{(earningsSummary?.referral ?? 0).toFixed(2)}
+                  {earningsSummary ? `₹${earningsSummary.referral.toFixed(2)}` : "—"}
                 </div>
               </div>
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
@@ -530,7 +802,7 @@ function DashboardPage() {
                   Global Pool
                 </div>
                 <div className="text-sm font-bold text-foreground">
-                  ₹{(earningsSummary?.global ?? 0).toFixed(2)}
+                  {earningsSummary ? `₹${earningsSummary.global.toFixed(2)}` : "—"}
                 </div>
               </div>
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
@@ -538,7 +810,7 @@ function DashboardPage() {
                   AdSense
                 </div>
                 <div className="text-sm font-bold text-foreground">
-                  ₹{(earningsSummary?.adsense ?? 0).toFixed(2)}
+                  {earningsSummary ? `₹${earningsSummary.adsense.toFixed(2)}` : "—"}
                 </div>
               </div>
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
@@ -546,7 +818,7 @@ function DashboardPage() {
                   AdMob
                 </div>
                 <div className="text-sm font-bold text-foreground">
-                  ₹{(earningsSummary?.admob ?? 0).toFixed(2)}
+                  {earningsSummary ? `₹${earningsSummary.admob.toFixed(2)}` : "—"}
                 </div>
               </div>
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
@@ -554,7 +826,7 @@ function DashboardPage() {
                   Affiliate
                 </div>
                 <div className="text-sm font-bold text-foreground">
-                  ₹{(earningsSummary?.affiliate ?? 0).toFixed(2)}
+                  {earningsSummary ? `₹${earningsSummary.affiliate.toFixed(2)}` : "—"}
                 </div>
               </div>
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
@@ -562,15 +834,23 @@ function DashboardPage() {
                   Ad Boost
                 </div>
                 <div className="text-sm font-bold text-foreground">
-                  ₹{(earningsSummary?.ad_boost ?? 0).toFixed(2)}
+                  {earningsSummary ? `₹${earningsSummary.ad_boost.toFixed(2)}` : "—"}
                 </div>
               </div>
             </div>
 
-            {/* Chart Area or Genuine Zero/Empty State */}
+            {/* Chart Area or Unavailable / Genuine Zero State */}
             {isEarningsLoading ? (
               <div className="h-44 w-full flex items-center justify-center rounded-2xl bg-secondary/20 animate-pulse">
                 <span className="text-xs text-muted-foreground">Loading earnings ledger...</span>
+              </div>
+            ) : earningsError ? (
+              <div className="h-44 w-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-destructive/40 bg-destructive/5 p-6 text-center">
+                <AlertCircle className="h-7 w-7 text-destructive/70 mb-2" />
+                <p className="text-xs font-semibold text-destructive">
+                  Earnings history unavailable
+                </p>
+                <p className="text-[11px] text-muted-foreground mt-0.5">{earningsError}</p>
               </div>
             ) : earningsHistory.length === 0 ? (
               <div className="h-44 w-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-border/60 bg-secondary/10 p-6 text-center">
@@ -579,7 +859,7 @@ function DashboardPage() {
                   No earnings recorded for this period
                 </p>
                 <p className="text-[11px] text-muted-foreground/70 mt-0.5">
-                  Real ledger records will plot as earnings are generated
+                  Real ledger records will plot as settled earnings are generated
                 </p>
               </div>
             ) : (
@@ -612,7 +892,7 @@ function DashboardPage() {
                           if (active && payload && payload.length && payload[0]) {
                             const data = payload[0].payload;
                             return (
-                              <div className="rounded-xl border border-border bg-popover/95 p-3 shadow-xl backdrop-blur-md text-xs space-y-1.5 min-w-[170px]">
+                              <div className="rounded-xl border border-border bg-popover/95 p-3 shadow-xl backdrop-blur-md text-xs space-y-1.5 min-w-[180px]">
                                 <div className="font-bold text-foreground pb-1 border-b border-border/50 flex justify-between items-center">
                                   <span>{data.date || label}</span>
                                   <span className="text-emerald-400 font-extrabold">
@@ -643,6 +923,10 @@ function DashboardPage() {
                                     <span className="font-semibold text-foreground">
                                       ₹{Number(data.admob || 0).toFixed(2)}
                                     </span>
+                                  </div>
+                                  <div className="flex justify-between text-emerald-400 font-semibold">
+                                    <span>Total Ad Earning:</span>
+                                    <span>₹{Number(data.total_ad_earning || 0).toFixed(2)}</span>
                                   </div>
                                   <div className="flex justify-between">
                                     <span>Affiliate:</span>
@@ -684,14 +968,14 @@ function DashboardPage() {
                 </div>
                 {(earningsSummary?.total_revenue ?? 0) === 0 && (
                   <p className="text-[11px] text-muted-foreground/70 text-center italic">
-                    Zero earnings recorded during this period (₹0.00 ledger total).
+                    Zero settled earnings recorded during this period.
                   </p>
                 )}
               </div>
             )}
             <p className="text-[11px] text-muted-foreground text-center">
-              Real-time ledger breakdown: Referral, Global Pool, AdSense, AdMob, Affiliate &amp; Ad
-              Boost
+              Real-time settled ledger breakdown: Referral, Global Pool, AdSense, AdMob, Affiliate
+              &amp; Ad Boost
             </p>
           </div>
         </div>
@@ -707,7 +991,7 @@ function DashboardPage() {
                 : "bg-secondary text-muted-foreground hover:text-foreground"
             }`}
           >
-            All 17 Summary Cards
+            All 18 Summary Cards
           </button>
           <button
             type="button"
@@ -718,7 +1002,7 @@ function DashboardPage() {
                 : "bg-secondary text-muted-foreground hover:text-foreground"
             }`}
           >
-            Income Streams (7)
+            Income Streams (8)
           </button>
           <button
             type="button"
@@ -740,12 +1024,16 @@ function DashboardPage() {
                 : "bg-secondary text-muted-foreground hover:text-foreground"
             }`}
           >
-            Team & Subscribers (4)
+            Team &amp; Subscribers (4)
           </button>
         </div>
 
-        {/* 17 Summary Cards Grid with live overrides */}
-        <DashboardSummaryCards filterCategory={filter} dynamicOverrides={dynamicCardOverrides} />
+        {/* 18 Summary Cards Grid with live overrides */}
+        <DashboardSummaryCards
+          filterCategory={filter}
+          dynamicOverrides={dynamicCardOverrides}
+          trendOverrides={trendOverrides}
+        />
       </div>
     </VideoHubLayout>
   );

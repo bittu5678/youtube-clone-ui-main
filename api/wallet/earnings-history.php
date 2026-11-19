@@ -9,13 +9,8 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../response.php';
 
 $pdo = getDatabaseConnection();
-$authUser = getAuthUser($pdo);
-
-if (!$authUser) {
-    jsonResponse(['success' => false, 'error' => 'Authentication required'], 401);
-}
-
-$requestedUserId = trim($_GET['user_id'] ?? ($authUser['user_id'] ?? ''));
+$requestedUserParam = trim($_GET['user_id'] ?? ($_GET['userId'] ?? ''));
+list($authUser, $requestedUserId) = requireAuthUser($pdo, $requestedUserParam ?: null);
 $rawPeriod = strtoupper(trim($_GET['period'] ?? ''));
 $rawDays = intval($_GET['days'] ?? 0);
 
@@ -47,6 +42,7 @@ try {
         'global' => 0.0,
         'adsense' => 0.0,
         'admob' => 0.0,
+        'total_ad_earning' => 0.0,
         'affiliate' => 0.0,
         'ad_boost' => 0.0,
     ];
@@ -60,6 +56,7 @@ try {
             FROM income_ledger
             WHERE UPPER(user_id) = UPPER(?)
               AND income_type != "withdrawal"
+              AND status = "settled"
               AND created_at >= DATE_SUB(DATE_FORMAT(CURDATE(), "%Y-%m-01"), INTERVAL 11 MONTH)
             GROUP BY DATE_FORMAT(created_at, "%Y-%m"), income_type
             ORDER BY period_key ASC
@@ -80,6 +77,7 @@ try {
                 'global' => 0.0,
                 'adsense' => 0.0,
                 'admob' => 0.0,
+                'total_ad_earning' => 0.0,
                 'affiliate' => 0.0,
                 'ad_boost' => 0.0,
                 'referral_income' => 0.0,
@@ -100,6 +98,7 @@ try {
             FROM income_ledger
             WHERE UPPER(user_id) = UPPER(?)
               AND income_type != "withdrawal"
+              AND status = "settled"
               AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
             GROUP BY DATE(created_at), income_type
             ORDER BY period_key ASC
@@ -120,6 +119,7 @@ try {
                 'global' => 0.0,
                 'adsense' => 0.0,
                 'admob' => 0.0,
+                'total_ad_earning' => 0.0,
                 'affiliate' => 0.0,
                 'ad_boost' => 0.0,
                 'referral_income' => 0.0,
@@ -157,10 +157,12 @@ try {
 
             $timeline[$k][$category] = round($timeline[$k][$category] + $amt, 2);
             $timeline[$k][$category . '_income'] = $timeline[$k][$category];
+            $timeline[$k]['total_ad_earning'] = round($timeline[$k]['adsense'] + $timeline[$k]['admob'], 2);
             $timeline[$k]['revenue'] = round($timeline[$k]['revenue'] + $amt, 2);
             $timeline[$k]['tx_count'] += $count;
 
             $summary[$category] = round($summary[$category] + $amt, 2);
+            $summary['total_ad_earning'] = round($summary['adsense'] + $summary['admob'], 2);
             $summary['total_revenue'] = round($summary['total_revenue'] + $amt, 2);
         }
     }

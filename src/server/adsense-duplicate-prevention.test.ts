@@ -1,51 +1,22 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { handleApiRequest } from "./api-handler.ts";
+import { handleApiRequest, resetInMemoryStore } from "./api-handler.ts";
+import { setTestPersistentDataDir } from "./payments.ts";
 
 describe("AdSense Monthly Statement Idempotency & Duplicate Prevention Tests", () => {
   let adminToken = "";
   let userToken = "";
-  let initialWalletsSnapshot = "";
-  let initialTxsSnapshot = "";
+  let testDataDir = "";
+  let storePath = "";
 
   before(async () => {
-    // 0. Clean up any previous test statement keys and snapshot store state
-    const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
-    if (fs.existsSync(storePath)) {
-      try {
-        const store = JSON.parse(fs.readFileSync(storePath, "utf-8"));
-        if (store.adsenseStatements) {
-          delete store.adsenseStatements["FT483921_2026-07"];
-          delete store.adsenseStatements["FT900431_2026-06"];
-          delete store.adsenseStatements["FT483921_2026-05"];
-          delete store.adsenseStatements["FT900431_2026-05"];
-        }
-        if (Array.isArray(store.walletTransactions)) {
-          store.walletTransactions = store.walletTransactions.filter(
-            (tx: any) =>
-              !String(tx["transaction_id"] || tx["transactionId"] || "").startsWith(
-                "TX_ADSENSE_FT483921_202607",
-              ) &&
-              !String(tx["transaction_id"] || tx["transactionId"] || "").startsWith(
-                "TX_ADSENSE_FT900431_202606",
-              ) &&
-              !String(tx["transaction_id"] || tx["transactionId"] || "").startsWith(
-                "TX_ADSENSE_FT483921_202605",
-              ) &&
-              !String(tx["transaction_id"] || tx["transactionId"] || "").startsWith(
-                "TX_ADSENSE_FT900431_202605",
-              ),
-          );
-        }
-        initialWalletsSnapshot = JSON.stringify(store.wallets || {});
-        initialTxsSnapshot = JSON.stringify(store.walletTransactions || []);
-        fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf-8");
-      } catch (_e) {
-        // Ignore errors during test file setup
-      }
-    }
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-adsense-dup-test-"));
+    storePath = path.join(testDataDir, "facetube_store.json");
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
 
     // 1. Authenticate as Admin (FT102857 / admin@facetube.com)
     const adminLoginReq = new Request("http://localhost:3000/api/auth/login", {
@@ -73,26 +44,10 @@ describe("AdSense Monthly Statement Idempotency & Duplicate Prevention Tests", (
   });
 
   after(() => {
-    const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
-    if (fs.existsSync(storePath)) {
-      try {
-        const store = JSON.parse(fs.readFileSync(storePath, "utf-8"));
-        if (initialWalletsSnapshot) {
-          store.wallets = JSON.parse(initialWalletsSnapshot);
-        }
-        if (initialTxsSnapshot) {
-          store.walletTransactions = JSON.parse(initialTxsSnapshot);
-        }
-        if (store.adsenseStatements) {
-          delete store.adsenseStatements["FT483921_2026-07"];
-          delete store.adsenseStatements["FT900431_2026-06"];
-          delete store.adsenseStatements["FT483921_2026-05"];
-          delete store.adsenseStatements["FT900431_2026-05"];
-        }
-        fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf-8");
-      } catch (_e) {
-        // Ignore errors during test file teardown
-      }
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
     }
   });
 
@@ -447,7 +402,6 @@ describe("AdSense Monthly Statement Idempotency & Duplicate Prevention Tests", (
 
     it("blocks new statement recording when a creator/month has historical records flagged for review", async () => {
       // Simulate flagged historical conflict for FT483921 in 2026-03
-      const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
       const store = JSON.parse(fs.readFileSync(storePath, "utf-8"));
       if (!store.adsenseHistoricalConflicts) {
         store.adsenseHistoricalConflicts = {};

@@ -13,7 +13,11 @@ import { Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import type { MainUploadMode } from "@/routes/upload";
 import { useAuth } from "@/lib/auth-context";
-import { getUserWallet, calculateTotalAdEarning, type UserWallet } from "@/lib/ledger-service";
+import {
+  getAuthoritativeUserWallet,
+  calculateTotalAdEarning,
+  type UserWallet,
+} from "@/lib/ledger-service";
 
 interface UploadOptionItem {
   id: "free" | "premium" | "ad_promotion" | "image";
@@ -86,22 +90,37 @@ export function UploadOptionsModal({ isOpen, onClose }: UploadOptionsModalProps)
     profile?.user_id || dbUser?.user_id || (user?.email ? user.email.split("@")[0] : null);
 
   const [wallet, setWallet] = useState<UserWallet | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
   const [isLoadingWallet, setIsLoadingWallet] = useState(false);
 
   useEffect(() => {
     if (!isOpen) return;
     if (!userId) {
       setWallet(null);
+      setWalletError(null);
+      setIsLoadingWallet(false);
       return;
     }
     let isMounted = true;
     setIsLoadingWallet(true);
-    getUserWallet(userId)
-      .then((w) => {
-        if (isMounted) setWallet(w);
+    setWalletError(null);
+    getAuthoritativeUserWallet(userId)
+      .then((res) => {
+        if (!isMounted) return;
+        if (res.wallet) {
+          setWallet(res.wallet);
+          setWalletError(null);
+        } else {
+          setWallet(null);
+          setWalletError(res.error || "Unable to load authoritative wallet.");
+        }
       })
       .catch((err) => {
         console.error("Failed to fetch wallet in UploadOptionsModal:", err);
+        if (isMounted) {
+          setWallet(null);
+          setWalletError("Failed to load wallet.");
+        }
       })
       .finally(() => {
         if (isMounted) setIsLoadingWallet(false);
@@ -210,7 +229,11 @@ export function UploadOptionsModal({ isOpen, onClose }: UploadOptionsModalProps)
                 Total Ad Earning
               </span>
               <p className="text-xs text-muted-foreground truncate">
-                {user ? "Verified AdSense + AdMob income" : "Sign in to view real earnings"}
+                {!user || !userId
+                  ? "Sign in to view real earnings"
+                  : walletError
+                    ? "Server unavailable"
+                    : "Verified AdSense + AdMob income"}
               </p>
             </div>
           </div>
@@ -218,14 +241,20 @@ export function UploadOptionsModal({ isOpen, onClose }: UploadOptionsModalProps)
             <div className="text-lg font-black text-emerald-400 sm:text-xl font-mono">
               {isLoadingWallet ? (
                 <span className="text-xs text-muted-foreground animate-pulse">Loading...</span>
-              ) : (
+              ) : wallet ? (
                 `₹${totalAdEarning.toFixed(2)}`
+              ) : (
+                <span className="text-sm text-muted-foreground">
+                  {user && userId ? "Unavailable" : "—"}
+                </span>
               )}
             </div>
             <span className="text-[10px] text-muted-foreground block">
-              {user && userId
+              {wallet && user && userId
                 ? `AdSense ₹${adsenseIncome.toFixed(2)} + AdMob ₹${admobIncome.toFixed(2)}`
-                : "₹0.00 base"}
+                : walletError
+                  ? "Unable to fetch server total"
+                  : "Sign in required"}
             </span>
           </div>
         </div>

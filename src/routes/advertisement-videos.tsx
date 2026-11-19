@@ -26,6 +26,11 @@ import { api } from "@/lib/api";
 import { Skeleton } from "@/components/ui/skeleton";
 import { resolveVideoThumbnail, SVG_FALLBACK_THUMBNAIL } from "@/lib/thumbnail-service";
 import { resolveMediaUrl } from "@/lib/media-url";
+import {
+  calculateTotalAdEarning,
+  getAuthoritativeUserWallet,
+  type UserWallet,
+} from "@/lib/ledger-service";
 
 export const Route = createFileRoute("/advertisement-videos")({
   head: () => ({
@@ -135,18 +140,22 @@ function AdvertisementVideosPage() {
   const [searchQuery, setSearchQuery] = useState("");
 
   const [videos, setVideos] = useState<AdVideoItem[]>([]);
-  const [adsenseIncome, setAdsenseIncome] = useState<number>(0);
+  const [wallet, setWallet] = useState<UserWallet | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     if (!currentUserId && !isAdmin) {
+      setWallet(null);
+      setWalletError(null);
       setIsLoading(false);
       return;
     }
 
     setIsLoading(true);
     setErrorMessage(null);
+    setWalletError(null);
 
     try {
       const isTargetingAll = isAdmin && adminScope === "all";
@@ -158,7 +167,10 @@ function AdvertisementVideosPage() {
         videoParams.userId = targetUserId;
       }
 
-      const res = await api.videos.list(videoParams);
+      const [res, walletRes] = await Promise.all([
+        api.videos.list(videoParams),
+        currentUserId ? getAuthoritativeUserWallet(currentUserId) : Promise.resolve(null),
+      ]);
       const rawVideos: any[] = res?.videos || [];
 
       const mappedVideos: AdVideoItem[] = rawVideos.map((v: any) => {
@@ -200,18 +212,19 @@ function AdvertisementVideosPage() {
 
       setVideos(mappedVideos);
 
-      // 2. Fetch authenticated user's wallet to display authoritative sponsor / AdSense revenue
-      if (currentUserId) {
-        try {
-          const walletRes = await api.wallet.getBalance(currentUserId);
-          if (walletRes?.wallet) {
-            const rawAd =
-              Number(walletRes.wallet.adsense_income ?? walletRes.wallet.adsenseIncome) || 0;
-            setAdsenseIncome(rawAd);
-          }
-        } catch (wErr) {
-          console.warn("Wallet balance lookup warning:", wErr);
+      // 2. Apply authoritative wallet response cleanly (without swallowing failures)
+      if (currentUserId && walletRes) {
+        if (walletRes.wallet) {
+          setWallet(walletRes.wallet);
+          setWalletError(null);
+        } else {
+          setWallet(null);
+          setWalletError(
+            walletRes.error || "Unable to load authoritative ad revenue balance from server.",
+          );
         }
+      } else {
+        setWallet(null);
       }
     } catch (err: any) {
       console.error("Failed to load advertisement videos:", err);
@@ -393,6 +406,22 @@ function AdvertisementVideosPage() {
           </div>
         )}
 
+        {walletError && (
+          <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4 text-amber-200 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2 text-xs font-semibold">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
+              <span>{walletError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={loadData}
+              className="rounded-lg bg-amber-500 px-3 py-1 text-xs font-bold text-black hover:bg-amber-400"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
         {/* KPI Summary Stats Cards */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
           {/* Card 1: Active Ad Videos */}
@@ -408,22 +437,27 @@ function AdvertisementVideosPage() {
             </p>
           </div>
 
-          {/* Card 2: Sponsor & Ad Revenue */}
+          {/* Card 2: AdSense Video Revenue (distinct from combined Total Ad Earning) */}
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
-            <span className="text-xs text-muted-foreground font-medium">Sponsor Revenue</span>
+            <span className="text-xs text-muted-foreground font-medium">AdSense Video Revenue</span>
             {isLoading ? (
               <Skeleton className="h-8 w-24 my-1" />
-            ) : (
+            ) : wallet ? (
               <p className="text-2xl font-black text-emerald-400">
                 ₹
-                {adsenseIncome.toLocaleString("en-IN", {
+                {Number(wallet.adsenseIncome ?? 0).toLocaleString("en-IN", {
                   minimumFractionDigits: 2,
                   maximumFractionDigits: 2,
                 })}
               </p>
+            ) : (
+              <p className="text-2xl font-black text-muted-foreground">Unavailable</p>
             )}
             <p className="text-[11px] text-emerald-400 font-semibold flex items-center gap-1">
-              <TrendingUp className="h-3 w-3" /> Authoritative ledger total
+              <TrendingUp className="h-3 w-3 shrink-0" />
+              {wallet
+                ? `Total Ad Earning (AdSense + AdMob): ₹${calculateTotalAdEarning(wallet).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                : "Authoritative ledger unavailable"}
             </p>
           </div>
 

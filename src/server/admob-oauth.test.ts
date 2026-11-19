@@ -1,10 +1,12 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { handleApiRequest } from "./api-handler.ts";
+import { handleApiRequest, resetInMemoryStore } from "./api-handler.ts";
 import { setMysqlPoolForTesting } from "./mysql.ts";
+import { setTestPersistentDataDir } from "./payments.ts";
 
 async function callApi(req: Request, env?: Record<string, string | undefined>): Promise<Response> {
   const res = await handleApiRequest(req, env);
@@ -18,7 +20,8 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
   const adminUserId = "FT102857";
   const regularUserId = "FT483921";
   const testEncryptionKey = "facetube-test-admob-aes-256-gcm-master-key-2026!";
-  const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
+  let testDataDir = "";
+  let storePath = "";
 
   const originalClientId = process.env["ADMOB_OAUTH_CLIENT_ID"];
   const originalClientSecret = process.env["ADMOB_OAUTH_CLIENT_SECRET"];
@@ -28,6 +31,11 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
   const originalNodeEnv = process.env["NODE_ENV"];
 
   before(async () => {
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-admob-oauth-test-"));
+    storePath = path.join(testDataDir, "facetube_store.json");
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
+
     // Run suite in explicit test mode so fail-closed production checks behave accurately
     if (!process.env["NODE_ENV"] && !process.env["APP_ENV"]) {
       process.env["NODE_ENV"] = "test";
@@ -93,6 +101,12 @@ describe("FaceTube AdMob OAuth 2.0 Security Hardening (Phase 2.2) Test Suite", (
 
     if (originalNodeEnv !== undefined) process.env["NODE_ENV"] = originalNodeEnv;
     else delete process.env["NODE_ENV"];
+
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+    }
   });
 
   // --------------------------------------------------------------------------

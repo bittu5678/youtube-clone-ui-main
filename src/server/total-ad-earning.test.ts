@@ -1,8 +1,10 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { handleApiRequest } from "./api-handler.ts";
+import { handleApiRequest, resetInMemoryStore } from "./api-handler.ts";
+import { setTestPersistentDataDir } from "./payments.ts";
 import { setMysqlPoolForTesting } from "./mysql.ts";
 import { api } from "../lib/api.ts";
 import {
@@ -89,11 +91,20 @@ describe("FaceTube Company Task: Total Ad Earning Display", () => {
       assert.equal(calculateTotalAdEarning(wallet), 200);
     });
 
-    it("handles missing admobIncome, null wallet, and floating-point precision safely", () => {
+    it("handles missing admobIncome, null wallet, and two-decimal floating-point rounding safely", () => {
       assert.equal(calculateTotalAdEarning(null), 0);
       assert.equal(calculateTotalAdEarning(undefined), 0);
       assert.equal(calculateTotalAdEarning({ adsenseIncome: 10.1 }), 10.1);
       assert.equal(calculateTotalAdEarning({ adsenseIncome: 0.1, admobIncome: 0.2 }), 0.3);
+      assert.equal(calculateTotalAdEarning({ adsenseIncome: 10.124, admobIncome: 5.111 }), 15.24);
+      assert.equal(
+        calculateTotalAdEarning({
+          adsenseIncome: 100.555,
+          admobIncome: 20.111,
+          adBoostIncome: 999,
+        } as any),
+        120.67,
+      );
     });
   });
 
@@ -532,14 +543,201 @@ describe("FaceTube Company Task: Total Ad Earning Display", () => {
       assert.equal(curMonth.referral, 0);
     });
 
-    it("maintains PHP parity in api/wallet/earnings-history.php", () => {
+    it("maintains PHP parity in api/wallet/earnings-history.php (auth, settled-only, total_ad_earning)", () => {
       const php = fs.readFileSync(path.join(ROOT, "api/wallet/earnings-history.php"), "utf8");
+      assert.ok(php.includes("requireAuthUser("), "PHP must enforce requireAuthUser");
+      assert.equal(php.includes("FT483921"), false, "PHP must NOT fall back to FT483921");
+      assert.ok(php.includes("status = 'settled'") || php.includes('status = "settled"'));
       assert.ok(php.includes("'admob' => 0.0"), "PHP summary and timeline must initialize admob");
       assert.ok(php.includes("'admob_income' => 0.0"), "PHP timeline must initialize admob_income");
+      assert.ok(
+        php.includes("'total_ad_earning' => 0.0"),
+        "PHP summary and timeline must initialize total_ad_earning",
+      );
       assert.ok(
         php.includes("$type === 'admob_income'") && php.includes("$category = 'admob'"),
         "PHP must map admob_income strictly to admob",
       );
+    });
+
+    it("rejects unauthenticated requests with 401 and non-admin cross-user requests with 403 while allowing self & admin (200)", async () => {
+      // 1. Unauthenticated -> 401 (both store & MySQL)
+      const unauthRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/earnings-history?user_id=FT777001&period=7D"),
+      );
+      assert.ok(unauthRes);
+      assert.equal(unauthRes.status, 401);
+
+      const executedSql: string[] = [];
+      const mockPool = {
+        query: async (sql: string) => {
+          executedSql.push(sql);
+          if (sql.includes("FROM sessions s")) {
+            return [[CREATOR_SESSION_ROW]];
+          }
+          if (sql.includes("FROM income_ledger")) {
+            return [
+              [
+                {
+                  period_key: new Date().toISOString().split("T")[0],
+                  income_type: "adsense_income",
+                  total_amount: 100,
+                  tx_count: 1,
+                },
+                {
+                  period_key: new Date().toISOString().split("T")[0],
+                  income_type: "admob_income",
+                  total_amount: 50,
+                  tx_count: 1,
+                },
+                {
+                  period_key: new Date().toISOString().split("T")[0],
+                  income_type: "referral_income",
+                  total_amount: 300,
+                  tx_count: 1,
+                },
+              ],
+            ];
+          }
+          return [[]];
+        },
+      };
+      setMysqlPoolForTesting(mockPool);
+
+      // 2. Non-admin cross-user request -> 403
+      const forbiddenRes = await handleApiRequest(
+        new Request(
+          "http://localhost:3000/api/wallet/earnings-history?user_id=FT999888&period=7D",
+          {
+            headers: { Authorization: "Bearer creator-token" },
+          },
+        ),
+      );
+      assert.ok(forbiddenRes);
+      assert.equal(forbiddenRes.status, 403);
+
+      // 3. Self request -> 200 with total_ad_earning = adsense + admob only & settled SQL filter
+      const selfRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/earnings-history?period=7D", {
+          headers: { Authorization: "Bearer creator-token" },
+        }),
+      );
+      assert.ok(selfRes);
+      assert.equal(selfRes.status, 200);
+      const selfData = await selfRes.json();
+      assert.equal(selfData.user_id, "FT777001");
+      assert.equal(selfData.summary.adsense, 100);
+      assert.equal(selfData.summary.admob, 50);
+      assert.equal(selfData.summary.referral, 300);
+      assert.equal(selfData.summary.total_ad_earning, 150);
+      const ledgerSql = executedSql.find((q) => q.includes("FROM income_ledger"))!;
+      assert.ok(ledgerSql.includes("status = 'settled'"), "SQL must filter to status = 'settled'");
+
+      // 4. Admin cross-user request -> 200
+      setMysqlPoolForTesting({
+        query: async (sql: string) => {
+          if (sql.includes("FROM sessions s")) return [[ADMIN_SESSION_ROW]];
+          if (sql.includes("FROM income_ledger")) return [[]];
+          return [[]];
+        },
+      });
+      const adminRes = await handleApiRequest(
+        new Request(
+          "http://localhost:3000/api/wallet/earnings-history?user_id=FT777001&period=7D",
+          {
+            headers: { Authorization: "Bearer admin-token" },
+          },
+        ),
+      );
+      assert.ok(adminRes);
+      assert.equal(adminRes.status, 200);
+    });
+
+    it("excludes pending and failed ledger rows in store fallback and includes only settled AdSense + AdMob in total_ad_earning", async () => {
+      const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-eh-settled-"));
+      try {
+        setTestPersistentDataDir(testDataDir);
+        resetInMemoryStore();
+
+        const todayIso = new Date().toISOString();
+        const storePath = path.join(testDataDir, "facetube_store.json");
+        // First trigger store creation via login as Alex (FT483921)
+        const loginRes = await handleApiRequest(
+          new Request("http://localhost:3000/api/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ identifier: "alex@facetube.com", password: "password123" }),
+          }),
+        );
+        assert.ok(loginRes);
+        const loginData = await loginRes.json();
+        const token = loginData.token;
+        assert.ok(token);
+
+        const store = JSON.parse(fs.readFileSync(storePath, "utf8"));
+        store.walletTransactions = [
+          {
+            id: "tx-s1",
+            userId: "FT483921",
+            incomeType: "adsense_income",
+            amount: 120.5,
+            status: "settled",
+            createdAt: todayIso,
+          },
+          {
+            id: "tx-s2",
+            userId: "FT483921",
+            incomeType: "admob_income",
+            amount: 79.5,
+            status: "settled",
+            createdAt: todayIso,
+          },
+          {
+            id: "tx-s3",
+            userId: "FT483921",
+            incomeType: "referral_income",
+            amount: 500,
+            status: "settled",
+            createdAt: todayIso,
+          },
+          {
+            id: "tx-p1",
+            userId: "FT483921",
+            incomeType: "adsense_income",
+            amount: 999,
+            status: "pending",
+            createdAt: todayIso,
+          },
+          {
+            id: "tx-f1",
+            userId: "FT483921",
+            incomeType: "admob_income",
+            amount: 888,
+            status: "failed",
+            createdAt: todayIso,
+          },
+        ];
+        fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf8");
+        resetInMemoryStore();
+
+        const res = await handleApiRequest(
+          new Request("http://localhost:3000/api/wallet/earnings-history?period=7D", {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+        );
+        assert.ok(res);
+        assert.equal(res.status, 200);
+        const data = await res.json();
+        assert.equal(data.summary.adsense, 120.5);
+        assert.equal(data.summary.admob, 79.5);
+        assert.equal(data.summary.referral, 500);
+        assert.equal(data.summary.total_ad_earning, 200);
+        assert.equal(data.summary.total_revenue, 700);
+      } finally {
+        setTestPersistentDataDir(null);
+        resetInMemoryStore();
+        fs.rmSync(testDataDir, { recursive: true, force: true });
+      }
     });
 
     it("fails closed with 503 in production when MySQL pool is unavailable (Phase 2 protection)", async () => {
@@ -1080,6 +1278,7 @@ describe("FaceTube Company Task: Total Ad Earning Display", () => {
         "utf8",
       );
       assert.ok(modalSrc.includes("calculateTotalAdEarning"));
+      assert.ok(modalSrc.includes("getAuthoritativeUserWallet"));
       assert.equal(modalSrc.includes("promo revenue"), false);
 
       const cardsSrc = fs.readFileSync(
@@ -1089,22 +1288,74 @@ describe("FaceTube Company Task: Total Ad Earning Display", () => {
       assert.equal(cardsSrc.includes("₹840 ad revenue"), false);
       assert.equal(cardsSrc.includes("₹3,150.00"), false);
       assert.equal(cardsSrc.includes("Last paid Sep 18"), false);
+      assert.equal(cardsSrc.includes("142.5K views"), false);
+      assert.equal(cardsSrc.includes("68.9% to Ambassador"), false);
+      assert.ok(cardsSrc.includes('"total-ad-earning"'));
 
       const dashboardSrc = fs.readFileSync(path.join(ROOT, "src/routes/dashboard.tsx"), "utf8");
       assert.ok(dashboardSrc.includes('"adsense-income":'));
       assert.ok(dashboardSrc.includes('"admob-income":'));
+      assert.ok(dashboardSrc.includes('"total-ad-earning":'));
       assert.ok(dashboardSrc.includes('"affiliate-income":'));
       assert.ok(dashboardSrc.includes('"withdrawal-balance":'));
-      assert.ok(dashboardSrc.includes("earningsSummary?.admob"));
-      assert.ok(dashboardSrc.includes("All 17 Summary Cards"));
-      assert.ok(dashboardSrc.includes("Income Streams (7)"));
+      assert.ok(dashboardSrc.includes("earningsSummary.admob"));
+      assert.ok(dashboardSrc.includes("All 18 Summary Cards"));
+      assert.ok(dashboardSrc.includes("Income Streams (8)"));
+      assert.ok(dashboardSrc.includes("getAuthoritativeUserWallet"));
+      assert.ok(dashboardSrc.includes("calculateTotalAdEarning"));
       assert.equal(dashboardSrc.includes("All 16 Summary Cards"), false);
       assert.equal(dashboardSrc.includes("Income Streams (6)"), false);
+      assert.equal(dashboardSrc.includes("WATCH_TIME_CHART_DATA"), false);
+      assert.equal(dashboardSrc.includes("4,660 hrs"), false);
+      assert.equal(dashboardSrc.includes("8m 42s"), false);
+      assert.equal(dashboardSrc.includes("FT483921"), false);
+
+      const incomeSrc = fs.readFileSync(path.join(ROOT, "src/routes/income.tsx"), "utf8");
+      assert.ok(incomeSrc.includes("getAuthoritativeUserWallet"));
+      assert.ok(incomeSrc.includes("calculateTotalAdEarning"));
+      assert.equal(incomeSrc.includes("FT483921"), false);
+      assert.equal(incomeSrc.includes("₹2,450.00"), false);
+      assert.equal(incomeSrc.includes("86 Sales"), false);
+
+      const profileSrc = fs.readFileSync(path.join(ROOT, "src/routes/profile.tsx"), "utf8");
+      assert.ok(profileSrc.includes("getAuthoritativeUserWallet"));
+      assert.ok(profileSrc.includes("calculateTotalAdEarning"));
+      assert.ok(profileSrc.includes("Total Ad Earning"));
+      assert.equal(profileSrc.includes("4,280.50"), false);
+      assert.equal(profileSrc.includes("Alex Rivera"), false);
+      assert.equal(profileSrc.includes("84.2K hrs"), false);
+      assert.equal(profileSrc.includes("FT483921"), false);
+      assert.equal(profileSrc.includes('"uv-1"'), false);
+
+      const adsenseSrc = fs.readFileSync(path.join(ROOT, "src/routes/adsense-income.tsx"), "utf8");
+      assert.ok(adsenseSrc.includes("getAuthoritativeUserWallet"));
+      assert.ok(adsenseSrc.includes("calculateTotalAdEarning"));
+      assert.ok(adsenseSrc.includes("Total Ad Earning"));
+      assert.equal(adsenseSrc.includes('.includes("video ad")'), false);
+      assert.equal(adsenseSrc.includes('.includes("adsense")'), false);
+
+      const admobSrc = fs.readFileSync(path.join(ROOT, "src/routes/admob-income.tsx"), "utf8");
+      assert.ok(admobSrc.includes("getAuthoritativeUserWallet"));
+      assert.ok(admobSrc.includes("calculateTotalAdEarning"));
+      assert.ok(admobSrc.includes("Total Ad Earning"));
+      assert.equal(admobSrc.includes('.includes("admob")'), false);
+
+      const advSrc = fs.readFileSync(
+        path.join(ROOT, "src/routes/advertisement-videos.tsx"),
+        "utf8",
+      );
+      assert.ok(advSrc.includes("getAuthoritativeUserWallet"));
+      assert.ok(advSrc.includes("calculateTotalAdEarning"));
+      assert.ok(advSrc.includes("AdSense Video Revenue"));
+      assert.equal(advSrc.includes(">Sponsor Revenue<"), false);
+      assert.ok(advSrc.includes("walletError"));
 
       const walletSrc = fs.readFileSync(path.join(ROOT, "src/routes/wallet-balance.tsx"), "utf8");
+      assert.ok(walletSrc.includes("getAuthoritativeUserWallet"));
       assert.ok(walletSrc.includes("AdSense Income"));
       assert.ok(walletSrc.includes("AdMob Income"));
       assert.ok(walletSrc.includes("Total Ad Earning"));
+      assert.equal(walletSrc.includes("FT483921"), false);
 
       const yourVideosSrc = fs.readFileSync(path.join(ROOT, "src/routes/your-videos.tsx"), "utf8");
       assert.equal(yourVideosSrc.includes("ad_earnings"), false);

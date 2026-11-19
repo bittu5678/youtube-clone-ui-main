@@ -532,6 +532,65 @@ interface PersistentPremiumState {
 const DEFAULT_DATA_DIR = path.resolve(process.cwd(), "data");
 let testDataDirOverride: string | null = null;
 let autoTestTempDir: string | null = null;
+let testStorageIsolationLatch = false;
+
+function detectStartupNodeTestRunner(): boolean {
+  if (typeof process === "undefined") {
+    return false;
+  }
+  const hasNodeTestContext = Boolean(String(process.env?.["NODE_TEST_CONTEXT"] ?? "").trim());
+  const execArgs = Array.isArray(process.execArgv) ? process.execArgv : [];
+  const argv = Array.isArray(process.argv) ? process.argv : [];
+  const hasTestFlag =
+    execArgs.some((arg) => arg === "--test" || arg.startsWith("--test-")) ||
+    argv.some((arg) => arg === "--test" || arg.startsWith("--test-"));
+  const startupNodeEnv = String(process.env?.["NODE_ENV"] ?? "")
+    .trim()
+    .toLowerCase();
+  const startupAppEnv = String(process.env?.["APP_ENV"] ?? "")
+    .trim()
+    .toLowerCase();
+  return hasNodeTestContext || hasTestFlag || startupNodeEnv === "test" || startupAppEnv === "test";
+}
+
+const STARTED_IN_NODE_TEST_RUNNER = detectStartupNodeTestRunner();
+
+/**
+ * Test-only latch to ensure non-production persistent JSON operations isolate into os.tmpdir()
+ * even if a caller runs outside `node --test` and later sets APP_ENV/NODE_ENV=development.
+ * Cannot enable JSON persistence or weaken fail-closed guards in production.
+ */
+export function enableTestStorageIsolation(): void {
+  testStorageIsolationLatch = true;
+}
+
+export function isTestStorageIsolationActive(env?: Record<string, string | undefined>): boolean {
+  if (isProductionRuntimeEnv(env)) {
+    return false;
+  }
+  return STARTED_IN_NODE_TEST_RUNNER || testStorageIsolationLatch || isTestRuntimeEnv(env);
+}
+
+export function isProtectedDataDir(targetPath: string): boolean {
+  const resolved = path.resolve(targetPath);
+  if (resolved === DEFAULT_DATA_DIR || resolved.startsWith(DEFAULT_DATA_DIR + path.sep)) {
+    return true;
+  }
+  try {
+    const realDefault = fs.existsSync(DEFAULT_DATA_DIR)
+      ? fs.realpathSync(DEFAULT_DATA_DIR)
+      : DEFAULT_DATA_DIR;
+    if (fs.existsSync(resolved)) {
+      const realTarget = fs.realpathSync(resolved);
+      if (realTarget === realDefault || realTarget.startsWith(realDefault + path.sep)) {
+        return true;
+      }
+    }
+  } catch {
+    // Ignore realpath errors for non-existent paths
+  }
+  return false;
+}
 
 export function isTestRuntimeEnv(env?: Record<string, string | undefined>): boolean {
   const hasExplicitAppEnv =
@@ -551,19 +610,34 @@ export function getExplicitTestDataDir(env?: Record<string, string | undefined>)
   if (isProductionRuntimeEnv(env)) {
     return null;
   }
-  if (testDataDirOverride) {
-    return testDataDirOverride;
-  }
-  const envOverride = (
-    env?.["FACETUBE_TEST_DATA_DIR"] ??
-    process.env["FACETUBE_TEST_DATA_DIR"] ??
-    ""
+  const hasExplicitEnvOverride =
+    env !== undefined && Object.prototype.hasOwnProperty.call(env, "FACETUBE_TEST_DATA_DIR");
+  const envOverride = String(
+    hasExplicitEnvOverride
+      ? (env["FACETUBE_TEST_DATA_DIR"] ?? "")
+      : (process.env["FACETUBE_TEST_DATA_DIR"] ?? ""),
   ).trim();
   if (envOverride) {
-    const resolved = path.resolve(envOverride);
-    if (resolved !== DEFAULT_DATA_DIR) {
-      return resolved;
+    const resolvedEnvDir = path.resolve(envOverride);
+    if (isProtectedDataDir(resolvedEnvDir)) {
+      throw new Error(
+        "[Payments Server] Test persistent data directory must not target protected data/ directory.",
+      );
     }
+    if (hasExplicitEnvOverride) {
+      return resolvedEnvDir;
+    }
+  }
+  if (testDataDirOverride) {
+    if (isProtectedDataDir(testDataDirOverride)) {
+      throw new Error(
+        "[Payments Server] Test persistent data directory must not target protected data/ directory.",
+      );
+    }
+    return testDataDirOverride;
+  }
+  if (envOverride) {
+    return path.resolve(envOverride);
   }
   return null;
 }
@@ -578,7 +652,7 @@ export function setTestPersistentDataDir(
     return;
   }
   const resolved = path.resolve(dir);
-  if (resolved === DEFAULT_DATA_DIR) {
+  if (isProtectedDataDir(resolved)) {
     throw new Error(
       "[Payments Server] Test persistent data directory must not target protected data/ directory.",
     );
@@ -594,9 +668,14 @@ export function getPersistentDataDir(env?: Record<string, string | undefined>): 
   if (explicit) {
     return explicit;
   }
-  if (isTestRuntimeEnv(env)) {
+  if (isTestStorageIsolationActive(env)) {
     if (!autoTestTempDir) {
       autoTestTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-test-premium-"));
+    }
+    if (isProtectedDataDir(autoTestTempDir)) {
+      throw new Error(
+        "[Payments Server] Auto-isolated test directory must not target protected data/ directory.",
+      );
     }
     return autoTestTempDir;
   }

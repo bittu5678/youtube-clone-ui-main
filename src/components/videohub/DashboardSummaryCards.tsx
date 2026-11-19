@@ -37,17 +37,17 @@ const DASHBOARD_SUMMARY_DATA: SummaryCardItem[] = [
   {
     id: "total-referrals",
     title: "Direct Referrals",
-    value: "0",
+    value: "—",
     subtitle: "Direct frontline members",
     icon: Users,
     color: "text-rose-400 bg-rose-500/10",
     link: "/referral-members",
   },
-  // 2. Team Members (Updated label per requirement)
+  // 2. Team Members
   {
     id: "total-team",
     title: "Team Members",
-    value: "0",
+    value: "—",
     subtitle: "Across network tiers",
     icon: Network,
     color: "text-blue-400 bg-blue-500/10",
@@ -57,18 +57,17 @@ const DASHBOARD_SUMMARY_DATA: SummaryCardItem[] = [
   {
     id: "free-videos",
     title: "Free Videos",
-    value: "14",
+    value: "—",
     subtitle: "Public standard content",
     icon: Video,
     color: "text-sky-400 bg-sky-500/10",
     link: "/free-videos",
-    trend: "142.5K views",
   },
   // 4. Sponsor Videos
   {
     id: "premium-videos",
     title: "Sponsor Videos",
-    value: "6",
+    value: "—",
     subtitle: "Monetized subscriber-only",
     icon: Sparkles,
     color: "text-amber-400 bg-amber-500/10",
@@ -78,51 +77,47 @@ const DASHBOARD_SUMMARY_DATA: SummaryCardItem[] = [
   {
     id: "short-videos",
     title: "Short Videos",
-    value: "18",
+    value: "—",
     subtitle: "Under 60s viral shorts",
     icon: Clapperboard,
     color: "text-brand bg-brand/10",
     link: "/short-videos",
-    trend: "280K views",
   },
   // 6. Live Videos
   {
     id: "live-videos",
     title: "Live Videos",
-    value: "3",
+    value: "—",
     subtitle: "Scheduled & archived streams",
     icon: Radio,
     color: "text-emerald-400 bg-emerald-500/10",
     link: "/live-videos",
-    trend: "Active stream ready",
   },
   // 7. Advertisement Videos
   {
     id: "advertisement-videos",
     title: "Advertisement Videos",
-    value: "5",
+    value: "—",
     subtitle: "Sponsor & promo campaigns",
     icon: Tv,
     color: "text-purple-400 bg-purple-500/10",
     link: "/advertisement-videos",
-    trend: "3 active deals",
   },
   // 8. Images Uploaded
   {
     id: "images-uploaded",
     title: "Images Uploaded",
-    value: "32",
+    value: "—",
     subtitle: "Thumbnails & community posts",
     icon: Image,
     color: "text-teal-400 bg-teal-500/10",
     link: "/images-uploaded",
-    trend: "High-res assets",
   },
   // 9. Referral Income
   {
     id: "referral-income",
     title: "Referral Income",
-    value: "₹0.00",
+    value: "—",
     subtitle: "Direct referral earnings",
     icon: DollarSign,
     color: "text-emerald-400 bg-emerald-500/10",
@@ -132,7 +127,7 @@ const DASHBOARD_SUMMARY_DATA: SummaryCardItem[] = [
   {
     id: "global-income",
     title: "Global Income",
-    value: "₹0.00",
+    value: "—",
     subtitle: "Worldwide pool distribution",
     icon: Globe2,
     color: "text-cyan-400 bg-cyan-500/10",
@@ -142,68 +137,78 @@ const DASHBOARD_SUMMARY_DATA: SummaryCardItem[] = [
   {
     id: "adsense-income",
     title: "AdSense Income",
-    value: "₹0.00",
+    value: "—",
     subtitle: "Video ad revenue split",
     icon: TrendingUp,
     color: "text-yellow-400 bg-yellow-500/10",
     link: "/adsense-income",
   },
-  // 11b. AdMob Income
+  // 12. AdMob Income
   {
     id: "admob-income",
     title: "AdMob Income",
-    value: "₹0.00",
+    value: "—",
     subtitle: "Android Mobile Ads split",
     icon: Smartphone,
     color: "text-blue-400 bg-blue-500/10",
     link: "/admob-income",
   },
-  // 12. Affiliate Income
+  // 13. Total Ad Earning (Strictly AdSense + AdMob)
+  {
+    id: "total-ad-earning",
+    title: "Total Ad Earning",
+    value: "—",
+    subtitle: "Verified AdSense + AdMob",
+    icon: DollarSign,
+    color: "text-emerald-400 bg-emerald-500/10",
+    link: "/adsense-income",
+    isPositive: true,
+  },
+  // 14. Affiliate Income
   {
     id: "affiliate-income",
     title: "Affiliate Income",
-    value: "₹0.00",
+    value: "—",
     subtitle: "Gear, courses & links",
     icon: Share2,
     color: "text-indigo-400 bg-indigo-500/10",
     link: "/affiliate-income",
   },
-  // 13. Wallet Balance
+  // 15. Wallet Balance
   {
     id: "wallet-balance",
     title: "Wallet Balance",
-    value: "₹0.00",
+    value: "—",
     subtitle: "Available for payout",
     icon: Wallet,
     color: "text-emerald-400 bg-emerald-500/10",
     link: "/wallet-balance",
   },
-  // 14. Withdrawal Balance
+  // 16. Withdrawal Balance
   {
     id: "withdrawal-balance",
     title: "Withdrawal Balance",
-    value: "₹0.00",
+    value: "—",
     subtitle: "Total successfully paid out",
     icon: ArrowDownToLine,
     color: "text-orange-400 bg-orange-500/10",
     link: "/withdrawal-balance",
   },
-  // 15. Current Rank
+  // 17. Current Rank
   {
     id: "current-rank",
     title: "Current Rank",
-    value: "Diamond",
-    subtitle: "Tier 5 Commission unlock",
+    value: "—",
+    subtitle: "Tier commission unlock",
     icon: Award,
     color: "text-amber-400 bg-amber-500/10",
     link: "/team-income",
-    trend: "68.9% to Ambassador",
   },
-  // 16. Subscriber Count
+  // 18. Subscriber Count
   {
     id: "subscriber-count",
     title: "Subscriber Count",
-    value: "0",
+    value: "—",
     subtitle: "Active channel followers",
     icon: Bell,
     color: "text-rose-400 bg-rose-500/10",
@@ -215,20 +220,24 @@ export function DashboardSummaryCards({
   filterCategory,
   limit,
   dynamicOverrides,
+  trendOverrides,
 }: {
   filterCategory?: "all" | "income" | "videos" | "network";
   limit?: number;
   dynamicOverrides?: Record<string, string>;
+  trendOverrides?: Record<string, string>;
 }) {
   let cards = DASHBOARD_SUMMARY_DATA;
 
-  if (dynamicOverrides) {
+  if (dynamicOverrides || trendOverrides) {
     cards = cards.map((c) => {
-      const overrideVal = dynamicOverrides[c.id];
-      if (overrideVal !== undefined) {
-        return { ...c, value: overrideVal };
-      }
-      return c;
+      const overrideVal = dynamicOverrides?.[c.id];
+      const overrideTrend = trendOverrides?.[c.id];
+      return {
+        ...c,
+        ...(overrideVal !== undefined ? { value: overrideVal } : {}),
+        ...(overrideTrend !== undefined ? { trend: overrideTrend } : {}),
+      };
     });
   }
 
@@ -239,6 +248,7 @@ export function DashboardSummaryCards({
         "global-income",
         "adsense-income",
         "admob-income",
+        "total-ad-earning",
         "affiliate-income",
         "wallet-balance",
         "withdrawal-balance",

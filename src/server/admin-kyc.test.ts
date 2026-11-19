@@ -1,13 +1,14 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { handleApiRequest } from "./api-handler";
-
-const STORE_PATH = path.resolve(process.cwd(), "data/facetube_store.json");
+import { handleApiRequest, resetInMemoryStore } from "./api-handler";
+import { setTestPersistentDataDir } from "./payments";
 
 describe("FaceTube Admin KYC Backend: RBAC, Review, Audit & Self-Verification Prevention Tests", () => {
-  let initialStoreSnapshot = "";
+  let testDataDir = "";
+  let STORE_PATH = "";
   let adminToken = "";
   let regularUserToken = "";
 
@@ -16,8 +17,10 @@ describe("FaceTube Admin KYC Backend: RBAC, Review, Audit & Self-Verification Pr
   const testCreatorId = "FT_TEST_CREATOR_99";
 
   before(async () => {
-    // Preserve initial store snapshot
-    initialStoreSnapshot = fs.readFileSync(STORE_PATH, "utf-8");
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-admin-kyc-test-"));
+    STORE_PATH = path.join(testDataDir, "facetube_store.json");
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
 
     // Authenticate Admin User (FT102857)
     const adminLoginReq = new Request("http://localhost:3000/api/auth/login", {
@@ -47,9 +50,10 @@ describe("FaceTube Admin KYC Backend: RBAC, Review, Audit & Self-Verification Pr
   });
 
   after(() => {
-    // Restore initial store snapshot
-    if (initialStoreSnapshot) {
-      fs.writeFileSync(STORE_PATH, initialStoreSnapshot, "utf-8");
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
     }
   });
 

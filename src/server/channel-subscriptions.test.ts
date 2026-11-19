@@ -1,11 +1,15 @@
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { handleApiRequest } from "./api-handler";
+import { handleApiRequest, resetInMemoryStore } from "./api-handler";
+import { setTestPersistentDataDir } from "./payments";
 import { getMysqlPool } from "./mysql";
 
 describe("FaceTube Phase 3: Creator Channel Subscriptions Tests", () => {
+  let testDataDir = "";
+  let storePath = "";
   let adminToken = "";
   let userTokenAlex = "";
   let userTokenMaya = "";
@@ -15,6 +19,11 @@ describe("FaceTube Phase 3: Creator Channel Subscriptions Tests", () => {
   const adminUserId = "FT102857";
 
   before(async () => {
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-channel-subs-test-"));
+    storePath = path.join(testDataDir, "facetube_store.json");
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
+
     // 1. Authenticate as Admin (admin@facetube.com / FT102857)
     const adminLoginRes = await handleApiRequest(
       new Request("http://localhost:3000/api/auth/login", {
@@ -56,9 +65,8 @@ describe("FaceTube Phase 3: Creator Channel Subscriptions Tests", () => {
   });
 
   beforeEach(async () => {
-    // Reset subscriptions in store
-    const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
-    if (fs.existsSync(storePath)) {
+    // Reset subscriptions in isolated test store
+    if (storePath && fs.existsSync(storePath)) {
       try {
         const store = JSON.parse(fs.readFileSync(storePath, "utf-8"));
         store.channelSubscriptions = [];
@@ -76,6 +84,14 @@ describe("FaceTube Phase 3: Creator Channel Subscriptions Tests", () => {
       } catch (_e) {
         // Table may not exist yet in local testing environment
       }
+    }
+  });
+
+  after(() => {
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
     }
   });
 

@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import {
   verifyServerPayment,
   verifyPayment,
@@ -24,6 +25,8 @@ import {
   getPersistentDataDir,
   getPersistentStateFile,
   getExplicitTestDataDir,
+  enableTestStorageIsolation,
+  isTestStorageIsolationActive,
 } from "./payments";
 import {
   handleApiRequest,
@@ -34,6 +37,8 @@ import {
   setStoreWalletBalance,
   resetStoreForTests,
   resetInMemoryStore,
+  getStoreDir,
+  getStoreFilePath,
 } from "./api-handler";
 import { isPromotionActive, getVideoBadgeLabels } from "../lib/video-service";
 import { api } from "../lib/api";
@@ -4638,7 +4643,7 @@ describe("Protected Production JSON Isolation Regression Tests", () => {
     assert.equal(sha256File(protectedPremPath), premHashBefore);
   });
 
-  it("2. Auto-isolates premium state without override, blocks unisolated store helpers in test mode, rejects protected data/ dir, and ignores overrides in production", async () => {
+  it("2. Auto-isolates both premium state and API store to os.tmpdir() without explicit override, rejects protected data/ overrides, and ignores overrides in production", async () => {
     const protectedDataDir = path.resolve(process.cwd(), "data");
     const protectedStorePath = path.join(protectedDataDir, "facetube_store.json");
     const protectedPremPath = path.join(protectedDataDir, "premium_transactions.json");
@@ -4650,14 +4655,39 @@ describe("Protected Production JSON Isolation Regression Tests", () => {
       () => setTestPersistentDataDir(protectedDataDir),
       /must not target protected data\//i,
     );
+    assert.throws(
+      () => setTestPersistentDataDir(path.join(protectedDataDir, "nested")),
+      /must not target protected data\//i,
+    );
 
     const prodEnv = { APP_ENV: "production", NODE_ENV: "production" };
     assert.equal(getExplicitTestDataDir(prodEnv), null);
     assert.equal(getPersistentDataDir(prodEnv), protectedDataDir);
     assert.equal(getPersistentStateFile(prodEnv), protectedPremPath);
+    assert.equal(getStoreDir(prodEnv), protectedDataDir);
+    assert.equal(getStoreFilePath(prodEnv), protectedStorePath);
     await assert.rejects(
       () => getPersistentPremiumTxNumber(prodEnv),
       /strictly disabled in production/i,
+    );
+
+    assert.throws(
+      () =>
+        getExplicitTestDataDir({
+          APP_ENV: "test",
+          NODE_ENV: "test",
+          FACETUBE_TEST_DATA_DIR: protectedDataDir,
+        }),
+      /must not target protected data\//i,
+    );
+    assert.throws(
+      () =>
+        getStoreDir({
+          APP_ENV: "test",
+          NODE_ENV: "test",
+          FACETUBE_TEST_DATA_DIR: path.join(protectedDataDir, "sub"),
+        }),
+      /must not target protected data\//i,
     );
 
     setTestPersistentDataDir(null);
@@ -4667,17 +4697,311 @@ describe("Protected Production JSON Isolation Regression Tests", () => {
       const autoDir = getPersistentDataDir(testEnv);
       assert.notEqual(path.resolve(autoDir), protectedDataDir);
       assert.ok(path.resolve(autoDir).startsWith(path.resolve(os.tmpdir())));
+      assert.equal(getStoreDir(testEnv), autoDir);
+      assert.equal(getStoreFilePath(testEnv), path.join(autoDir, "facetube_store.json"));
 
       await resetPersistentPremiumState(0, [], [], [], testEnv);
-      assert.throws(
-        () => resetStoreForTests("FT483921", 50000, testEnv),
-        /requires an isolated test directory/i,
+      resetStoreForTests("FT483921", 50000, testEnv);
+      setStoreWalletBalance("FT483921", 65000, testEnv);
+
+      assert.ok(fs.existsSync(path.join(autoDir, "facetube_store.json")));
+      assert.ok(fs.existsSync(path.join(autoDir, "premium_transactions.json")));
+      const autoStore = JSON.parse(
+        fs.readFileSync(path.join(autoDir, "facetube_store.json"), "utf-8"),
       );
-      assert.throws(
-        () => setStoreWalletBalance("FT483921", 100, testEnv),
-        /requires an isolated test directory/i,
-      );
+      assert.equal(autoStore.wallets["FT483921"].balance, 65000);
     } finally {
+      setTestPersistentDataDir(paymentTestDataDir);
+      resetInMemoryStore();
+    }
+
+    assert.equal(sha256File(protectedStorePath), storeHashBefore);
+    assert.equal(sha256File(protectedPremPath), premHashBefore);
+  });
+
+  it("3. API test-mode requests without an explicit test directory auto-isolate in os.tmpdir() and cannot modify protected data/*.json", async () => {
+    const protectedDataDir = path.resolve(process.cwd(), "data");
+    const protectedStorePath = path.join(protectedDataDir, "facetube_store.json");
+    const protectedPremPath = path.join(protectedDataDir, "premium_transactions.json");
+
+    const storeHashBefore = sha256File(protectedStorePath);
+    const premHashBefore = sha256File(protectedPremPath);
+    const origTestDirEnv = process.env["FACETUBE_TEST_DATA_DIR"];
+    delete process.env["FACETUBE_TEST_DATA_DIR"];
+
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+
+    try {
+      const unconfiguredTestEnv = {
+        APP_ENV: "test",
+        NODE_ENV: "test",
+        RAZORPAY_KEY_SECRET: "auto_iso_secret_123456",
+        RAZORPAY_SKIP_REMOTE_CHECK: "true",
+      };
+
+      const autoDir = getStoreDir(unconfiguredTestEnv);
+      assert.ok(path.resolve(autoDir).startsWith(path.resolve(os.tmpdir())));
+      assert.equal(getStoreDir(unconfiguredTestEnv), getPersistentDataDir(unconfiguredTestEnv));
+
+      const catRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/categories/list", { method: "GET" }),
+        unconfiguredTestEnv,
+        { pool: null },
+      );
+      assert.equal(catRes?.status, 200);
+
+      const loginRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifier: "alex@facetube.com", password: "password123" }),
+        }),
+        unconfiguredTestEnv,
+        { pool: null },
+      );
+      assert.equal(loginRes?.status, 200);
+
+      const orderId = `order_auto_iso_${Date.now()}`;
+      const paymentId = `pay_auto_iso_${Date.now()}`;
+      const sig = crypto
+        .createHmac("sha256", unconfiguredTestEnv.RAZORPAY_KEY_SECRET)
+        .update(`${orderId}|${paymentId}`)
+        .digest("hex");
+      const verifyRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/payments/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            orderId,
+            paymentId,
+            signature: sig,
+            userId: "FT483921",
+            purpose: "premium_video_upload",
+          }),
+        }),
+        unconfiguredTestEnv,
+        { pool: null },
+      );
+      assert.equal(verifyRes?.status, 200);
+
+      assert.ok(fs.existsSync(path.join(autoDir, "facetube_store.json")));
+      assert.ok(fs.existsSync(path.join(autoDir, "premium_transactions.json")));
+    } finally {
+      if (origTestDirEnv !== undefined) {
+        process.env["FACETUBE_TEST_DATA_DIR"] = origTestDirEnv;
+      }
+      setTestPersistentDataDir(paymentTestDataDir);
+      resetInMemoryStore();
+    }
+
+    assert.equal(sha256File(protectedStorePath), storeHashBefore);
+    assert.equal(sha256File(protectedPremPath), premHashBefore);
+  });
+
+  it("4. Invalidates inMemoryStore cache on directory switches and direct disk modifications without leaking stale state", async () => {
+    const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-cache-dir-a-"));
+    const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-cache-dir-b-"));
+
+    try {
+      const envA = { APP_ENV: "test", NODE_ENV: "test" };
+      setTestPersistentDataDir(dirA);
+      resetInMemoryStore();
+      setStoreWalletBalance("FT483921", 11111, envA);
+
+      // Switch to dirB WITHOUT calling resetInMemoryStore() manually
+      setTestPersistentDataDir(dirB);
+      setStoreWalletBalance("FT483921", 22222, envA);
+
+      const storeB = JSON.parse(fs.readFileSync(path.join(dirB, "facetube_store.json"), "utf-8"));
+      assert.equal(storeB.wallets["FT483921"].balance, 22222);
+
+      // Switch back to dirA -> must load dirA's 11111, not dirB's cached 22222
+      setTestPersistentDataDir(dirA);
+      const loginRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifier: "alex@facetube.com", password: "password123" }),
+        }),
+        envA,
+        { pool: null },
+      );
+      const loginJson = (await loginRes?.json()) as any;
+      const balRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/balance?userId=FT483921", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${loginJson.token}` },
+        }),
+        envA,
+        { pool: null },
+      );
+      const balJson = (await balRes?.json()) as any;
+      assert.equal(balJson.wallet.balance, 11111);
+
+      // Direct external write on disk in same directory within same millisecond must invalidate cache
+      const fileA = path.join(dirA, "facetube_store.json");
+      const rawA = JSON.parse(fs.readFileSync(fileA, "utf-8"));
+      rawA.wallets["FT483921"].balance = 33333;
+      fs.writeFileSync(fileA, JSON.stringify(rawA, null, 2), "utf-8");
+
+      const balRes2 = await handleApiRequest(
+        new Request("http://localhost:3000/api/wallet/balance?userId=FT483921", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${loginJson.token}` },
+        }),
+        envA,
+        { pool: null },
+      );
+      const balJson2 = (await balRes2?.json()) as any;
+      assert.equal(balJson2.wallet.balance, 33333);
+    } finally {
+      setTestPersistentDataDir(paymentTestDataDir);
+      resetInMemoryStore();
+      fs.rmSync(dirA, { recursive: true, force: true });
+      fs.rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+
+  it("5. Keeps storage isolated in os.tmpdir() when test changes process.env or handleApiRequest env to development, preserves production fail-closed guards, and preserves data/ in normal local development", async () => {
+    const protectedDataDir = path.resolve(process.cwd(), "data");
+    const protectedStorePath = path.join(protectedDataDir, "facetube_store.json");
+    const protectedPremPath = path.join(protectedDataDir, "premium_transactions.json");
+
+    const storeHashBefore = sha256File(protectedStorePath);
+    const premHashBefore = sha256File(protectedPremPath);
+
+    const origAppEnv = process.env["APP_ENV"];
+    const origNodeEnv = process.env["NODE_ENV"];
+    const origTestDirEnv = process.env["FACETUBE_TEST_DATA_DIR"];
+
+    setTestPersistentDataDir(null);
+    delete process.env["FACETUBE_TEST_DATA_DIR"];
+    resetInMemoryStore();
+
+    try {
+      // Mutate process.env to development after test runner started in test context
+      process.env["APP_ENV"] = "development";
+      process.env["NODE_ENV"] = "development";
+
+      assert.equal(getExplicitTestDataDir(), null);
+      assert.equal(isTestStorageIsolationActive(), true);
+
+      const isolatedFromProcessEnv = getPersistentDataDir();
+      assert.notEqual(path.resolve(isolatedFromProcessEnv), protectedDataDir);
+      assert.ok(path.resolve(isolatedFromProcessEnv).startsWith(path.resolve(os.tmpdir())));
+      assert.equal(getStoreDir(), isolatedFromProcessEnv);
+
+      // Explicit development env passed to handleApiRequest must also resolve to os.tmpdir()
+      const devEnv = { APP_ENV: "development", NODE_ENV: "development" };
+      assert.equal(getExplicitTestDataDir(devEnv), null);
+      assert.equal(isTestStorageIsolationActive(devEnv), true);
+      assert.equal(getPersistentDataDir(devEnv), isolatedFromProcessEnv);
+      assert.equal(getStoreDir(devEnv), isolatedFromProcessEnv);
+
+      const loginRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifier: "alex@facetube.com", password: "password123" }),
+        }),
+        devEnv,
+        { pool: null },
+      );
+      assert.equal(loginRes?.status, 200);
+      assert.ok(fs.existsSync(path.join(isolatedFromProcessEnv, "facetube_store.json")));
+
+      // Verify explicit enableTestStorageIsolation() cannot weaken production fail-closed guards
+      enableTestStorageIsolation();
+      const prodWithDevNode = { APP_ENV: "production", NODE_ENV: "development" };
+      assert.equal(isProductionRuntimeEnv(prodWithDevNode), true);
+      assert.equal(isTestStorageIsolationActive(prodWithDevNode), false);
+      assert.equal(getPersistentDataDir(prodWithDevNode), protectedDataDir);
+      assert.throws(
+        () => resetStoreForTests("FT483921", 50000, prodWithDevNode),
+        /disabled in production/i,
+      );
+      await assert.rejects(
+        () => getPersistentPremiumTxNumber(prodWithDevNode),
+        /strictly disabled in production/i,
+      );
+      const prodLoginRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identifier: "alex@facetube.com", password: "password123" }),
+        }),
+        prodWithDevNode,
+        { pool: null },
+      );
+      assert.equal(prodLoginRes?.status, 503);
+
+      // Verify in a standalone non-test Node process that normal local development resolves to data/
+      const cleanChildEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) {
+        if (
+          v !== undefined &&
+          k !== "NODE_TEST_CONTEXT" &&
+          k !== "FACETUBE_TEST_DATA_DIR" &&
+          k !== "APP_ENV" &&
+          k !== "NODE_ENV"
+        ) {
+          cleanChildEnv[k] = v;
+        }
+      }
+      cleanChildEnv["APP_ENV"] = "development";
+      cleanChildEnv["NODE_ENV"] = "development";
+
+      const probeScript = `
+        import { getPersistentDataDir, isTestStorageIsolationActive, enableTestStorageIsolation } from "./src/server/payments.ts";
+        import { getStoreDir, getStoreFilePath } from "./src/server/api-handler.ts";
+        const devResult = {
+          isolatedBefore: isTestStorageIsolationActive(),
+          dataDirBefore: getPersistentDataDir(),
+          storeDirBefore: getStoreDir(),
+          storeFileBefore: getStoreFilePath(),
+        };
+        enableTestStorageIsolation();
+        const afterLatch = {
+          isolatedAfter: isTestStorageIsolationActive(),
+          dataDirAfter: getPersistentDataDir(),
+          prodIsolatedAfter: isTestStorageIsolationActive({ APP_ENV: "production", NODE_ENV: "development" }),
+        };
+        console.log("__PROBE_JSON__:" + JSON.stringify({ devResult, afterLatch }));
+      `;
+      const probeStdout = execFileSync(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "-e", probeScript],
+        { cwd: process.cwd(), env: cleanChildEnv, encoding: "utf-8" },
+      );
+      const probeLine = probeStdout
+        .split(/\r?\n/)
+        .find((line) => line.startsWith("__PROBE_JSON__:"));
+      assert.ok(probeLine, `Expected __PROBE_JSON__ line in stdout, got: ${probeStdout}`);
+      const probeParsed = JSON.parse(probeLine.slice("__PROBE_JSON__:".length));
+      try {
+        assert.equal(probeParsed.devResult.isolatedBefore, false);
+        assert.equal(path.resolve(probeParsed.devResult.dataDirBefore), protectedDataDir);
+        assert.equal(path.resolve(probeParsed.devResult.storeDirBefore), protectedDataDir);
+        assert.equal(path.resolve(probeParsed.devResult.storeFileBefore), protectedStorePath);
+        assert.equal(probeParsed.afterLatch.isolatedAfter, true);
+        assert.ok(
+          path.resolve(probeParsed.afterLatch.dataDirAfter).startsWith(path.resolve(os.tmpdir())),
+        );
+        assert.equal(probeParsed.afterLatch.prodIsolatedAfter, false);
+      } finally {
+        if (probeParsed?.afterLatch?.dataDirAfter) {
+          fs.rmSync(probeParsed.afterLatch.dataDirAfter, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      if (origAppEnv !== undefined) process.env["APP_ENV"] = origAppEnv;
+      else delete process.env["APP_ENV"];
+      if (origNodeEnv !== undefined) process.env["NODE_ENV"] = origNodeEnv;
+      else delete process.env["NODE_ENV"];
+      if (origTestDirEnv !== undefined) process.env["FACETUBE_TEST_DATA_DIR"] = origTestDirEnv;
+      else delete process.env["FACETUBE_TEST_DATA_DIR"];
+
       setTestPersistentDataDir(paymentTestDataDir);
       resetInMemoryStore();
     }

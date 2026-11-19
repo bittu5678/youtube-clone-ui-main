@@ -544,6 +544,7 @@ export const api = {
           global: number;
           adsense: number;
           admob: number;
+          total_ad_earning?: number;
           affiliate: number;
           ad_boost: number;
         };
@@ -555,6 +556,7 @@ export const api = {
           global: number;
           adsense: number;
           admob: number;
+          total_ad_earning?: number;
           affiliate: number;
           ad_boost: number;
           referral_income: number;

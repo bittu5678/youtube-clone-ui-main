@@ -1,13 +1,16 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   handleApiRequest,
   isFailClosedProductionEnv,
   isMysqlDuplicateKeyError,
+  resetInMemoryStore,
 } from "./api-handler.ts";
 import { setMysqlPoolForTesting } from "./mysql.ts";
+import { setTestPersistentDataDir } from "./payments.ts";
 import { ADMOB_TEST_IDS, resolveAdMobConfig, requireAdMobConfig } from "../lib/admob-service.ts";
 
 describe("FaceTube Google AdMob Integration & Backend Statements Test Suite", () => {
@@ -15,24 +18,18 @@ describe("FaceTube Google AdMob Integration & Backend Statements Test Suite", ()
   let userToken = "";
   const targetCreator = "FT483921";
   const testMonth = "2026-08";
-  const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
-  let initialWalletSnapshot: any = null;
+  let testDataDir = "";
+  let storePath = "";
   const originalNodeEnv = process.env["NODE_ENV"];
 
   before(async () => {
     if (!process.env["NODE_ENV"] && !process.env["APP_ENV"]) {
       process.env["NODE_ENV"] = "test";
     }
-    if (fs.existsSync(storePath)) {
-      try {
-        const store = JSON.parse(fs.readFileSync(storePath, "utf-8"));
-        if (store.wallets?.[targetCreator]) {
-          initialWalletSnapshot = structuredClone(store.wallets[targetCreator]);
-        }
-      } catch (_e) {
-        // ignore
-      }
-    }
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-admob-marketing-test-"));
+    storePath = path.join(testDataDir, "facetube_store.json");
+    setTestPersistentDataDir(testDataDir);
+    resetInMemoryStore();
 
     // 1. Authenticate as Admin (admin@facetube.com)
     const adminLoginReq = new Request("http://localhost:3000/api/auth/login", {
@@ -64,25 +61,10 @@ describe("FaceTube Google AdMob Integration & Backend Statements Test Suite", ()
     if (originalNodeEnv !== undefined) process.env["NODE_ENV"] = originalNodeEnv;
     else delete process.env["NODE_ENV"];
 
-    if (fs.existsSync(storePath)) {
-      try {
-        const store = JSON.parse(fs.readFileSync(storePath, "utf-8"));
-        if (store.admobStatements) {
-          delete store.admobStatements[`${targetCreator}_${testMonth}`];
-        }
-        if (Array.isArray(store.walletTransactions)) {
-          store.walletTransactions = store.walletTransactions.filter(
-            (tx: any) =>
-              !String(tx["transaction_id"] || tx["transactionId"] || "").includes("ADMOB"),
-          );
-        }
-        if (initialWalletSnapshot && store.wallets) {
-          store.wallets[targetCreator] = initialWalletSnapshot;
-        }
-        fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf-8");
-      } catch (_e) {
-        // cleanup
-      }
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
     }
   });
 

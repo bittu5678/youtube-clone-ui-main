@@ -1,6 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import {
@@ -10,23 +11,21 @@ import {
   base64UrlDecode,
   resetInMemoryStore,
 } from "./api-handler.ts";
+import { setTestPersistentDataDir } from "./payments.ts";
 
 describe("LiveKit WebRTC Live Streaming Backend Foundation Tests (Stage 1)", () => {
   let adminToken = "";
   let creatorToken = "";
   let viewerToken = "";
   let testStreamId = "";
-  let storeBackup = "";
-  const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
+  let testDataDir = "";
   const testApiSecret = "test-livekit-secret-key-12345";
   const originalSecret = process.env["LIVEKIT_API_SECRET"];
 
   before(async () => {
     process.env["LIVEKIT_API_SECRET"] = testApiSecret;
-
-    if (fs.existsSync(storePath)) {
-      storeBackup = fs.readFileSync(storePath, "utf-8");
-    }
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-live-stream-test-"));
+    setTestPersistentDataDir(testDataDir);
     resetInMemoryStore();
 
     // 1. Authenticate Admin (FT102857)
@@ -97,8 +96,10 @@ describe("LiveKit WebRTC Live Streaming Backend Foundation Tests (Stage 1)", () 
       delete process.env["LIVEKIT_API_SECRET"];
     }
 
-    if (storeBackup && fs.existsSync(storePath)) {
-      fs.writeFileSync(storePath, storeBackup, "utf-8");
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
     }
   });
 

@@ -19,8 +19,8 @@ import { toast } from "sonner";
 import { VideoHubLayout } from "@/components/videohub/VideoHubLayout";
 import { useAuth } from "@/lib/auth-context";
 import {
-  getUserWallet,
-  getUserLedger,
+  getAuthoritativeUserWallet,
+  getAuthoritativeUserLedger,
   getDailyWithdrawnAmount,
   validateWithdrawalRequest,
   processWithdrawal,
@@ -47,13 +47,15 @@ export const Route = createFileRoute("/wallet-balance")({
 });
 
 function WalletBalancePage() {
-  const { user, profile, dbUser } = useAuth();
-  const userId = profile?.user_id || dbUser?.user_id || user?.email?.split("@")[0] || "FT483921";
+  const { user, profile, dbUser, isLoading: authLoading } = useAuth();
+  const userId =
+    profile?.user_id || dbUser?.user_id || (user?.email ? user.email.split("@")[0] : "") || "";
 
   const [wallet, setWallet] = useState<UserWallet | null>(null);
   const [ledger, setLedger] = useState<LedgerTransaction[]>([]);
   const [alreadyWithdrawnToday, setAlreadyWithdrawnToday] = useState(0);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(true);
+  const [walletError, setWalletError] = useState<string | null>(null);
 
   // Form states
   const [withdrawAmount, setWithdrawAmount] = useState<string>("100");
@@ -65,33 +67,56 @@ function WalletBalancePage() {
   const [isKycVerified, setIsKycVerified] = useState(true);
 
   const loadWalletData = useCallback(async () => {
+    if (authLoading) return;
+    if (!userId) {
+      setWallet(null);
+      setLedger([]);
+      setAlreadyWithdrawnToday(0);
+      setWalletError(null);
+      setIsRefreshing(false);
+      return;
+    }
+
     setIsRefreshing(true);
+    setWalletError(null);
     try {
-      const [w, txs, dailyWithdrawn, personalKyc, bankKyc] = await Promise.all([
-        getUserWallet(userId),
-        getUserLedger(userId),
+      const [walletRes, ledgerRes, dailyWithdrawn, personalKyc, bankKyc] = await Promise.all([
+        getAuthoritativeUserWallet(userId),
+        getAuthoritativeUserLedger(userId),
         getDailyWithdrawnAmount(userId),
         getPersonalKyc(userId),
         getBankKyc(userId),
       ]);
 
-      setWallet(w);
-      setLedger(txs);
+      if (walletRes.wallet) {
+        setWallet(walletRes.wallet);
+        setWalletError(null);
+      } else {
+        setWallet(null);
+        setWalletError(
+          walletRes.error || "Unable to load authoritative wallet balance from server.",
+        );
+      }
+
+      setLedger(ledgerRes.transactions || []);
       setAlreadyWithdrawnToday(dailyWithdrawn);
 
       const kycOk = personalKyc?.status === "Verified" && bankKyc?.status === "Verified";
       setIsKycVerified(kycOk);
     } catch (err) {
       console.error("Failed to load wallet data:", err);
+      setWallet(null);
+      setWalletError(err instanceof Error ? err.message : "Failed to load wallet data.");
     } finally {
       setIsRefreshing(false);
     }
-  }, [userId]);
+  }, [authLoading, userId]);
 
   useEffect(() => {
     loadWalletData();
   }, [loadWalletData]);
 
+  const unavailableLabel = isRefreshing && !wallet ? "..." : "Unavailable";
   const balance = wallet ? wallet.balance : 0;
   const remainingDailyLimit = Math.max(0, WITHDRAWAL_RULES.MAX_DAILY_LIMIT - alreadyWithdrawnToday);
   const currentNumAmount = Number(withdrawAmount) || 0;
@@ -203,8 +228,9 @@ function WalletBalancePage() {
                 </button>
               </div>
               <p className="text-sm text-muted-foreground">
-                Unified income ledger for User {userId} aggregating Referral Income, Global Pool,
-                AdSense, AdMob, and Affiliate Revenue
+                {userId
+                  ? `Unified income ledger for User ${userId} aggregating Referral Income, Global Pool, AdSense, AdMob, and Affiliate Revenue`
+                  : "Sign in to view your authoritative wallet balance and income streams."}
               </p>
             </div>
           </div>
@@ -219,6 +245,37 @@ function WalletBalancePage() {
             </Link>
           </div>
         </div>
+
+        {!authLoading && !userId && (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs text-amber-200">
+              <Lock className="h-4 w-4 text-amber-400 shrink-0" />
+              <span>Please sign in to load your real wallet balance and withdrawal options.</span>
+            </div>
+            <Link
+              to="/login"
+              className="inline-flex items-center justify-center rounded-lg bg-amber-500 px-3.5 py-1.5 text-xs font-bold text-black hover:bg-amber-400"
+            >
+              Sign In
+            </Link>
+          </div>
+        )}
+
+        {walletError && (
+          <div className="rounded-2xl border border-destructive/40 bg-destructive/10 p-4 flex items-center justify-between gap-3 text-xs text-destructive">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 shrink-0" />
+              <span>{walletError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={loadWalletData}
+              className="rounded-lg bg-destructive px-3 py-1 text-xs font-bold text-white hover:opacity-90"
+            >
+              Retry
+            </button>
+          </div>
+        )}
 
         {/* Big Balance Banner */}
         <div className="rounded-2xl border border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 via-card to-card p-6 sm:p-8 shadow-card">
@@ -236,11 +293,12 @@ function WalletBalancePage() {
                 )}
               </div>
               <div className="text-4xl sm:text-5xl font-black text-foreground tracking-tight">
-                ₹
-                {balance.toLocaleString("en-IN", {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
-                })}
+                {wallet
+                  ? `₹${balance.toLocaleString("en-IN", {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}`
+                  : unavailableLabel}
               </div>
               <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
                 <span className="flex items-center gap-1 text-emerald-400 font-semibold">
@@ -357,7 +415,7 @@ function WalletBalancePage() {
               Referral Income
             </span>
             <p className="text-xl font-bold text-foreground">
-              ₹{wallet ? wallet.referralIncome.toFixed(2) : "0.00"}
+              {wallet ? `₹${wallet.referralIncome.toFixed(2)}` : unavailableLabel}
             </p>
             <p className="text-[11px] text-muted-foreground">Earned network commissions</p>
           </div>
@@ -369,7 +427,7 @@ function WalletBalancePage() {
               AdSense Income
             </span>
             <p className="text-xl font-bold text-yellow-400">
-              ₹{wallet ? wallet.adsenseIncome.toFixed(2) : "0.00"}
+              {wallet ? `₹${wallet.adsenseIncome.toFixed(2)}` : unavailableLabel}
             </p>
             <p className="text-[11px] text-muted-foreground">Verified AdSense revenue</p>
           </div>
@@ -381,7 +439,7 @@ function WalletBalancePage() {
               AdMob Income
             </span>
             <p className="text-xl font-bold text-blue-400">
-              ₹{(Number(wallet?.admobIncome) || 0).toFixed(2)}
+              {wallet ? `₹${(Number(wallet.admobIncome) || 0).toFixed(2)}` : unavailableLabel}
             </p>
             <p className="text-[11px] text-muted-foreground">Verified mobile ad revenue</p>
           </div>
@@ -393,7 +451,7 @@ function WalletBalancePage() {
               Total Ad Earning
             </span>
             <p className="text-xl font-bold text-emerald-400">
-              ₹{calculateTotalAdEarning(wallet).toFixed(2)}
+              {wallet ? `₹${calculateTotalAdEarning(wallet).toFixed(2)}` : unavailableLabel}
             </p>
             <p className="text-[11px] text-muted-foreground">AdSense + AdMob combined</p>
           </div>
@@ -405,7 +463,7 @@ function WalletBalancePage() {
               Global Pool
             </span>
             <p className="text-xl font-bold text-cyan-400">
-              ₹{wallet ? wallet.globalIncome.toFixed(2) : "0.00"}
+              {wallet ? `₹${wallet.globalIncome.toFixed(2)}` : unavailableLabel}
             </p>
             <p className="text-[11px] text-muted-foreground">Global pool distributions</p>
           </div>
@@ -417,7 +475,7 @@ function WalletBalancePage() {
               Affiliate Links
             </span>
             <p className="text-xl font-bold text-indigo-400">
-              ₹{wallet ? wallet.affiliateIncome.toFixed(2) : "0.00"}
+              {wallet ? `₹${wallet.affiliateIncome.toFixed(2)}` : unavailableLabel}
             </p>
             <p className="text-[11px] text-muted-foreground">Gear &amp; product sales</p>
           </div>

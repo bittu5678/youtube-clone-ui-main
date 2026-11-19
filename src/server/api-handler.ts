@@ -23,9 +23,11 @@ import {
   type RefundRequestRecord,
   isFailClosedProductionEnv,
   isProductionRuntimeEnv,
-  isTestRuntimeEnv,
+  isTestStorageIsolationActive,
   getExplicitTestDataDir,
+  getPersistentDataDir,
   getPersistentStateFile,
+  isProtectedDataDir,
   parseStrictBooleanFlag,
 } from "./payments.ts";
 
@@ -38,14 +40,21 @@ import {
 } from "./email.ts";
 import { handleAdminRecoverPremiumPayment } from "./premium-recovery.ts";
 
-const DATA_DIR = path.resolve(process.cwd(), "data");
-
-function getStoreDir(env?: Record<string, string | undefined>): string {
-  const testDir = getExplicitTestDataDir(env);
-  return testDir || DATA_DIR;
+export function getStoreDir(env?: Record<string, string | undefined>): string {
+  const storeDir = getPersistentDataDir(env);
+  if (
+    !isProductionRuntimeEnv(env) &&
+    isTestStorageIsolationActive(env) &&
+    isProtectedDataDir(storeDir)
+  ) {
+    throw new Error(
+      "[FaceTube Store] Test store directory must not target protected data/ directory.",
+    );
+  }
+  return storeDir;
 }
 
-function getStoreFilePath(env?: Record<string, string | undefined>): string {
+export function getStoreFilePath(env?: Record<string, string | undefined>): string {
   return path.join(getStoreDir(env), "facetube_store.json");
 }
 
@@ -1008,13 +1017,17 @@ function getInitialStore(): ServerStore {
 }
 
 let inMemoryStore: ServerStore | null = null;
-let lastLoadedMtime = 0;
 let lastLoadedStorePath = "";
+let lastLoadedHash = "";
+
+function hashStoreContent(content: string): string {
+  return crypto.createHash("sha256").update(content).digest("hex");
+}
 
 export function resetInMemoryStore(): void {
   inMemoryStore = null;
-  lastLoadedMtime = 0;
   lastLoadedStorePath = "";
+  lastLoadedHash = "";
 }
 
 function createEmptyStoreForProduction(): ServerStore {
@@ -1054,16 +1067,21 @@ function loadStore(env?: Record<string, string | undefined>): ServerStore {
     return createEmptyStoreForProduction();
   }
   const storeFile = getStoreFilePath(env);
+  if (lastLoadedStorePath && lastLoadedStorePath !== storeFile) {
+    inMemoryStore = null;
+    lastLoadedStorePath = "";
+    lastLoadedHash = "";
+  }
   try {
     if (fs.existsSync(storeFile)) {
-      const stats = fs.statSync(storeFile);
-      if (inMemoryStore && lastLoadedStorePath === storeFile && stats.mtimeMs <= lastLoadedMtime) {
+      const content = fs.readFileSync(storeFile, "utf-8");
+      const contentHash = hashStoreContent(content);
+      if (inMemoryStore && lastLoadedStorePath === storeFile && lastLoadedHash === contentHash) {
         return inMemoryStore;
       }
-      const content = fs.readFileSync(storeFile, "utf-8");
       inMemoryStore = JSON.parse(content);
-      lastLoadedMtime = stats.mtimeMs;
       lastLoadedStorePath = storeFile;
+      lastLoadedHash = contentHash;
       if (inMemoryStore) {
         if (!inMemoryStore.liveStreams) inMemoryStore.liveStreams = [];
         if (!inMemoryStore.liveChatMessages) inMemoryStore.liveChatMessages = [];
@@ -1133,9 +1151,10 @@ function saveStore(store: ServerStore, env?: Record<string, string | undefined>)
     if (!fs.existsSync(storeDir)) {
       fs.mkdirSync(storeDir, { recursive: true });
     }
-    fs.writeFileSync(storeFile, JSON.stringify(store, null, 2), "utf-8");
+    const serialized = JSON.stringify(store, null, 2);
+    fs.writeFileSync(storeFile, serialized, "utf-8");
     lastLoadedStorePath = storeFile;
-    lastLoadedMtime = Date.now();
+    lastLoadedHash = hashStoreContent(serialized);
   } catch (err) {
     console.warn("[FaceTube Store] Could not persist store file", err);
   }
@@ -1145,9 +1164,15 @@ function assertTestStoreIsolationConfigured(
   env: Record<string, string | undefined> | undefined,
   helperName: string,
 ): void {
-  if (!isProductionRuntimeEnv(env) && isTestRuntimeEnv(env) && !getExplicitTestDataDir(env)) {
+  if (isProductionRuntimeEnv(env)) {
     throw new Error(
-      `[FaceTube Store] ${helperName} requires an isolated test directory (via setTestPersistentDataDir or FACETUBE_TEST_DATA_DIR) so protected data/facetube_store.json is never modified.`,
+      `[FaceTube Store] ${helperName} is disabled in production because JSON store persistence is disabled.`,
+    );
+  }
+  const storeDir = getStoreDir(env);
+  if (isTestStorageIsolationActive(env) && isProtectedDataDir(storeDir)) {
+    throw new Error(
+      `[FaceTube Store] ${helperName} requires an isolated test directory so protected data/facetube_store.json is never modified.`,
     );
   }
 }
@@ -9304,7 +9329,12 @@ export async function handleApiRequest(
       if (earlyResponse) {
         return earlyResponse;
       }
-      const requestedUserId = url.searchParams.get("user_id") || authUser?.user_id || "FT483921";
+      const qUserId = url.searchParams.get("user_id") || url.searchParams.get("userId");
+      const auth = requireAuth(authUser, qUserId);
+      if (!auth.success) {
+        return auth.response;
+      }
+      const requestedUserId = auth.effectiveUserId;
       if (isProd && !pool) {
         return jsonResponse(
           { success: false, error: "Database connection unavailable in production." },
@@ -9347,6 +9377,7 @@ export async function handleApiRequest(
                FROM income_ledger
                WHERE UPPER(user_id) = UPPER(?)
                  AND income_type != 'withdrawal'
+                 AND status = 'settled'
                  AND created_at >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 11 MONTH)
                GROUP BY DATE_FORMAT(created_at, '%Y-%m'), income_type
                ORDER BY period_key ASC`,
@@ -9362,6 +9393,7 @@ export async function handleApiRequest(
                FROM income_ledger
                WHERE UPPER(user_id) = UPPER(?)
                  AND income_type != 'withdrawal'
+                 AND status = 'settled'
                  AND created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
                GROUP BY DATE(created_at), income_type
                ORDER BY period_key ASC`,
@@ -9386,6 +9418,7 @@ export async function handleApiRequest(
                 global: 0,
                 adsense: 0,
                 admob: 0,
+                total_ad_earning: 0,
                 affiliate: 0,
                 ad_boost: 0,
                 referral_income: 0,
@@ -9410,6 +9443,7 @@ export async function handleApiRequest(
                 global: 0,
                 adsense: 0,
                 admob: 0,
+                total_ad_earning: 0,
                 affiliate: 0,
                 ad_boost: 0,
                 referral_income: 0,
@@ -9429,6 +9463,7 @@ export async function handleApiRequest(
             global: 0,
             adsense: 0,
             admob: 0,
+            total_ad_earning: 0,
             affiliate: 0,
             ad_boost: 0,
           };
@@ -9457,10 +9492,14 @@ export async function handleApiRequest(
 
               timelineMap[k][category] = Number((timelineMap[k][category] + amt).toFixed(2));
               timelineMap[k][`${category}_income`] = timelineMap[k][category];
+              timelineMap[k].total_ad_earning = Number(
+                (timelineMap[k].adsense + timelineMap[k].admob).toFixed(2),
+              );
               timelineMap[k].revenue = Number((timelineMap[k].revenue + amt).toFixed(2));
               timelineMap[k].tx_count += count;
 
               summary[category] = Number((summary[category] + amt).toFixed(2));
+              summary.total_ad_earning = Number((summary.adsense + summary.admob).toFixed(2));
               summary.total_revenue = Number((summary.total_revenue + amt).toFixed(2));
             }
           }
@@ -9500,7 +9539,10 @@ export async function handleApiRequest(
           (t.user_id || t.userId)?.toUpperCase() === requestedUserId.toUpperCase() &&
           t.income_type !== "withdrawal" &&
           t.incomeType !== "withdrawal" &&
-          t.type !== "withdrawal",
+          t.type !== "withdrawal" &&
+          String(t.status ?? "settled")
+            .trim()
+            .toLowerCase() === "settled",
       );
 
       const history: any[] = [];
@@ -9510,6 +9552,7 @@ export async function handleApiRequest(
         global: 0,
         adsense: 0,
         admob: 0,
+        total_ad_earning: 0,
         affiliate: 0,
         ad_boost: 0,
       };
@@ -9552,12 +9595,14 @@ export async function handleApiRequest(
           adm = Number(adm.toFixed(2));
           aff = Number(aff.toFixed(2));
           boost = Number(boost.toFixed(2));
+          const totalAdEarn = Number((ads + adm).toFixed(2));
           const totalRev = Number((ref + glb + ads + adm + aff + boost).toFixed(2));
 
           summary.referral = Number((summary.referral + ref).toFixed(2));
           summary.global = Number((summary.global + glb).toFixed(2));
           summary.adsense = Number((summary.adsense + ads).toFixed(2));
           summary.admob = Number((summary.admob + adm).toFixed(2));
+          summary.total_ad_earning = Number((summary.adsense + summary.admob).toFixed(2));
           summary.affiliate = Number((summary.affiliate + aff).toFixed(2));
           summary.ad_boost = Number((summary.ad_boost + boost).toFixed(2));
           summary.total_revenue = Number((summary.total_revenue + totalRev).toFixed(2));
@@ -9570,6 +9615,7 @@ export async function handleApiRequest(
             global: glb,
             adsense: ads,
             admob: adm,
+            total_ad_earning: totalAdEarn,
             affiliate: aff,
             ad_boost: boost,
             referral_income: ref,
@@ -9619,12 +9665,14 @@ export async function handleApiRequest(
           adm = Number(adm.toFixed(2));
           aff = Number(aff.toFixed(2));
           boost = Number(boost.toFixed(2));
+          const totalAdEarn = Number((ads + adm).toFixed(2));
           const totalRev = Number((ref + glb + ads + adm + aff + boost).toFixed(2));
 
           summary.referral = Number((summary.referral + ref).toFixed(2));
           summary.global = Number((summary.global + glb).toFixed(2));
           summary.adsense = Number((summary.adsense + ads).toFixed(2));
           summary.admob = Number((summary.admob + adm).toFixed(2));
+          summary.total_ad_earning = Number((summary.adsense + summary.admob).toFixed(2));
           summary.affiliate = Number((summary.affiliate + aff).toFixed(2));
           summary.ad_boost = Number((summary.ad_boost + boost).toFixed(2));
           summary.total_revenue = Number((summary.total_revenue + totalRev).toFixed(2));
@@ -9637,6 +9685,7 @@ export async function handleApiRequest(
             global: glb,
             adsense: ads,
             admob: adm,
+            total_ad_earning: totalAdEarn,
             affiliate: aff,
             ad_boost: boost,
             referral_income: ref,

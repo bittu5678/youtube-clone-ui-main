@@ -70,12 +70,11 @@ describe("FaceTube Task 4: Dynamic Sponsor Ad Video Dashboard Tests", () => {
       assert.equal(typeof v.isPromoted, "boolean");
     }
 
-    // Must find the promoted video for FT483921 (vid-seed-002)
-    const promotedVid = body.videos.find((v: any) => v.id === "vid-seed-002");
-    assert.ok(promotedVid, "vid-seed-002 should exist for FT483921");
-    assert.equal(promotedVid.isPromoted, true);
-    assert.equal(promotedVid.promotionPlan, "plan-7-days");
-    assert.ok(promotedVid.promotionExpiresAt);
+    // FT483921 seed video vid-seed-002 starts unpromoted in getInitialStore()
+    const seedVid = body.videos.find((v: any) => v.id === "vid-seed-002");
+    assert.ok(seedVid, "vid-seed-002 should exist for FT483921");
+    assert.equal(seedVid.isPromoted, false);
+    assert.equal(seedVid.promotionPlan ?? null, null);
   });
 
   it("3. /api/videos/list with Maya Lin (FT900431) isolates her campaign from Alex Rivera", async () => {
@@ -99,10 +98,12 @@ describe("FaceTube Task 4: Dynamic Sponsor Ad Video Dashboard Tests", () => {
     const alexVid = body.videos.find((v: any) => v.id === "vid-seed-002");
     assert.equal(alexVid, undefined, "FT483921's video must not leak in FT900431's video list");
 
-    // Must include Maya's promoted video vid-seed-004
+    // Must include Maya's actively promoted seed video vid-seed-004
     const mayaPromoted = body.videos.find((v: any) => v.id === "vid-seed-004");
     assert.ok(mayaPromoted, "vid-seed-004 should exist for FT900431");
+    assert.equal(mayaPromoted.isPromoted, true);
     assert.equal(mayaPromoted.promotionPlan, "plan-monthly");
+    assert.ok(mayaPromoted.promotionExpiresAt);
   });
 
   it("4. /api/videos/list without userId returns all videos for platform-wide admin audit", async () => {

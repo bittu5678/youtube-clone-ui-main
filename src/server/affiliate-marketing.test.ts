@@ -1,31 +1,20 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { handleApiRequest, validateSafeAffiliateUrl, resetInMemoryStore } from "./api-handler.ts";
+import { setTestPersistentDataDir } from "./payments.ts";
 
 describe("Secure Affiliate Marketing Backend Foundation Tests", () => {
   let adminToken = "";
   let userToken = "";
-  let storeBackup = "";
-  const storePath = path.resolve(process.cwd(), "data/facetube_store.json");
+  let testDataDir = "";
 
   before(async () => {
-    // Snapshot original store and clean any test conversions
-    if (fs.existsSync(storePath)) {
-      storeBackup = fs.readFileSync(storePath, "utf-8");
-      try {
-        const parsed = JSON.parse(storeBackup);
-        if (parsed.affiliateConversions) {
-          delete parsed.affiliateConversions["impact_IMP-ACTION-SECURE-999"];
-          delete parsed.affiliateConversions["impact_IMP-ACTION-TEST-001"];
-          fs.writeFileSync(storePath, JSON.stringify(parsed, null, 2), "utf-8");
-        }
-      } catch (_e) {
-        // Ignore
-      }
-    }
+    testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "facetube-affiliate-test-"));
+    setTestPersistentDataDir(testDataDir);
     resetInMemoryStore();
 
     // Authenticate as Admin (FT102857)
@@ -54,9 +43,10 @@ describe("Secure Affiliate Marketing Backend Foundation Tests", () => {
   });
 
   after(() => {
-    // Restore original store snapshot
-    if (storeBackup && fs.existsSync(storePath)) {
-      fs.writeFileSync(storePath, storeBackup, "utf-8");
+    setTestPersistentDataDir(null);
+    resetInMemoryStore();
+    if (testDataDir) {
+      fs.rmSync(testDataDir, { recursive: true, force: true });
     }
   });
 

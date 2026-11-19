@@ -1,6 +1,14 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { TrendingUp, Tv } from "lucide-react";
+import { AlertCircle, DollarSign, Lock, TrendingUp, Tv } from "lucide-react";
+import { useEffect, useState } from "react";
 import { VideoHubLayout } from "@/components/videohub/VideoHubLayout";
+import { useAuth } from "@/lib/auth-context";
+import { api } from "@/lib/api";
+import {
+  calculateTotalAdEarning,
+  getAuthoritativeUserWallet,
+  type UserWallet,
+} from "@/lib/ledger-service";
 
 export const Route = createFileRoute("/adsense-income")({
   head: () => ({
@@ -16,48 +24,67 @@ export const Route = createFileRoute("/adsense-income")({
   component: AdSenseIncomePage,
 });
 
-import { useEffect, useState } from "react";
-import { useAuth } from "@/lib/auth-context";
-import { api } from "@/lib/api";
-
 function AdSenseIncomePage() {
-  const { user, profile, dbUser } = useAuth();
-  const userId = profile?.user_id || dbUser?.user_id || user?.user_id;
-  const [wallet, setWallet] = useState<any>(null);
+  const { user, profile, dbUser, isLoading: authLoading } = useAuth();
+  const userId = profile?.user_id || dbUser?.user_id || (user as any)?.user_id || "";
+  const [wallet, setWallet] = useState<UserWallet | null>(null);
   const [adsenseTransactions, setAdsenseTransactions] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
+    if (authLoading) return;
+    if (!userId) {
+      setWallet(null);
+      setAdsenseTransactions([]);
+      setErrorMessage(null);
+      setIsLoading(false);
+      return;
+    }
+
     let isMounted = true;
     async function loadData() {
       setIsLoading(true);
+      setErrorMessage(null);
       try {
-        const [wRes, txRes] = await Promise.all([
-          api.wallet.getBalance(userId),
+        const [walletRes, txRes] = await Promise.all([
+          getAuthoritativeUserWallet(userId),
           api.wallet.getTransactions(userId, 50),
         ]);
-        if (isMounted) {
-          if (wRes && wRes.success && wRes.wallet) {
-            setWallet(wRes.wallet);
-          }
-          if (txRes && txRes.success && Array.isArray(txRes.transactions)) {
-            const filtered = txRes.transactions.filter(
-              (t: any) =>
-                t.income_type === "adsense_income" ||
-                t.incomeType === "adsense_income" ||
-                t.purpose === "adsense_income" ||
-                String(t.description || "")
-                  .toLowerCase()
-                  .includes("adsense") ||
-                String(t.description || "")
-                  .toLowerCase()
-                  .includes("video ad"),
-            );
-            setAdsenseTransactions(filtered);
+        if (!isMounted) return;
+
+        if (walletRes.wallet) {
+          setWallet(walletRes.wallet);
+        } else {
+          setWallet(null);
+          setErrorMessage(
+            walletRes.error || "Unable to load authoritative wallet balance from server.",
+          );
+        }
+
+        if (txRes && txRes.success && Array.isArray(txRes.transactions)) {
+          const filtered = txRes.transactions.filter((t: any) => {
+            const type = String(t.income_type || t.incomeType || t.purpose || "")
+              .trim()
+              .toLowerCase();
+            return type === "adsense_income";
+          });
+          setAdsenseTransactions(filtered);
+        } else {
+          setAdsenseTransactions([]);
+          if (!walletRes.error) {
+            setErrorMessage("Unable to load AdSense ledger transactions from server.");
           }
         }
       } catch (err) {
         console.error("Failed to load user AdSense data:", err);
+        if (isMounted) {
+          setWallet(null);
+          setAdsenseTransactions([]);
+          setErrorMessage(
+            err instanceof Error ? err.message : "Failed to load AdSense income data.",
+          );
+        }
       } finally {
         if (isMounted) setIsLoading(false);
       }
@@ -66,11 +93,19 @@ function AdSenseIncomePage() {
     return () => {
       isMounted = false;
     };
-  }, [userId]);
+  }, [authLoading, userId]);
 
-  const adsenseRevenue = Number(wallet?.adsense_income ?? 0);
-  const totalEarned = Number(wallet?.total_earned ?? 0);
-  const walletBalance = Number(wallet?.balance ?? 0);
+  const adsenseRevenue = wallet ? Number(wallet.adsenseIncome ?? 0) : null;
+  const admobRevenue = wallet ? Number(wallet.admobIncome ?? 0) : null;
+  const totalAdEarning = wallet ? calculateTotalAdEarning(wallet) : null;
+  const totalEarned = wallet ? Number(wallet.totalEarned ?? 0) : null;
+  const walletBalance = wallet ? Number(wallet.balance ?? 0) : null;
+
+  const formatMetric = (value: number | null) => {
+    if (isLoading) return "...";
+    if (value === null) return "Unavailable";
+    return `₹${value.toFixed(2)}`;
+  };
 
   return (
     <VideoHubLayout>
@@ -100,25 +135,60 @@ function AdSenseIncomePage() {
           </Link>
         </div>
 
+        {/* Auth or Server Unavailable Banner */}
+        {!authLoading && !userId && (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs text-amber-200">
+              <Lock className="h-4 w-4 text-amber-400 shrink-0" />
+              <span>Sign in to view your authoritative AdSense income and ledger records.</span>
+            </div>
+            <Link
+              to="/login"
+              className="inline-flex items-center justify-center rounded-lg bg-amber-500 px-3.5 py-1.5 text-xs font-bold text-black hover:bg-amber-400"
+            >
+              Sign In
+            </Link>
+          </div>
+        )}
+
+        {errorMessage && (
+          <div className="rounded-2xl border border-destructive/40 bg-destructive/10 p-4 flex items-center gap-2.5 text-xs text-destructive">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+        )}
+
         {/* Stats */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Total AdSense Revenue</span>
-            <p className="text-2xl font-black text-yellow-400">₹{adsenseRevenue.toFixed(2)}</p>
+            <p className="text-2xl font-black text-yellow-400">{formatMetric(adsenseRevenue)}</p>
             <p className="text-[11px] text-emerald-400 font-semibold flex items-center gap-1">
               <TrendingUp className="h-3 w-3" /> Authoritative ledger total
+            </p>
+          </div>
+          <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-4 space-y-1 shadow-card">
+            <span className="text-xs text-emerald-400 font-semibold flex items-center gap-1">
+              <DollarSign className="h-3.5 w-3.5" />
+              Total Ad Earning
+            </span>
+            <p className="text-2xl font-black text-emerald-400">{formatMetric(totalAdEarning)}</p>
+            <p className="text-[11px] text-muted-foreground">
+              {wallet
+                ? `AdSense ₹${(adsenseRevenue ?? 0).toFixed(2)} + AdMob ₹${(admobRevenue ?? 0).toFixed(2)}`
+                : "Verified AdSense + AdMob only"}
             </p>
           </div>
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">
               Available Wallet Balance
             </span>
-            <p className="text-2xl font-black text-foreground">₹{walletBalance.toFixed(2)}</p>
+            <p className="text-2xl font-black text-foreground">{formatMetric(walletBalance)}</p>
             <p className="text-[11px] text-muted-foreground">Ready for creator payout</p>
           </div>
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Cumulative Earned</span>
-            <p className="text-2xl font-black text-emerald-400">₹{totalEarned.toFixed(2)}</p>
+            <p className="text-2xl font-black text-emerald-400">{formatMetric(totalEarned)}</p>
             <p className="text-[11px] text-muted-foreground">All income channels combined</p>
           </div>
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
