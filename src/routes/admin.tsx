@@ -165,6 +165,8 @@ function AdminPage() {
     totalReferralIncome: 0,
     totalGlobalIncome: 0,
     totalAdsenseIncome: 0,
+    totalAdmobIncome: 0,
+    totalAdEarning: 0,
     totalAffiliateIncome: 0,
   });
   const [reportPage, setReportPage] = useState(1);
@@ -198,7 +200,20 @@ function AdminPage() {
         const res = await api.admin.getEarningsReport(queryParams);
         if (res && res.success) {
           setEarningsUsers(res.users || []);
-          if (res.summary) setEarningsSummary(res.summary);
+          if (res.summary) {
+            const totalAdsenseIncome = Number(res.summary.totalAdsenseIncome) || 0;
+            const totalAdmobIncome = Number(res.summary.totalAdmobIncome) || 0;
+            const totalAdEarning =
+              res.summary.totalAdEarning !== undefined && res.summary.totalAdEarning !== null
+                ? Number(res.summary.totalAdEarning) || 0
+                : Math.round((totalAdsenseIncome + totalAdmobIncome) * 100) / 100;
+            setEarningsSummary({
+              ...res.summary,
+              totalAdsenseIncome,
+              totalAdmobIncome,
+              totalAdEarning,
+            });
+          }
           if (res.pagination) {
             setReportPage(res.pagination.page);
             setReportLimit(res.pagination.limit);
@@ -269,6 +284,8 @@ function AdminPage() {
         "Referral Income (INR)",
         "Global Pool Income (INR)",
         "AdSense Income (INR)",
+        "AdMob Income (INR)",
+        "Total Ad Earning (INR)",
         "Affiliate Income (INR)",
         "Total Withdrawn (INR)",
         "Joined Date",
@@ -276,8 +293,14 @@ function AdminPage() {
 
       const csvContent = [
         headers.join(","),
-        ...rows.map((r: any) =>
-          [
+        ...rows.map((r: any) => {
+          const adsense = Number(r.adsenseIncome) || 0;
+          const admob = Number(r.admobIncome) || 0;
+          const totalAdEarning =
+            r.totalAdEarning !== undefined && r.totalAdEarning !== null
+              ? Number(r.totalAdEarning) || 0
+              : Math.round((adsense + admob) * 100) / 100;
+          return [
             `"${r.userId}"`,
             `"${(r.name || "").replace(/"/g, '""')}"`,
             `"${(r.email || "").replace(/"/g, '""')}"`,
@@ -287,12 +310,14 @@ function AdminPage() {
             (Number(r.totalEarned) || 0).toFixed(2),
             (Number(r.referralIncome) || 0).toFixed(2),
             (Number(r.globalIncome) || 0).toFixed(2),
-            (Number(r.adsenseIncome) || 0).toFixed(2),
+            adsense.toFixed(2),
+            admob.toFixed(2),
+            totalAdEarning.toFixed(2),
             (Number(r.affiliateIncome) || 0).toFixed(2),
             (Number(r.totalWithdrawn) || 0).toFixed(2),
             `"${r.createdAt || ""}"`,
-          ].join(","),
-        ),
+          ].join(",");
+        }),
       ].join("\r\n");
 
       const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8;" });
@@ -1601,7 +1626,11 @@ ALTER TABLE uploaded_videos ADD COLUMN IF NOT EXISTS ad_earnings DECIMAL(12,2) D
                             {vid.creator_name || vid.channel || vid.user_id || "Creator"}
                           </td>
                           <td className="py-3 text-xs font-mono font-bold text-emerald-400">
-                            ₹{(Number(vid.ad_earnings) || 0).toFixed(2)}
+                            {vid.ad_earnings !== undefined && vid.ad_earnings !== null ? (
+                              `₹${(Number(vid.ad_earnings) || 0).toFixed(2)}`
+                            ) : (
+                              <span className="text-muted-foreground font-normal">—</span>
+                            )}
                           </td>
                           <td className="py-3">
                             {isBlocked ? (
@@ -2219,7 +2248,7 @@ ALTER TABLE uploaded_videos ADD COLUMN IF NOT EXISTS ad_earnings DECIMAL(12,2) D
                   <BarChart3 className="h-4 w-4 text-brand" />
                   <span>Platform Aggregate Breakdown by Genuine Income Stream</span>
                 </p>
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
                   <div className="rounded-xl border border-border/60 bg-secondary/20 p-3">
                     <span className="text-[10px] uppercase font-bold text-muted-foreground">
                       Referral Income
@@ -2257,7 +2286,33 @@ ALTER TABLE uploaded_videos ADD COLUMN IF NOT EXISTS ad_earnings DECIMAL(12,2) D
                       })}
                     </p>
                     <p className="text-[10px] text-muted-foreground mt-0.5">
-                      Impressions & watch time
+                      Verified AdSense share
+                    </p>
+                  </div>
+                  <div className="rounded-xl border border-border/60 bg-secondary/20 p-3">
+                    <span className="text-[10px] uppercase font-bold text-muted-foreground">
+                      Google AdMob Income
+                    </span>
+                    <p className="text-base font-black text-foreground mt-1">
+                      ₹
+                      {earningsSummary.totalAdmobIncome.toLocaleString("en-IN", {
+                        minimumFractionDigits: 2,
+                      })}
+                    </p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">Verified AdMob share</p>
+                  </div>
+                  <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3">
+                    <span className="text-[10px] uppercase font-bold text-emerald-400">
+                      Total Ad Earning
+                    </span>
+                    <p className="text-base font-black text-emerald-400 mt-1">
+                      ₹
+                      {earningsSummary.totalAdEarning.toLocaleString("en-IN", {
+                        minimumFractionDigits: 2,
+                      })}
+                    </p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">
+                      AdSense + AdMob combined
                     </p>
                   </div>
                   <div className="rounded-xl border border-border/60 bg-secondary/20 p-3">
@@ -2309,60 +2364,76 @@ ALTER TABLE uploaded_videos ADD COLUMN IF NOT EXISTS ad_earnings DECIMAL(12,2) D
                           <th className="pb-3 font-semibold">Referral</th>
                           <th className="pb-3 font-semibold">Global Pool</th>
                           <th className="pb-3 font-semibold">AdSense</th>
+                          <th className="pb-3 font-semibold">AdMob</th>
+                          <th className="pb-3 font-semibold">Total Ad Earning</th>
                           <th className="pb-3 font-semibold">Affiliate</th>
                           <th className="pb-3 pr-2 text-right font-semibold">History</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-border/60">
-                        {earningsUsers.map((u) => (
-                          <tr key={u.userId} className="transition hover:bg-secondary/30">
-                            <td className="py-3 pl-2">
-                              <p className="font-semibold text-xs text-foreground">{u.name}</p>
-                              <p className="text-[11px] text-muted-foreground">{u.email}</p>
-                              <div className="flex items-center gap-1.5 mt-0.5">
-                                <span className="font-mono text-[10px] font-bold text-brand bg-brand/10 px-1 py-0.2 rounded">
-                                  {u.userId}
-                                </span>
-                                {u.referralCode && (
-                                  <span className="font-mono text-[10px] text-muted-foreground">
-                                    Ref: {u.referralCode}
+                        {earningsUsers.map((u) => {
+                          const adsense = Number(u.adsenseIncome || 0);
+                          const admob = Number(u.admobIncome || 0);
+                          const totalAdEarning =
+                            u.totalAdEarning !== undefined && u.totalAdEarning !== null
+                              ? Number(u.totalAdEarning || 0)
+                              : Math.round((adsense + admob) * 100) / 100;
+                          return (
+                            <tr key={u.userId} className="transition hover:bg-secondary/30">
+                              <td className="py-3 pl-2">
+                                <p className="font-semibold text-xs text-foreground">{u.name}</p>
+                                <p className="text-[11px] text-muted-foreground">{u.email}</p>
+                                <div className="flex items-center gap-1.5 mt-0.5">
+                                  <span className="font-mono text-[10px] font-bold text-brand bg-brand/10 px-1 py-0.2 rounded">
+                                    {u.userId}
                                   </span>
-                                )}
-                              </div>
-                            </td>
-                            <td className="py-3 font-mono text-xs font-bold text-brand">
-                              ₹{Number(u.balance || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 font-mono text-xs font-bold text-emerald-400">
-                              ₹{Number(u.totalEarned || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 font-mono text-xs font-bold text-amber-400">
-                              ₹{Number(u.totalWithdrawn || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 font-mono text-xs text-foreground">
-                              ₹{Number(u.referralIncome || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 font-mono text-xs text-foreground">
-                              ₹{Number(u.globalIncome || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 font-mono text-xs text-foreground">
-                              ₹{Number(u.adsenseIncome || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 font-mono text-xs text-foreground">
-                              ₹{Number(u.affiliateIncome || 0).toFixed(2)}
-                            </td>
-                            <td className="py-3 pr-2 text-right">
-                              <button
-                                type="button"
-                                onClick={() => handleViewWithdrawals(u)}
-                                className="inline-flex items-center gap-1 rounded-lg border border-border bg-secondary/50 px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-secondary hover:text-brand"
-                              >
-                                <Eye className="h-3 w-3" />
-                                <span>Withdrawals</span>
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                                  {u.referralCode && (
+                                    <span className="font-mono text-[10px] text-muted-foreground">
+                                      Ref: {u.referralCode}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-3 font-mono text-xs font-bold text-brand">
+                                ₹{Number(u.balance || 0).toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs font-bold text-emerald-400">
+                                ₹{Number(u.totalEarned || 0).toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs font-bold text-amber-400">
+                                ₹{Number(u.totalWithdrawn || 0).toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs text-foreground">
+                                ₹{Number(u.referralIncome || 0).toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs text-foreground">
+                                ₹{Number(u.globalIncome || 0).toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs text-foreground">
+                                ₹{adsense.toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs text-foreground">
+                                ₹{admob.toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs font-bold text-emerald-400">
+                                ₹{totalAdEarning.toFixed(2)}
+                              </td>
+                              <td className="py-3 font-mono text-xs text-foreground">
+                                ₹{Number(u.affiliateIncome || 0).toFixed(2)}
+                              </td>
+                              <td className="py-3 pr-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => handleViewWithdrawals(u)}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-border bg-secondary/50 px-2.5 py-1 text-[11px] font-medium text-foreground hover:bg-secondary hover:text-brand"
+                                >
+                                  <Eye className="h-3 w-3" />
+                                  <span>Withdrawals</span>
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

@@ -46,6 +46,7 @@ try {
         'referral' => 0.0,
         'global' => 0.0,
         'adsense' => 0.0,
+        'admob' => 0.0,
         'affiliate' => 0.0,
         'ad_boost' => 0.0,
     ];
@@ -78,11 +79,13 @@ try {
                 'referral' => 0.0,
                 'global' => 0.0,
                 'adsense' => 0.0,
+                'admob' => 0.0,
                 'affiliate' => 0.0,
                 'ad_boost' => 0.0,
                 'referral_income' => 0.0,
                 'global_income' => 0.0,
                 'adsense_income' => 0.0,
+                'admob_income' => 0.0,
                 'affiliate_income' => 0.0,
                 'ad_boost_income' => 0.0,
                 'tx_count' => 0,
@@ -116,11 +119,13 @@ try {
                 'referral' => 0.0,
                 'global' => 0.0,
                 'adsense' => 0.0,
+                'admob' => 0.0,
                 'affiliate' => 0.0,
                 'ad_boost' => 0.0,
                 'referral_income' => 0.0,
                 'global_income' => 0.0,
                 'adsense_income' => 0.0,
+                'admob_income' => 0.0,
                 'affiliate_income' => 0.0,
                 'ad_boost_income' => 0.0,
                 'tx_count' => 0,
@@ -133,13 +138,15 @@ try {
         if (isset($timeline[$k])) {
             $amt = round(floatval($r['total_amount']), 2);
             $count = intval($r['tx_count']);
-            $type = strval($r['income_type'] ?? '');
+            $type = strtolower(trim(strval($r['income_type'] ?? '')));
 
             $category = 'referral';
             if ($type === 'global_income') {
                 $category = 'global';
             } elseif ($type === 'adsense_income') {
                 $category = 'adsense';
+            } elseif ($type === 'admob_income') {
+                $category = 'admob';
             } elseif ($type === 'affiliate_income' || $type === 'marketing_income') {
                 $category = 'affiliate';
             } elseif ($type === 'ad_boost_income' || $type === 'marketing_ads') {

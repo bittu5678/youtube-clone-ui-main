@@ -13,6 +13,7 @@ import {
   Users,
   RefreshCw,
   Lock,
+  Smartphone,
 } from "lucide-react";
 import { toast } from "sonner";
 import { VideoHubLayout } from "@/components/videohub/VideoHubLayout";
@@ -23,6 +24,7 @@ import {
   getDailyWithdrawnAmount,
   validateWithdrawalRequest,
   processWithdrawal,
+  calculateTotalAdEarning,
   WITHDRAWAL_RULES,
   type UserWallet,
   type LedgerTransaction,
@@ -202,7 +204,7 @@ function WalletBalancePage() {
               </div>
               <p className="text-sm text-muted-foreground">
                 Unified income ledger for User {userId} aggregating Referral Income, Global Pool,
-                and Ad Revenue
+                AdSense, AdMob, and Affiliate Revenue
               </p>
             </div>
           </div>
@@ -346,8 +348,8 @@ function WalletBalancePage() {
           </div>
         </div>
 
-        {/* 4 Streams Breakdown */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        {/* Income Streams Breakdown (including separate AdSense, AdMob & combined Total Ad Earning) */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
           {/* 1. Referral Income */}
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
@@ -364,15 +366,39 @@ function WalletBalancePage() {
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
               <TrendingUp className="h-3 w-3 text-yellow-400" />
-              Video AdSense
+              AdSense Income
             </span>
             <p className="text-xl font-bold text-yellow-400">
               ₹{wallet ? wallet.adsenseIncome.toFixed(2) : "0.00"}
             </p>
-            <p className="text-[11px] text-muted-foreground">Ad revenue monetization</p>
+            <p className="text-[11px] text-muted-foreground">Verified AdSense revenue</p>
           </div>
 
-          {/* 3. Global Income */}
+          {/* 3. Mobile AdMob */}
+          <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
+            <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
+              <Smartphone className="h-3 w-3 text-blue-400" />
+              AdMob Income
+            </span>
+            <p className="text-xl font-bold text-blue-400">
+              ₹{(Number(wallet?.admobIncome) || 0).toFixed(2)}
+            </p>
+            <p className="text-[11px] text-muted-foreground">Verified mobile ad revenue</p>
+          </div>
+
+          {/* 4. Total Ad Earning (AdSense + AdMob) */}
+          <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-4 space-y-1 shadow-card">
+            <span className="text-xs text-emerald-400 font-semibold flex items-center gap-1">
+              <DollarSign className="h-3 w-3 text-emerald-400" />
+              Total Ad Earning
+            </span>
+            <p className="text-xl font-bold text-emerald-400">
+              ₹{calculateTotalAdEarning(wallet).toFixed(2)}
+            </p>
+            <p className="text-[11px] text-muted-foreground">AdSense + AdMob combined</p>
+          </div>
+
+          {/* 5. Global Income */}
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
               <Globe2 className="h-3 w-3 text-cyan-400" />
@@ -384,7 +410,7 @@ function WalletBalancePage() {
             <p className="text-[11px] text-muted-foreground">Global pool distributions</p>
           </div>
 
-          {/* 4. Affiliate Income */}
+          {/* 6. Affiliate Income */}
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
               <CreditCard className="h-3 w-3 text-indigo-400" />

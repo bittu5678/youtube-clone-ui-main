@@ -711,6 +711,7 @@ function resolveAccountingForItem($pdo, $item, $txNumber, $hasAdEarningsCol, $ha
         $adminAllocation = $hasReferrer ? 4.00 : 5.00;
         $globalPoolAllocation = 0.00;
         $eligibleVideoCount = 0;
+        $distinctCreatorCount = 0;
     } else {
         $baseAdminPaise = 100 + $unallocatedReferrerPaise;
         $adEarningsExpr = $hasAdEarningsCol ? 'COALESCE(ad_earnings, 0.00) AS ad_earnings' : '0.00 AS ad_earnings';
@@ -732,6 +733,14 @@ function resolveAccountingForItem($pdo, $item, $txNumber, $hasAdEarningsCol, $ha
         }
 
         $eligibleVideoCount = count($eligibleVideos);
+        $distinctCreatorIds = [];
+        foreach ($eligibleVideos as $ev) {
+            $evUid = strtoupper(trim((string)($ev['user_id'] ?? '')));
+            if ($evUid !== '') {
+                $distinctCreatorIds[$evUid] = true;
+            }
+        }
+        $distinctCreatorCount = count($distinctCreatorIds);
         if ($eligibleVideoCount === 0) {
             $adminPaise = $baseAdminPaise + 300;
             $adminAllocation = $adminPaise / 100;
@@ -797,6 +806,8 @@ function resolveAccountingForItem($pdo, $item, $txNumber, $hasAdEarningsCol, $ha
         'adminAllocation' => $adminAllocation,
         'globalPoolAllocation' => $globalPoolAllocation,
         'eligibleVideosCount' => $eligibleVideoCount,
+        'eligibleVideoCount' => $eligibleVideoCount,
+        'distinctCreatorCount' => $distinctCreatorCount,
         'creatorPayouts' => $creatorPayouts,
     ];
 }

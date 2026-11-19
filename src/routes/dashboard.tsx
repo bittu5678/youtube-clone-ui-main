@@ -89,6 +89,7 @@ function DashboardPage() {
       referral: number;
       global: number;
       adsense: number;
+      admob: number;
       affiliate: number;
       ad_boost: number;
       tx_count?: number;
@@ -99,6 +100,7 @@ function DashboardPage() {
     referral: number;
     global: number;
     adsense: number;
+    admob: number;
     affiliate: number;
     ad_boost: number;
   } | null>(null);
@@ -163,6 +165,7 @@ function DashboardPage() {
                 referral: Number(h.referral ?? h.referral_income) || 0,
                 global: Number(h.global ?? h.global_income) || 0,
                 adsense: Number(h.adsense ?? h.adsense_income) || 0,
+                admob: Number(h.admob ?? h.admob_income) || 0,
                 affiliate: Number(h.affiliate ?? h.affiliate_income) || 0,
                 ad_boost: Number(h.ad_boost ?? h.ad_boost_income) || 0,
                 tx_count: h.tx_count,
@@ -172,7 +175,15 @@ function DashboardPage() {
             setEarningsHistory([]);
           }
           if (res.summary) {
-            setEarningsSummary(res.summary);
+            setEarningsSummary({
+              total_revenue: Number(res.summary.total_revenue) || 0,
+              referral: Number(res.summary.referral) || 0,
+              global: Number(res.summary.global) || 0,
+              adsense: Number(res.summary.adsense) || 0,
+              admob: Number(res.summary.admob) || 0,
+              affiliate: Number(res.summary.affiliate) || 0,
+              ad_boost: Number(res.summary.ad_boost) || 0,
+            });
           }
         }
       } catch (err) {
@@ -190,7 +201,7 @@ function DashboardPage() {
 
   const currentCreatorRank = calculateRankFromSubscribers(subscriberCount);
 
-  // Dynamic overrides mapped directly to the 16 summary cards
+  // Dynamic overrides mapped directly to the 17 summary cards
   const dynamicCardOverrides: Record<string, string> = {
     "free-videos": String(videoCounts.totalFree),
     "premium-videos": String(videoCounts.totalPremium),
@@ -204,6 +215,10 @@ function DashboardPage() {
         ? `₹${wallet.referralIncome.toFixed(2)}`
         : "₹0.00",
     "global-income": wallet ? `₹${wallet.globalIncome.toFixed(2)}` : "₹0.00",
+    "adsense-income": wallet ? `₹${wallet.adsenseIncome.toFixed(2)}` : "₹0.00",
+    "admob-income": wallet ? `₹${(Number(wallet.admobIncome) || 0).toFixed(2)}` : "₹0.00",
+    "affiliate-income": wallet ? `₹${wallet.affiliateIncome.toFixed(2)}` : "₹0.00",
+    "withdrawal-balance": wallet ? `₹${wallet.totalWithdrawn.toFixed(2)}` : "₹0.00",
     "current-rank": currentCreatorRank.awardName,
     "subscriber-count": isSubscriberLoading ? "..." : subscriberCount.toLocaleString(),
   };
@@ -233,7 +248,7 @@ function DashboardPage() {
                 )}
               </div>
               <p className="text-sm text-muted-foreground">
-                All 16 performance metrics, dynamic video classifications, and income streams for{" "}
+                All 17 performance metrics, dynamic video classifications, and income streams for{" "}
                 <strong>{userId}</strong>
               </p>
             </div>
@@ -500,8 +515,8 @@ function DashboardPage() {
               </div>
             </div>
 
-            {/* Income Streams Breakdown (5 real streams) */}
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-1 pb-1">
+            {/* Income Streams Breakdown (6 real streams including AdMob) */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 pb-1">
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
                 <div className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider">
                   Referral
@@ -528,13 +543,21 @@ function DashboardPage() {
               </div>
               <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
                 <div className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider">
+                  AdMob
+                </div>
+                <div className="text-sm font-bold text-foreground">
+                  ₹{(earningsSummary?.admob ?? 0).toFixed(2)}
+                </div>
+              </div>
+              <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
+                <div className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider">
                   Affiliate
                 </div>
                 <div className="text-sm font-bold text-foreground">
                   ₹{(earningsSummary?.affiliate ?? 0).toFixed(2)}
                 </div>
               </div>
-              <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40 col-span-2 sm:col-span-1">
+              <div className="rounded-xl bg-secondary/30 p-2.5 border border-border/40">
                 <div className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider">
                   Ad Boost
                 </div>
@@ -616,6 +639,12 @@ function DashboardPage() {
                                     </span>
                                   </div>
                                   <div className="flex justify-between">
+                                    <span>AdMob:</span>
+                                    <span className="font-semibold text-foreground">
+                                      ₹{Number(data.admob || 0).toFixed(2)}
+                                    </span>
+                                  </div>
+                                  <div className="flex justify-between">
                                     <span>Affiliate:</span>
                                     <span className="font-semibold text-foreground">
                                       ₹{Number(data.affiliate || 0).toFixed(2)}
@@ -661,7 +690,8 @@ function DashboardPage() {
               </div>
             )}
             <p className="text-[11px] text-muted-foreground text-center">
-              Real-time ledger breakdown: Referral, Global Pool, AdSense, Affiliate &amp; Ad Boost
+              Real-time ledger breakdown: Referral, Global Pool, AdSense, AdMob, Affiliate &amp; Ad
+              Boost
             </p>
           </div>
         </div>
@@ -677,7 +707,7 @@ function DashboardPage() {
                 : "bg-secondary text-muted-foreground hover:text-foreground"
             }`}
           >
-            All 16 Summary Cards
+            All 17 Summary Cards
           </button>
           <button
             type="button"
@@ -688,7 +718,7 @@ function DashboardPage() {
                 : "bg-secondary text-muted-foreground hover:text-foreground"
             }`}
           >
-            Income Streams (6)
+            Income Streams (7)
           </button>
           <button
             type="button"
@@ -714,7 +744,7 @@ function DashboardPage() {
           </button>
         </div>
 
-        {/* 16 Summary Cards Grid with live overrides */}
+        {/* 17 Summary Cards Grid with live overrides */}
         <DashboardSummaryCards filterCategory={filter} dynamicOverrides={dynamicCardOverrides} />
       </div>
     </VideoHubLayout>

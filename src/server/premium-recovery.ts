@@ -74,6 +74,8 @@ export interface ItemAccountingResult {
   adminAllocation: number;
   globalPoolAllocation: number;
   eligibleVideosCount: number;
+  eligibleVideoCount: number;
+  distinctCreatorCount: number;
   creatorPayouts: CreatorPayoutItem[];
 }
 
@@ -582,11 +584,13 @@ async function resolveAccountingForItem(
   let adminAllocation = 0.0;
   let globalPoolAllocation = 0.0;
   let eligibleVideosCount = 0;
+  let distinctCreatorCount = 0;
 
   if (isSpecial) {
     adminAllocation = hasReferrer ? 4.0 : 5.0;
     globalPoolAllocation = 0.0;
     eligibleVideosCount = 0;
+    distinctCreatorCount = 0;
   } else {
     const baseAdminPaise = 100 + unallocatedReferrerPaise;
     const adEarningsExpr = hasAdEarningsCol
@@ -622,6 +626,15 @@ async function resolveAccountingForItem(
     }
 
     eligibleVideosCount = eligibleVideos.length;
+    distinctCreatorCount = new Set(
+      eligibleVideos
+        .map((ev) =>
+          String(ev.user_id ?? "")
+            .trim()
+            .toUpperCase(),
+        )
+        .filter((uid) => uid.length > 0),
+    ).size;
     if (eligibleVideosCount === 0) {
       const adminPaise = baseAdminPaise + 300;
       adminAllocation = adminPaise / 100;
@@ -683,6 +696,8 @@ async function resolveAccountingForItem(
     adminAllocation,
     globalPoolAllocation,
     eligibleVideosCount,
+    eligibleVideoCount: eligibleVideosCount,
+    distinctCreatorCount,
     creatorPayouts,
   };
 }

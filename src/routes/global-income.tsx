@@ -4,8 +4,9 @@ import { Globe2, TrendingUp, CheckCircle2, Wallet } from "lucide-react";
 import { VideoHubLayout } from "@/components/videohub/VideoHubLayout";
 import { useAuth } from "@/lib/auth-context";
 import {
-  getUserLedger,
-  getUserWallet,
+  deriveGlobalIncomeDisplayState,
+  getAuthoritativeUserLedger,
+  getAuthoritativeUserWallet,
   getGlobalPoolSummary,
   type GlobalPoolSummary,
   type LedgerTransaction,
@@ -37,7 +38,9 @@ function GlobalIncomePage() {
   ).trim();
 
   const [wallet, setWallet] = useState<UserWallet | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
   const [globalTransactions, setGlobalTransactions] = useState<LedgerTransaction[]>([]);
+  const [ledgerError, setLedgerError] = useState<string | null>(null);
   const [poolSummary, setPoolSummary] = useState<GlobalPoolSummary | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -49,7 +52,9 @@ function GlobalIncomePage() {
 
     if (!userId) {
       setWallet(null);
+      setWalletError(null);
       setGlobalTransactions([]);
+      setLedgerError(null);
       setPoolSummary(null);
       setLoading(false);
       return;
@@ -57,12 +62,42 @@ function GlobalIncomePage() {
 
     let cancelled = false;
     setLoading(true);
-    Promise.all([getUserWallet(userId), getUserLedger(userId), getGlobalPoolSummary(userId)])
-      .then(([w, ledger, summary]) => {
+    setWalletError(null);
+    setLedgerError(null);
+    Promise.all([
+      getAuthoritativeUserWallet(userId),
+      getAuthoritativeUserLedger(userId),
+      getGlobalPoolSummary(userId),
+    ])
+      .then(([walletRes, ledgerRes, summary]) => {
         if (cancelled) return;
-        setWallet(w);
-        setGlobalTransactions(ledger.filter((t) => t.incomeType === "global_income"));
+        if (walletRes.error || !walletRes.wallet || walletRes.wallet.isStale) {
+          setWallet(null);
+          setWalletError(walletRes.error || "Server balance unavailable");
+        } else {
+          setWallet(walletRes.wallet);
+          setWalletError(null);
+        }
+
+        if (ledgerRes.error) {
+          setGlobalTransactions([]);
+          setLedgerError(ledgerRes.error);
+        } else {
+          setGlobalTransactions(
+            ledgerRes.transactions.filter((t) => !t.isStale && t.incomeType === "global_income"),
+          );
+          setLedgerError(null);
+        }
+
         setPoolSummary(summary);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setWallet(null);
+        setWalletError("Server balance unavailable");
+        setGlobalTransactions([]);
+        setLedgerError("Server ledger unavailable");
+        setPoolSummary(null);
       })
       .finally(() => {
         if (!cancelled) {
@@ -74,6 +109,16 @@ function GlobalIncomePage() {
       cancelled = true;
     };
   }, [authLoading, userId]);
+
+  const viewState = deriveGlobalIncomeDisplayState({
+    loading,
+    userId,
+    wallet,
+    walletError,
+    transactions: globalTransactions,
+    ledgerError,
+    poolSummary,
+  });
 
   return (
     <VideoHubLayout>
@@ -152,68 +197,29 @@ function GlobalIncomePage() {
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Your Global Income</span>
-            <p className="text-2xl font-black text-cyan-400">
-              {loading ? "…" : !userId ? "—" : `₹${(wallet?.globalIncome ?? 0).toFixed(2)}`}
-            </p>
+            <p className="text-2xl font-black text-cyan-400">{viewState.globalIncomeValue}</p>
             <p className="text-[11px] text-emerald-400 font-semibold flex items-center gap-1">
-              <TrendingUp className="h-3 w-3" />{" "}
-              {!loading && !userId
-                ? "Sign in required"
-                : wallet?.isStale
-                  ? "Cached server balance"
-                  : "Eligible video share"}
+              <TrendingUp className="h-3 w-3" /> {viewState.globalIncomeCaption}
             </p>
           </div>
 
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Eligible Videos</span>
-            <p className="text-2xl font-black text-foreground">
-              {loading
-                ? "…"
-                : poolSummary && !poolSummary.error
-                  ? poolSummary.eligibleVideoCount
-                  : "—"}
-            </p>
-            <p className="text-[11px] text-muted-foreground">
-              {!loading && !userId
-                ? "Sign in to view pool"
-                : poolSummary?.error
-                  ? "Server summary unavailable"
-                  : poolSummary
-                    ? `${poolSummary.distinctCreatorCount} creator${poolSummary.distinctCreatorCount === 1 ? "" : "s"} · Sponsor uploads`
-                    : "Sponsor uploads only"}
-            </p>
+            <p className="text-2xl font-black text-foreground">{viewState.eligibleVideosValue}</p>
+            <p className="text-[11px] text-muted-foreground">{viewState.eligibleVideosCaption}</p>
           </div>
 
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Share Per Video</span>
-            <p className="text-2xl font-black text-foreground">
-              {loading
-                ? "…"
-                : poolSummary && !poolSummary.error
-                  ? `₹${poolSummary.estimatedEqualSharePerVideo.toFixed(2)}`
-                  : "—"}
-            </p>
-            <p className="text-[11px] text-muted-foreground">
-              {!loading && !userId
-                ? "Sign in required"
-                : poolSummary?.error
-                  ? "Live pool data required"
-                  : poolSummary?.weightingMode === "ad_earnings_weighted"
-                    ? "Weighted by Ad Earnings (equal est.)"
-                    : "Equal floor share per video"}
-            </p>
+            <p className="text-2xl font-black text-foreground">{viewState.sharePerVideoValue}</p>
+            <p className="text-[11px] text-muted-foreground">{viewState.sharePerVideoCaption}</p>
           </div>
 
           <div className="rounded-2xl border border-border bg-card p-4 space-y-1 shadow-card">
             <span className="text-xs text-muted-foreground font-medium">Distribution Status</span>
             <p className="text-2xl font-black text-emerald-400">Automated</p>
             <p className="text-[11px] text-muted-foreground">
-              {!loading && !userId
-                ? "Awaiting sign-in"
-                : poolSummary?.error
-                  ? "Awaiting server sync"
-                  : "Server ledger synced"}
+              {viewState.distributionStatusCaption}
             </p>
           </div>
         </div>
@@ -222,7 +228,7 @@ function GlobalIncomePage() {
         <div className="rounded-2xl border border-border bg-card overflow-hidden shadow-card">
           <div className="p-4 border-b border-border flex items-center justify-between">
             <h3 className="text-sm font-bold text-foreground">Global Income Ledger Entries</h3>
-            <span className="text-xs text-muted-foreground">Live database ledger records</span>
+            <span className="text-xs text-muted-foreground">{viewState.ledgerHeaderSubtitle}</span>
           </div>
 
           <div className="overflow-x-auto">
@@ -238,8 +244,8 @@ function GlobalIncomePage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-border font-medium">
-                {globalTransactions.length > 0 ? (
-                  globalTransactions.map((tx) => (
+                {viewState.visibleTransactions.length > 0 ? (
+                  viewState.visibleTransactions.map((tx) => (
                     <tr key={tx.id} className="transition hover:bg-secondary/20">
                       <td className="px-4 py-3 font-mono text-xs text-cyan-400">
                         {tx.transactionId}
@@ -275,9 +281,7 @@ function GlobalIncomePage() {
                 ) : (
                   <tr>
                     <td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">
-                      {!loading && !userId
-                        ? "Please sign in to view your Global Income balance, eligible video count, and ledger entries."
-                        : "No global income distributions found for this account. Distributions occur automatically when users upload Sponsor Videos."}
+                      {viewState.ledgerEmptyMessage}
                     </td>
                   </tr>
                 )}

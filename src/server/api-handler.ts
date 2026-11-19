@@ -2418,6 +2418,114 @@ export async function handleApiRequest(
             await conn.beginTransaction();
             inTx = true;
 
+            const buildDuplicateDistribution = async (existingTx: any) => {
+              const existingPaymentId = String(existingTx.payment_id || "").trim();
+              const isDupPremium = existingTx.purpose === "premium_video_upload";
+              const isDupSpec = Boolean(existingTx.is_special);
+              const dupGlobalPoolAmt = Number(existingTx.global_pool_allocation) || 0;
+              const dupReferralAmt = Number(existingTx.referral_commission) || 0;
+
+              let dupEligibleVideoCount: number | null = 0;
+              let dupDistinctCreatorCount: number | null = 0;
+              let dupPerMemberShare: number | null = 0;
+
+              if (isDupPremium && !isDupSpec && dupGlobalPoolAmt > 0) {
+                dupEligibleVideoCount = null;
+                dupDistinctCreatorCount = null;
+                dupPerMemberShare = null;
+                try {
+                  const likePrefix = `${`TX_GLB_${existingPaymentId}_`.replace(/[!%_]/g, "!$&")}%`;
+                  const [glbRows]: any = await conn.query(
+                    `SELECT user_id, amount
+                     FROM income_ledger
+                     WHERE transaction_id LIKE ? ESCAPE '!' AND income_type = 'global_income'
+                     ORDER BY created_at ASC, id ASC`,
+                    [likePrefix],
+                  );
+                  if (Array.isArray(glbRows) && glbRows.length > 0) {
+                    dupEligibleVideoCount = glbRows.length;
+                    dupDistinctCreatorCount = new Set(
+                      glbRows
+                        .map((r: any) =>
+                          String(r.user_id || "")
+                            .trim()
+                            .toUpperCase(),
+                        )
+                        .filter((uid: string) => uid.length > 0),
+                    ).size;
+                    dupPerMemberShare = Number(glbRows[0]?.amount) || 0;
+                  }
+                } catch {
+                  // Leave counts null rather than inventing values when ledger metadata cannot be read
+                }
+              }
+
+              let dupReferrerId: string | null = null;
+              if (existingPaymentId) {
+                if (isDupPremium) {
+                  let resolvedFromPremiumTx = false;
+                  try {
+                    const [ptRefRows]: any = await conn.query(
+                      `SELECT referrer_id FROM premium_transactions WHERE payment_id = ? LIMIT 1`,
+                      [existingPaymentId],
+                    );
+                    if (Array.isArray(ptRefRows) && ptRefRows.length > 0) {
+                      const ptRef = String(ptRefRows[0]?.referrer_id || "").trim();
+                      if (ptRef) {
+                        dupReferrerId = ptRef;
+                        resolvedFromPremiumTx = true;
+                      } else if (dupReferralAmt <= 0) {
+                        dupReferrerId = null;
+                        resolvedFromPremiumTx = true;
+                      }
+                    }
+                  } catch {
+                    // Optional table or read error; fall through to ledger lookup if referral commission > 0
+                  }
+
+                  if (!resolvedFromPremiumTx && dupReferralAmt > 0) {
+                    try {
+                      const [refLedgerRows]: any = await conn.query(
+                        `SELECT user_id FROM income_ledger WHERE transaction_id = ? LIMIT 1`,
+                        [`TX_REF_${existingPaymentId}`],
+                      );
+                      const ledgerRef = String(refLedgerRows?.[0]?.user_id || "").trim();
+                      if (ledgerRef) {
+                        dupReferrerId = ledgerRef;
+                      }
+                    } catch {
+                      // Leave referrerId null rather than inventing payer user_id
+                    }
+                  }
+                } else if (dupReferralAmt > 0) {
+                  try {
+                    const [adsRefRows]: any = await conn.query(
+                      `SELECT user_id FROM income_ledger WHERE transaction_id = ? LIMIT 1`,
+                      [`TX_ADS_L1_${existingPaymentId}`],
+                    );
+                    const adsRef = String(adsRefRows?.[0]?.user_id || "").trim();
+                    if (adsRef) {
+                      dupReferrerId = adsRef;
+                    }
+                  } catch {
+                    // Leave referrerId null rather than inventing payer user_id
+                  }
+                }
+              }
+
+              return {
+                directReferralAmount: dupReferralAmt,
+                referrerId: dupReferrerId,
+                adminAmount: Number(existingTx.admin_allocation) || 0,
+                globalPoolAmount: dupGlobalPoolAmt,
+                eligibleMembersCount: dupEligibleVideoCount,
+                eligibleVideoCount: dupEligibleVideoCount,
+                distinctCreatorCount: dupDistinctCreatorCount,
+                perMemberShare: dupPerMemberShare,
+                totalReferralAmount: dupReferralAmt,
+              };
+            };
+
             // Check duplicate under row lock
             const [existingRows]: any = await conn.query(
               `SELECT * FROM payment_transactions WHERE payment_id = ? FOR UPDATE`,
@@ -2471,41 +2579,8 @@ export async function handleApiRequest(
                 });
               }
 
-              const isDupPremium = existingTx.purpose === "premium_video_upload";
               const isDupSpec = Boolean(existingTx.is_special);
-              const dupGlobalPoolAmt = Number(existingTx.global_pool_allocation) || 0;
-              let dupEligibleVideoCount = 0;
-              let dupDistinctCreatorCount = 0;
-              let dupPerMemberShare = 0;
-
-              if (isDupPremium && !isDupSpec && dupGlobalPoolAmt > 0) {
-                try {
-                  const [glbRows]: any = await conn.query(
-                    `SELECT user_id, amount
-                     FROM income_ledger
-                     WHERE transaction_id LIKE ? AND income_type = 'global_income'
-                     ORDER BY created_at ASC, id ASC`,
-                    [`TX_GLB_${existingTx.payment_id}_%`],
-                  );
-                  if (Array.isArray(glbRows) && glbRows.length > 0) {
-                    dupEligibleVideoCount = glbRows.length;
-                    dupDistinctCreatorCount = new Set(
-                      glbRows
-                        .map((r: any) =>
-                          String(r.user_id || "")
-                            .trim()
-                            .toUpperCase(),
-                        )
-                        .filter((uid: string) => uid.length > 0),
-                    ).size;
-                    dupPerMemberShare = Number(glbRows[0]?.amount) || 0;
-                  }
-                } catch {
-                  // Preserve idempotent 200 duplicate response if ledger metadata query is unavailable
-                }
-              }
-
-              const dupReferralAmt = Number(existingTx.referral_commission) || 0;
+              const dupDistribution = await buildDuplicateDistribution(existingTx);
               return jsonResponse({
                 verified: true,
                 paymentId: existingTx.payment_id,
@@ -2515,17 +2590,7 @@ export async function handleApiRequest(
                 txNumber: Number(existingTx.tx_number),
                 isSpecialTransaction: isDupSpec,
                 specialTag: existingTx.special_tag,
-                distribution: {
-                  directReferralAmount: dupReferralAmt,
-                  referrerId: existingTx.user_id,
-                  adminAmount: Number(existingTx.admin_allocation) || 0,
-                  globalPoolAmount: dupGlobalPoolAmt,
-                  eligibleMembersCount: dupEligibleVideoCount,
-                  eligibleVideoCount: dupEligibleVideoCount,
-                  distinctCreatorCount: dupDistinctCreatorCount,
-                  perMemberShare: dupPerMemberShare,
-                  totalReferralAmount: dupReferralAmt,
-                },
+                distribution: dupDistribution,
                 duplicate: true,
                 message: "Payment already verified and credited previously (idempotent duplicate).",
               });
@@ -3087,41 +3152,8 @@ export async function handleApiRequest(
                     });
                   }
 
-                  const isDupPremium = existingTx.purpose === "premium_video_upload";
                   const isDupSpec = Boolean(existingTx.is_special);
-                  const dupGlobalPoolAmt = Number(existingTx.global_pool_allocation) || 0;
-                  let dupEligibleVideoCount = 0;
-                  let dupDistinctCreatorCount = 0;
-                  let dupPerMemberShare = 0;
-
-                  if (isDupPremium && !isDupSpec && dupGlobalPoolAmt > 0) {
-                    try {
-                      const [glbRows]: any = await conn.query(
-                        `SELECT user_id, amount
-                         FROM income_ledger
-                         WHERE transaction_id LIKE ? AND income_type = 'global_income'
-                         ORDER BY created_at ASC, id ASC`,
-                        [`TX_GLB_${existingTx.payment_id}_%`],
-                      );
-                      if (Array.isArray(glbRows) && glbRows.length > 0) {
-                        dupEligibleVideoCount = glbRows.length;
-                        dupDistinctCreatorCount = new Set(
-                          glbRows
-                            .map((r: any) =>
-                              String(r.user_id || "")
-                                .trim()
-                                .toUpperCase(),
-                            )
-                            .filter((uid: string) => uid.length > 0),
-                        ).size;
-                        dupPerMemberShare = Number(glbRows[0]?.amount) || 0;
-                      }
-                    } catch {
-                      // Preserve idempotent duplicate response
-                    }
-                  }
-
-                  const dupReferralAmt = Number(existingTx.referral_commission) || 0;
+                  const dupDistribution = await buildDuplicateDistribution(existingTx);
                   return jsonResponse({
                     verified: true,
                     paymentId: existingTx.payment_id,
@@ -3131,17 +3163,7 @@ export async function handleApiRequest(
                     txNumber: Number(existingTx.tx_number),
                     isSpecialTransaction: isDupSpec,
                     specialTag: existingTx.special_tag,
-                    distribution: {
-                      directReferralAmount: dupReferralAmt,
-                      referrerId: existingTx.user_id,
-                      adminAmount: Number(existingTx.admin_allocation) || 0,
-                      globalPoolAmount: dupGlobalPoolAmt,
-                      eligibleMembersCount: dupEligibleVideoCount,
-                      eligibleVideoCount: dupEligibleVideoCount,
-                      distinctCreatorCount: dupDistinctCreatorCount,
-                      perMemberShare: dupPerMemberShare,
-                      totalReferralAmount: dupReferralAmt,
-                    },
+                    distribution: dupDistribution,
                     duplicate: true,
                     message:
                       "Payment already verified and credited previously (idempotent duplicate).",
@@ -7524,20 +7546,49 @@ export async function handleApiRequest(
     }
 
     if (method === "GET") {
-      if (isProd) {
-        if (!pool) {
-          return jsonResponse(
-            { success: false, error: "Database connection unavailable in production." },
-            503,
-          );
-        }
+      if (isProd && !pool) {
+        return jsonResponse(
+          { success: false, error: "Database connection unavailable in production." },
+          503,
+        );
+      }
+      if (pool) {
         try {
+          let hasAdEarningsCol = false;
+          try {
+            const [colRows]: any = await pool.query(
+              `SELECT COLUMN_NAME
+               FROM INFORMATION_SCHEMA.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE()
+                 AND TABLE_NAME = 'uploaded_videos'
+                 AND COLUMN_NAME = 'ad_earnings'`,
+            );
+            if (Array.isArray(colRows) && colRows.length > 0) {
+              hasAdEarningsCol = true;
+            }
+          } catch (_colErr) {
+            hasAdEarningsCol = false;
+          }
+
+          const adEarningsSelect = hasAdEarningsCol
+            ? ", COALESCE(ad_earnings, 0.00) AS ad_earnings"
+            : "";
           const [rows]: any = await pool.query(
-            "SELECT * FROM uploaded_videos ORDER BY created_at DESC",
+            `SELECT id, user_id, creator_name, title, description, video_url, thumbnail_url,
+                    video_type, content_type, category, duration, views, likes,
+                    is_promoted, is_blocked, block_reason, blocked_at, created_at${adEarningsSelect}
+             FROM uploaded_videos
+             ORDER BY created_at DESC`,
           );
           const list = (Array.isArray(rows) ? rows : []).map((v: any) => ({
             ...v,
             is_blocked: Boolean(v.is_blocked),
+            ...(hasAdEarningsCol ||
+            (Object.prototype.hasOwnProperty.call(v, "ad_earnings") &&
+              v.ad_earnings !== undefined &&
+              v.ad_earnings !== null)
+              ? { ad_earnings: Math.round((Number(v.ad_earnings) || 0) * 100) / 100 }
+              : {}),
           }));
           return jsonResponse({
             success: true,
@@ -7550,15 +7601,21 @@ export async function handleApiRequest(
             },
           });
         } catch (dbErr: any) {
-          return jsonResponse(
-            { success: false, error: "Database error loading videos: " + dbErr.message },
-            503,
-          );
+          if (isProd) {
+            return jsonResponse(
+              { success: false, error: "Database error loading videos: " + dbErr.message },
+              503,
+            );
+          }
+          console.warn("[admin/videos] MySQL query failed, falling back to store:", dbErr);
         }
       }
       const list = store.videos.map((v) => ({
         ...v,
         is_blocked: Boolean(v.is_blocked),
+        ...(v.ad_earnings !== undefined && v.ad_earnings !== null
+          ? { ad_earnings: Math.round((Number(v.ad_earnings) || 0) * 100) / 100 }
+          : {}),
       }));
       return jsonResponse({
         success: true,
@@ -9239,11 +9296,13 @@ export async function handleApiRequest(
                 referral: 0,
                 global: 0,
                 adsense: 0,
+                admob: 0,
                 affiliate: 0,
                 ad_boost: 0,
                 referral_income: 0,
                 global_income: 0,
                 adsense_income: 0,
+                admob_income: 0,
                 affiliate_income: 0,
                 ad_boost_income: 0,
                 tx_count: 0,
@@ -9261,11 +9320,13 @@ export async function handleApiRequest(
                 referral: 0,
                 global: 0,
                 adsense: 0,
+                admob: 0,
                 affiliate: 0,
                 ad_boost: 0,
                 referral_income: 0,
                 global_income: 0,
                 adsense_income: 0,
+                admob_income: 0,
                 affiliate_income: 0,
                 ad_boost_income: 0,
                 tx_count: 0,
@@ -9278,6 +9339,7 @@ export async function handleApiRequest(
             referral: 0,
             global: 0,
             adsense: 0,
+            admob: 0,
             affiliate: 0,
             ad_boost: 0,
           };
@@ -9288,12 +9350,15 @@ export async function handleApiRequest(
             if (timelineMap[k]) {
               const amt = Number(r.total_amount) || 0;
               const count = Number(r.tx_count) || 0;
-              const type = String(r.income_type || "");
+              const type = String(r.income_type || "")
+                .trim()
+                .toLowerCase();
 
-              let category: "referral" | "global" | "adsense" | "affiliate" | "ad_boost" =
+              let category: "referral" | "global" | "adsense" | "admob" | "affiliate" | "ad_boost" =
                 "referral";
               if (type === "global_income") category = "global";
               else if (type === "adsense_income") category = "adsense";
+              else if (type === "admob_income") category = "admob";
               else if (type === "affiliate_income" || type === "marketing_income")
                 category = "affiliate";
               else if (type === "ad_boost_income" || type === "marketing_ads")
@@ -9345,6 +9410,7 @@ export async function handleApiRequest(
         (t: any) =>
           (t.user_id || t.userId)?.toUpperCase() === requestedUserId.toUpperCase() &&
           t.income_type !== "withdrawal" &&
+          t.incomeType !== "withdrawal" &&
           t.type !== "withdrawal",
       );
 
@@ -9354,6 +9420,7 @@ export async function handleApiRequest(
         referral: 0,
         global: 0,
         adsense: 0,
+        admob: 0,
         affiliate: 0,
         ad_boost: 0,
       };
@@ -9372,14 +9439,18 @@ export async function handleApiRequest(
           let ref = 0;
           let glb = 0;
           let ads = 0;
+          let adm = 0;
           let aff = 0;
           let boost = 0;
 
           for (const tx of matchingTxs) {
             const amt = Number(tx["amount"]) || 0;
-            const tType = String(tx["income_type"] || tx["incomeType"] || tx["type"] || "");
+            const tType = String(tx["income_type"] || tx["incomeType"] || tx["type"] || "")
+              .trim()
+              .toLowerCase();
             if (tType === "global_income") glb += amt;
             else if (tType === "adsense_income") ads += amt;
+            else if (tType === "admob_income") adm += amt;
             else if (tType === "affiliate_income" || tType === "marketing_income") aff += amt;
             else if (tType === "ad_boost_income" || tType === "marketing_ads") boost += amt;
             else if (tType === "referral_income" || tType === "direct_commission") ref += amt;
@@ -9389,13 +9460,15 @@ export async function handleApiRequest(
           ref = Number(ref.toFixed(2));
           glb = Number(glb.toFixed(2));
           ads = Number(ads.toFixed(2));
+          adm = Number(adm.toFixed(2));
           aff = Number(aff.toFixed(2));
           boost = Number(boost.toFixed(2));
-          const totalRev = Number((ref + glb + ads + aff + boost).toFixed(2));
+          const totalRev = Number((ref + glb + ads + adm + aff + boost).toFixed(2));
 
           summary.referral = Number((summary.referral + ref).toFixed(2));
           summary.global = Number((summary.global + glb).toFixed(2));
           summary.adsense = Number((summary.adsense + ads).toFixed(2));
+          summary.admob = Number((summary.admob + adm).toFixed(2));
           summary.affiliate = Number((summary.affiliate + aff).toFixed(2));
           summary.ad_boost = Number((summary.ad_boost + boost).toFixed(2));
           summary.total_revenue = Number((summary.total_revenue + totalRev).toFixed(2));
@@ -9407,11 +9480,13 @@ export async function handleApiRequest(
             referral: ref,
             global: glb,
             adsense: ads,
+            admob: adm,
             affiliate: aff,
             ad_boost: boost,
             referral_income: ref,
             global_income: glb,
             adsense_income: ads,
+            admob_income: adm,
             affiliate_income: aff,
             ad_boost_income: boost,
             tx_count: matchingTxs.length,
@@ -9431,14 +9506,18 @@ export async function handleApiRequest(
           let ref = 0;
           let glb = 0;
           let ads = 0;
+          let adm = 0;
           let aff = 0;
           let boost = 0;
 
           for (const tx of matchingTxs) {
             const amt = Number(tx["amount"]) || 0;
-            const tType = String(tx["income_type"] || tx["incomeType"] || tx["type"] || "");
+            const tType = String(tx["income_type"] || tx["incomeType"] || tx["type"] || "")
+              .trim()
+              .toLowerCase();
             if (tType === "global_income") glb += amt;
             else if (tType === "adsense_income") ads += amt;
+            else if (tType === "admob_income") adm += amt;
             else if (tType === "affiliate_income" || tType === "marketing_income") aff += amt;
             else if (tType === "ad_boost_income" || tType === "marketing_ads") boost += amt;
             else if (tType === "referral_income" || tType === "direct_commission") ref += amt;
@@ -9448,13 +9527,15 @@ export async function handleApiRequest(
           ref = Number(ref.toFixed(2));
           glb = Number(glb.toFixed(2));
           ads = Number(ads.toFixed(2));
+          adm = Number(adm.toFixed(2));
           aff = Number(aff.toFixed(2));
           boost = Number(boost.toFixed(2));
-          const totalRev = Number((ref + glb + ads + aff + boost).toFixed(2));
+          const totalRev = Number((ref + glb + ads + adm + aff + boost).toFixed(2));
 
           summary.referral = Number((summary.referral + ref).toFixed(2));
           summary.global = Number((summary.global + glb).toFixed(2));
           summary.adsense = Number((summary.adsense + ads).toFixed(2));
+          summary.admob = Number((summary.admob + adm).toFixed(2));
           summary.affiliate = Number((summary.affiliate + aff).toFixed(2));
           summary.ad_boost = Number((summary.ad_boost + boost).toFixed(2));
           summary.total_revenue = Number((summary.total_revenue + totalRev).toFixed(2));
@@ -9466,11 +9547,13 @@ export async function handleApiRequest(
             referral: ref,
             global: glb,
             adsense: ads,
+            admob: adm,
             affiliate: aff,
             ad_boost: boost,
             referral_income: ref,
             global_income: glb,
             adsense_income: ads,
+            admob_income: adm,
             affiliate_income: aff,
             ad_boost_income: boost,
             tx_count: matchingTxs.length,
@@ -16245,6 +16328,24 @@ export async function handleApiRequest(
           );
           const totalUsers = Number(countRows?.[0]?.total) || 0;
 
+          // Check wallet_balances.admob_income column compatibility before referencing wb.admob_income
+          let hasWalletAdmobCol = false;
+          try {
+            const [colRows]: any = await pool.query(
+              `SELECT COLUMN_NAME
+               FROM INFORMATION_SCHEMA.COLUMNS
+               WHERE TABLE_SCHEMA = DATABASE()
+                 AND TABLE_NAME = 'wallet_balances'
+                 AND COLUMN_NAME = 'admob_income'`,
+            );
+            if (Array.isArray(colRows) && colRows.length > 0) {
+              hasWalletAdmobCol = true;
+            }
+          } catch (_colErr) {
+            hasWalletAdmobCol = false;
+          }
+          const wbAdmobFallback = hasWalletAdmobCol ? "wb.admob_income" : "0.00";
+
           // 2. Summary aggregates
           const summarySql = `
             SELECT 
@@ -16255,6 +16356,7 @@ export async function handleApiRequest(
               COALESCE(SUM(COALESCE(lt.ledger_referral_income, wb.referral_income, 0)), 0) AS total_referral_income,
               COALESCE(SUM(COALESCE(lt.ledger_global_income, wb.global_income, 0)), 0) AS total_global_income,
               COALESCE(SUM(COALESCE(lt.ledger_adsense_income, wb.adsense_income, 0)), 0) AS total_adsense_income,
+              COALESCE(SUM(COALESCE(lt.ledger_admob_income, ${wbAdmobFallback}, 0)), 0) AS total_admob_income,
               COALESCE(SUM(COALESCE(lt.ledger_affiliate_income, wb.affiliate_income, 0)), 0) AS total_affiliate_income
             FROM users u
             LEFT JOIN wallet_balances wb ON UPPER(wb.user_id) = UPPER(u.user_id)
@@ -16264,6 +16366,7 @@ export async function handleApiRequest(
                 SUM(CASE WHEN income_type IN ('referral_income', 'direct_commission') THEN amount ELSE 0 END) AS ledger_referral_income,
                 SUM(CASE WHEN income_type = 'global_income' THEN amount ELSE 0 END) AS ledger_global_income,
                 SUM(CASE WHEN income_type = 'adsense_income' THEN amount ELSE 0 END) AS ledger_adsense_income,
+                SUM(CASE WHEN income_type = 'admob_income' THEN amount ELSE 0 END) AS ledger_admob_income,
                 SUM(CASE WHEN income_type IN ('affiliate_income', 'marketing_income') THEN amount ELSE 0 END) AS ledger_affiliate_income,
                 SUM(CASE WHEN income_type = 'withdrawal' THEN amount ELSE 0 END) AS ledger_total_withdrawn,
                 SUM(CASE WHEN income_type != 'withdrawal' THEN amount ELSE 0 END) AS ledger_total_earned
@@ -16275,6 +16378,10 @@ export async function handleApiRequest(
           `;
           const [sumRows]: any = await pool.query(summarySql, params);
           const sRow = sumRows?.[0] || {};
+          const totalAdsenseIncome =
+            Math.round((Number(sRow.total_adsense_income) || 0) * 100) / 100;
+          const totalAdmobIncome = Math.round((Number(sRow.total_admob_income) || 0) * 100) / 100;
+          const totalAdEarning = Math.round((totalAdsenseIncome + totalAdmobIncome) * 100) / 100;
           const summary = {
             totalUsers: Number(sRow.total_count) || totalUsers,
             totalWalletBalance: Math.round((Number(sRow.total_wallet_balance) || 0) * 100) / 100,
@@ -16282,7 +16389,9 @@ export async function handleApiRequest(
             totalWithdrawn: Math.round((Number(sRow.total_withdrawn) || 0) * 100) / 100,
             totalReferralIncome: Math.round((Number(sRow.total_referral_income) || 0) * 100) / 100,
             totalGlobalIncome: Math.round((Number(sRow.total_global_income) || 0) * 100) / 100,
-            totalAdsenseIncome: Math.round((Number(sRow.total_adsense_income) || 0) * 100) / 100,
+            totalAdsenseIncome,
+            totalAdmobIncome,
+            totalAdEarning,
             totalAffiliateIncome:
               Math.round((Number(sRow.total_affiliate_income) || 0) * 100) / 100,
           };
@@ -16303,6 +16412,7 @@ export async function handleApiRequest(
               COALESCE(lt.ledger_referral_income, wb.referral_income, 0.00) AS referral_income,
               COALESCE(lt.ledger_global_income, wb.global_income, 0.00) AS global_income,
               COALESCE(lt.ledger_adsense_income, wb.adsense_income, 0.00) AS adsense_income,
+              COALESCE(lt.ledger_admob_income, ${wbAdmobFallback}, 0.00) AS admob_income,
               COALESCE(lt.ledger_affiliate_income, wb.affiliate_income, 0.00) AS affiliate_income
             FROM users u
             LEFT JOIN wallet_balances wb ON UPPER(wb.user_id) = UPPER(u.user_id)
@@ -16312,6 +16422,7 @@ export async function handleApiRequest(
                 SUM(CASE WHEN income_type IN ('referral_income', 'direct_commission') THEN amount ELSE 0 END) AS ledger_referral_income,
                 SUM(CASE WHEN income_type = 'global_income' THEN amount ELSE 0 END) AS ledger_global_income,
                 SUM(CASE WHEN income_type = 'adsense_income' THEN amount ELSE 0 END) AS ledger_adsense_income,
+                SUM(CASE WHEN income_type = 'admob_income' THEN amount ELSE 0 END) AS ledger_admob_income,
                 SUM(CASE WHEN income_type IN ('affiliate_income', 'marketing_income') THEN amount ELSE 0 END) AS ledger_affiliate_income,
                 SUM(CASE WHEN income_type = 'withdrawal' THEN amount ELSE 0 END) AS ledger_total_withdrawn,
                 SUM(CASE WHEN income_type != 'withdrawal' THEN amount ELSE 0 END) AS ledger_total_earned
@@ -16327,9 +16438,12 @@ export async function handleApiRequest(
 
           if (exportType === "csv") {
             const csvRows: string[] = [
-              "\uFEFFUser ID,Full Name,Email Address,Role,Referral Code,Available Balance (INR),Total Earned (INR),Referral Income (INR),Global Income (INR),AdSense Income (INR),Affiliate Income (INR),Total Withdrawn (INR),Joined Date",
+              "\uFEFFUser ID,Full Name,Email Address,Role,Referral Code,Available Balance (INR),Total Earned (INR),Referral Income (INR),Global Income (INR),AdSense Income (INR),AdMob Income (INR),Total Ad Earning (INR),Affiliate Income (INR),Total Withdrawn (INR),Joined Date",
             ];
             for (const r of dataRows || []) {
+              const rowAdsense = Math.round((Number(r.adsense_income) || 0) * 100) / 100;
+              const rowAdmob = Math.round((Number(r.admob_income) || 0) * 100) / 100;
+              const rowTotalAd = Math.round((rowAdsense + rowAdmob) * 100) / 100;
               const line = [
                 `"${r.user_id}"`,
                 `"${(r.name || "").replace(/"/g, '""')}"`,
@@ -16340,7 +16454,9 @@ export async function handleApiRequest(
                 Number(r.total_earned || 0).toFixed(2),
                 Number(r.referral_income || 0).toFixed(2),
                 Number(r.global_income || 0).toFixed(2),
-                Number(r.adsense_income || 0).toFixed(2),
+                rowAdsense.toFixed(2),
+                rowAdmob.toFixed(2),
+                rowTotalAd.toFixed(2),
                 Number(r.affiliate_income || 0).toFixed(2),
                 Number(r.total_withdrawn || 0).toFixed(2),
                 `"${r.created_at || ""}"`,
@@ -16356,22 +16472,29 @@ export async function handleApiRequest(
             });
           }
 
-          const users = (dataRows || []).map((r: any) => ({
-            id: r.id,
-            userId: r.user_id,
-            name: r.name,
-            email: r.email,
-            role: r.role,
-            referralCode: r.referral_code,
-            createdAt: r.created_at,
-            balance: Math.round((Number(r.balance) || 0) * 100) / 100,
-            totalEarned: Math.round((Number(r.total_earned) || 0) * 100) / 100,
-            totalWithdrawn: Math.round((Number(r.total_withdrawn) || 0) * 100) / 100,
-            referralIncome: Math.round((Number(r.referral_income) || 0) * 100) / 100,
-            globalIncome: Math.round((Number(r.global_income) || 0) * 100) / 100,
-            adsenseIncome: Math.round((Number(r.adsense_income) || 0) * 100) / 100,
-            affiliateIncome: Math.round((Number(r.affiliate_income) || 0) * 100) / 100,
-          }));
+          const users = (dataRows || []).map((r: any) => {
+            const rowAdsense = Math.round((Number(r.adsense_income) || 0) * 100) / 100;
+            const rowAdmob = Math.round((Number(r.admob_income) || 0) * 100) / 100;
+            const rowTotalAd = Math.round((rowAdsense + rowAdmob) * 100) / 100;
+            return {
+              id: r.id,
+              userId: r.user_id,
+              name: r.name,
+              email: r.email,
+              role: r.role,
+              referralCode: r.referral_code,
+              createdAt: r.created_at,
+              balance: Math.round((Number(r.balance) || 0) * 100) / 100,
+              totalEarned: Math.round((Number(r.total_earned) || 0) * 100) / 100,
+              totalWithdrawn: Math.round((Number(r.total_withdrawn) || 0) * 100) / 100,
+              referralIncome: Math.round((Number(r.referral_income) || 0) * 100) / 100,
+              globalIncome: Math.round((Number(r.global_income) || 0) * 100) / 100,
+              adsenseIncome: rowAdsense,
+              admobIncome: rowAdmob,
+              totalAdEarning: rowTotalAd,
+              affiliateIncome: Math.round((Number(r.affiliate_income) || 0) * 100) / 100,
+            };
+          });
 
           const totalPages = totalUsers > 0 ? Math.ceil(totalUsers / limit) : 1;
           return jsonResponse({
@@ -16434,6 +16557,7 @@ export async function handleApiRequest(
             referral_income: defaultEarned[norm] ? defaultEarned[norm] * 0.4 : 0,
             global_income: defaultEarned[norm] ? defaultEarned[norm] * 0.3 : 0,
             adsense_income: defaultEarned[norm] ? defaultEarned[norm] * 0.2 : 0,
+            admob_income: 0,
             affiliate_income: defaultEarned[norm] ? defaultEarned[norm] * 0.1 : 0,
             updated_at: new Date().toISOString(),
           };
@@ -16481,6 +16605,7 @@ export async function handleApiRequest(
           acc.totalReferralIncome += w.referral_income || 0;
           acc.totalGlobalIncome += w.global_income || 0;
           acc.totalAdsenseIncome += w.adsense_income || 0;
+          acc.totalAdmobIncome += w.admob_income || 0;
           acc.totalAffiliateIncome += w.affiliate_income || 0;
           return acc;
         },
@@ -16492,6 +16617,8 @@ export async function handleApiRequest(
           totalReferralIncome: 0,
           totalGlobalIncome: 0,
           totalAdsenseIncome: 0,
+          totalAdmobIncome: 0,
+          totalAdEarning: 0,
           totalAffiliateIncome: 0,
         },
       );
@@ -16503,6 +16630,9 @@ export async function handleApiRequest(
       summary.totalReferralIncome = Math.round(summary.totalReferralIncome * 100) / 100;
       summary.totalGlobalIncome = Math.round(summary.totalGlobalIncome * 100) / 100;
       summary.totalAdsenseIncome = Math.round(summary.totalAdsenseIncome * 100) / 100;
+      summary.totalAdmobIncome = Math.round(summary.totalAdmobIncome * 100) / 100;
+      summary.totalAdEarning =
+        Math.round((summary.totalAdsenseIncome + summary.totalAdmobIncome) * 100) / 100;
       summary.totalAffiliateIncome = Math.round(summary.totalAffiliateIncome * 100) / 100;
 
       // Slicing for pagination
@@ -16510,10 +16640,13 @@ export async function handleApiRequest(
 
       if (exportType === "csv") {
         const csvRows: string[] = [
-          "\uFEFFUser ID,Full Name,Email Address,Role,Referral Code,Available Balance (INR),Total Earned (INR),Referral Income (INR),Global Income (INR),AdSense Income (INR),Affiliate Income (INR),Total Withdrawn (INR),Joined Date",
+          "\uFEFFUser ID,Full Name,Email Address,Role,Referral Code,Available Balance (INR),Total Earned (INR),Referral Income (INR),Global Income (INR),AdSense Income (INR),AdMob Income (INR),Total Ad Earning (INR),Affiliate Income (INR),Total Withdrawn (INR),Joined Date",
         ];
         for (const u of filteredUsers) {
           const w = getOrInitWallet(u.user_id);
+          const rowAdsense = Math.round((Number(w.adsense_income) || 0) * 100) / 100;
+          const rowAdmob = Math.round((Number(w.admob_income) || 0) * 100) / 100;
+          const rowTotalAd = Math.round((rowAdsense + rowAdmob) * 100) / 100;
           const line = [
             `"${u.user_id}"`,
             `"${(u.name || "").replace(/"/g, '""')}"`,
@@ -16524,7 +16657,9 @@ export async function handleApiRequest(
             (w.total_earned || 0).toFixed(2),
             (w.referral_income || 0).toFixed(2),
             (w.global_income || 0).toFixed(2),
-            (w.adsense_income || 0).toFixed(2),
+            rowAdsense.toFixed(2),
+            rowAdmob.toFixed(2),
+            rowTotalAd.toFixed(2),
             (w.affiliate_income || 0).toFixed(2),
             (w.total_withdrawn || 0).toFixed(2),
             `"${u.created_at || ""}"`,
@@ -16542,6 +16677,9 @@ export async function handleApiRequest(
 
       const users = paginatedUsers.map((u) => {
         const w = getOrInitWallet(u.user_id);
+        const rowAdsense = Math.round((Number(w.adsense_income) || 0) * 100) / 100;
+        const rowAdmob = Math.round((Number(w.admob_income) || 0) * 100) / 100;
+        const rowTotalAd = Math.round((rowAdsense + rowAdmob) * 100) / 100;
         return {
           id: u.id,
           userId: u.user_id,
@@ -16555,7 +16693,9 @@ export async function handleApiRequest(
           totalWithdrawn: Math.round((w.total_withdrawn || 0) * 100) / 100,
           referralIncome: Math.round((w.referral_income || 0) * 100) / 100,
           globalIncome: Math.round((w.global_income || 0) * 100) / 100,
-          adsenseIncome: Math.round((w.adsense_income || 0) * 100) / 100,
+          adsenseIncome: rowAdsense,
+          admobIncome: rowAdmob,
+          totalAdEarning: rowTotalAd,
           affiliateIncome: Math.round((w.affiliate_income || 0) * 100) / 100,
         };
       });

@@ -51,6 +51,18 @@ export interface UserWallet {
   isStale?: boolean | undefined;
 }
 
+/**
+ * Computes Total Ad Earning strictly as verified AdSense income + verified AdMob income.
+ * Does NOT include Ad Boost, Affiliate, Referral, or Global Pool income.
+ */
+export function calculateTotalAdEarning(
+  wallet?: Pick<UserWallet, "adsenseIncome" | "admobIncome"> | null,
+): number {
+  const adsense = Number(wallet?.adsenseIncome) || 0;
+  const admob = Number(wallet?.admobIncome) || 0;
+  return Math.round((adsense + admob) * 100) / 100;
+}
+
 const LOCAL_STORAGE_LEDGER_KEY = "facetube_income_ledger_v3";
 const LOCAL_STORAGE_WALLETS_KEY = "facetube_user_wallets_v3";
 
@@ -154,6 +166,7 @@ export async function getUserWallet(userId: string): Promise<UserWallet> {
   if (wallets[norm]) {
     return {
       ...wallets[norm]!,
+      admobIncome: Number(wallets[norm]!.admobIncome) || 0,
       isStale: true,
     };
   }
@@ -273,6 +286,232 @@ export async function getGlobalPoolSummary(excludeUserId?: string): Promise<Glob
       error: msg,
     };
   }
+}
+
+export interface AuthoritativeWalletResult {
+  wallet: UserWallet | null;
+  error?: string | undefined;
+}
+
+export interface AuthoritativeLedgerResult {
+  transactions: LedgerTransaction[];
+  error?: string | undefined;
+}
+
+/**
+ * Strictly fetches the authenticated user's wallet balance from the backend server.
+ * Unlike getUserWallet(), this NEVER falls back to localStorage or synthesizes a ₹0.00 wallet.
+ */
+export async function getAuthoritativeUserWallet(
+  userId: string,
+): Promise<AuthoritativeWalletResult> {
+  const norm = userId.trim().toUpperCase();
+  if (!norm) {
+    return { wallet: null, error: "Sign in required to load server balance." };
+  }
+
+  try {
+    const res = await api.wallet.getBalance(norm);
+    if (res && res.success !== false && res.wallet && typeof res.wallet === "object") {
+      const data = res.wallet;
+      const wallet: UserWallet = {
+        userId: data.user_id || data.userId || norm,
+        balance: Number(data.balance) || 0,
+        totalEarned: Number(data.total_earned ?? data.totalEarned) || 0,
+        totalWithdrawn: Number(data.total_withdrawn ?? data.totalWithdrawn) || 0,
+        referralIncome: Number(data.referral_income ?? data.referralIncome) || 0,
+        globalIncome: Number(data.global_income ?? data.globalIncome) || 0,
+        adsenseIncome: Number(data.adsense_income ?? data.adsenseIncome) || 0,
+        admobIncome: Number(data.admob_income ?? data.admobIncome) || 0,
+        affiliateIncome: Number(data.affiliate_income ?? data.affiliateIncome) || 0,
+        updatedAt: data.updated_at || data.updatedAt || new Date().toISOString(),
+        isStale: false,
+      };
+      return { wallet };
+    }
+    throw new Error("Server returned an invalid wallet balance response.");
+  } catch (err: unknown) {
+    const msg =
+      err instanceof Error ? err.message : "Failed to fetch live wallet balance from server.";
+    console.warn("getAuthoritativeUserWallet: failed to fetch live wallet from server:", err);
+    return { wallet: null, error: msg };
+  }
+}
+
+/**
+ * Strictly fetches the authenticated user's ledger transactions from the backend server.
+ * Unlike getUserLedger(), this NEVER falls back to localStorage cached transactions.
+ */
+export async function getAuthoritativeUserLedger(
+  userId: string,
+): Promise<AuthoritativeLedgerResult> {
+  const norm = userId.trim().toUpperCase();
+  if (!norm) {
+    return { transactions: [], error: "Sign in required to load server ledger." };
+  }
+
+  try {
+    const res = await api.wallet.getTransactions(norm);
+    if (res && res.success !== false && Array.isArray(res.transactions)) {
+      const mapped: LedgerTransaction[] = res.transactions.map((d: any) => ({
+        id: String(d.id),
+        transactionId: d.transaction_id || d.transactionId,
+        userId: d.user_id || d.userId,
+        sourceUserId: d.source_user_id || d.sourceUserId || undefined,
+        sourceUserName: d.source_user_name || d.sourceUserName || undefined,
+        videoId: d.video_id || d.videoId || undefined,
+        incomeType: (d.income_type || d.incomeType) as IncomeType,
+        amount: Number(d.amount) || 0,
+        status: d.status || "settled",
+        specialTag: d.special_tag || d.specialTag || undefined,
+        description: d.description || "",
+        batchId: d.batch_id || d.batchId || undefined,
+        batch_id: d.batch_id || d.batchId || undefined,
+        payoutMethod: d.payout_method || d.payoutMethod || undefined,
+        payout_method: d.payout_method || d.payoutMethod || undefined,
+        beneficiaryDetails: d.beneficiary_details || d.beneficiaryDetails || undefined,
+        beneficiary_details: d.beneficiary_details || d.beneficiaryDetails || undefined,
+        createdAt: d.created_at || d.createdAt,
+        isStale: false,
+      }));
+      return { transactions: mapped };
+    }
+    throw new Error("Server returned an invalid ledger response.");
+  } catch (err: unknown) {
+    const msg =
+      err instanceof Error ? err.message : "Failed to fetch live transactions from server.";
+    console.warn("getAuthoritativeUserLedger: failed to fetch live transactions from server:", err);
+    return { transactions: [], error: msg };
+  }
+}
+
+export interface GlobalIncomeDisplayState {
+  walletAvailable: boolean;
+  poolAvailable: boolean;
+  ledgerAvailable: boolean;
+  hasAnyServerError: boolean;
+  globalIncomeValue: string;
+  globalIncomeCaption: string;
+  eligibleVideosValue: string | number;
+  eligibleVideosCaption: string;
+  sharePerVideoValue: string;
+  sharePerVideoCaption: string;
+  distributionStatusCaption: string;
+  ledgerHeaderSubtitle: string;
+  visibleTransactions: LedgerTransaction[];
+  ledgerEmptyMessage: string;
+}
+
+/**
+ * Computes strictly server-authoritative display strings for the Global Income page.
+ * Rejects stale/cached entries and ensures any failed required server request yields
+ * explicit unavailable captions and "Awaiting server sync" status.
+ */
+export function deriveGlobalIncomeDisplayState(params: {
+  loading: boolean;
+  userId: string;
+  wallet: UserWallet | null;
+  walletError: string | null;
+  transactions: LedgerTransaction[];
+  ledgerError: string | null;
+  poolSummary: GlobalPoolSummary | null;
+}): GlobalIncomeDisplayState {
+  const { loading, userId, wallet, walletError, transactions, ledgerError, poolSummary } = params;
+  const hasUser = Boolean(userId.trim());
+
+  const walletAvailable = Boolean(hasUser && !walletError && wallet && !wallet.isStale);
+  const poolAvailable = Boolean(
+    hasUser && poolSummary && !poolSummary.error && !poolSummary.isStale,
+  );
+  const hasStaleLedger = transactions.some((t) => Boolean(t.isStale));
+  const liveGlobalTransactions =
+    ledgerError || hasStaleLedger
+      ? []
+      : transactions.filter((t) => !t.isStale && t.incomeType === "global_income");
+  const ledgerAvailable = Boolean(hasUser && !ledgerError && !hasStaleLedger);
+  const hasAnyServerError = Boolean(
+    hasUser && !loading && (!walletAvailable || !poolAvailable || !ledgerAvailable),
+  );
+
+  const globalIncomeValue = loading
+    ? "…"
+    : walletAvailable && wallet
+      ? `₹${wallet.globalIncome.toFixed(2)}`
+      : "—";
+
+  const globalIncomeCaption =
+    !loading && !hasUser
+      ? "Sign in required"
+      : !loading && !walletAvailable
+        ? "Server balance unavailable"
+        : "Eligible video share";
+
+  const eligibleVideosValue = loading
+    ? "…"
+    : poolAvailable && poolSummary
+      ? poolSummary.eligibleVideoCount
+      : "—";
+
+  const eligibleVideosCaption =
+    !loading && !hasUser
+      ? "Sign in to view pool"
+      : !loading && !poolAvailable
+        ? "Server summary unavailable"
+        : poolSummary
+          ? `${poolSummary.distinctCreatorCount} creator${poolSummary.distinctCreatorCount === 1 ? "" : "s"} · Sponsor uploads`
+          : "Sponsor uploads only";
+
+  const sharePerVideoValue = loading
+    ? "…"
+    : poolAvailable && poolSummary
+      ? `₹${poolSummary.estimatedEqualSharePerVideo.toFixed(2)}`
+      : "—";
+
+  const sharePerVideoCaption =
+    !loading && !hasUser
+      ? "Sign in required"
+      : !loading && !poolAvailable
+        ? "Live pool data required"
+        : poolSummary?.weightingMode === "ad_earnings_weighted"
+          ? "Weighted by Ad Earnings (equal est.)"
+          : "Equal floor share per video";
+
+  const distributionStatusCaption =
+    !loading && !hasUser
+      ? "Awaiting sign-in"
+      : hasAnyServerError
+        ? "Awaiting server sync"
+        : "Server ledger synced";
+
+  const ledgerHeaderSubtitle =
+    !loading && hasUser && !ledgerAvailable
+      ? "Server ledger unavailable"
+      : "Live database ledger records";
+
+  const ledgerEmptyMessage = loading
+    ? "Loading live database ledger records…"
+    : !hasUser
+      ? "Please sign in to view your Global Income balance, eligible video count, and ledger entries."
+      : !ledgerAvailable
+        ? "Server ledger unavailable. Live Global Income entries could not be verified from the server."
+        : "No global income distributions found for this account. Distributions occur automatically when users upload Sponsor Videos.";
+
+  return {
+    walletAvailable,
+    poolAvailable,
+    ledgerAvailable,
+    hasAnyServerError,
+    globalIncomeValue,
+    globalIncomeCaption,
+    eligibleVideosValue,
+    eligibleVideosCaption,
+    sharePerVideoValue,
+    sharePerVideoCaption,
+    distributionStatusCaption,
+    ledgerHeaderSubtitle,
+    visibleTransactions: !loading && ledgerAvailable ? liveGlobalTransactions : [],
+    ledgerEmptyMessage,
+  };
 }
 
 /**
@@ -603,6 +842,17 @@ export async function processWithdrawal(
 
   let updatedWallet: UserWallet;
   if (res.updatedWallet) {
+    const rawAdmobIncome =
+      res.updatedWallet.admob_income !== undefined && res.updatedWallet.admob_income !== null
+        ? res.updatedWallet.admob_income
+        : res.updatedWallet.admobIncome !== undefined && res.updatedWallet.admobIncome !== null
+          ? res.updatedWallet.admobIncome
+          : undefined;
+    const resolvedAdmobIncome =
+      rawAdmobIncome !== undefined
+        ? Number(rawAdmobIncome) || 0
+        : Number(currentWallet.admobIncome) || 0;
+
     updatedWallet = {
       userId: norm,
       balance: Number(res.updatedWallet.balance) || 0,
@@ -621,6 +871,7 @@ export async function processWithdrawal(
       adsenseIncome:
         Number(res.updatedWallet.adsense_income || res.updatedWallet.adsenseIncome) ||
         currentWallet.adsenseIncome,
+      admobIncome: resolvedAdmobIncome,
       affiliateIncome:
         Number(res.updatedWallet.affiliate_income || res.updatedWallet.affiliateIncome) ||
         currentWallet.affiliateIncome,
@@ -631,6 +882,7 @@ export async function processWithdrawal(
   } else {
     updatedWallet = {
       ...currentWallet,
+      admobIncome: Number(currentWallet.admobIncome) || 0,
       balance: Math.max(0, currentWallet.balance - amount),
       totalWithdrawn: currentWallet.totalWithdrawn + amount,
       updatedAt: new Date().toISOString(),

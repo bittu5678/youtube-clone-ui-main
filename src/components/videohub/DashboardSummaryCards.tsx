@@ -73,8 +73,6 @@ const DASHBOARD_SUMMARY_DATA: SummaryCardItem[] = [
     icon: Sparkles,
     color: "text-amber-400 bg-amber-500/10",
     link: "/premium-videos",
-    trend: "₹840 ad revenue",
-    isPositive: true,
   },
   // 5. Short Videos
   {
@@ -184,12 +182,11 @@ const DASHBOARD_SUMMARY_DATA: SummaryCardItem[] = [
   {
     id: "withdrawal-balance",
     title: "Withdrawal Balance",
-    value: "₹3,150.00",
+    value: "₹0.00",
     subtitle: "Total successfully paid out",
     icon: ArrowDownToLine,
     color: "text-orange-400 bg-orange-500/10",
     link: "/withdrawal-balance",
-    trend: "Last paid Sep 18",
   },
   // 15. Current Rank
   {
